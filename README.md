@@ -13,7 +13,7 @@ To efficiently (memory and runtime) keep track of k-mers and their frequencies a
 # Installation
 UniqSketch builds into a stand-alone executable:
 ```
-git clone https://github.com/amzn/uniqsketch
+git clone https://github.com/amazon-science/uniqsketch
 cd uniqsketch
 make
 ```
