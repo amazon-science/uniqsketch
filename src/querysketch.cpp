@@ -16,7 +16,7 @@
 #define PROGRAM "querysketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.1.0\n";
+    PROGRAM " Version 1.2.1\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTIONS] [ARGS]\n"
