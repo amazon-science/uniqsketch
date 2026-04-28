@@ -49,4 +49,21 @@ inline bool validateFiles(const std::vector<std::string>& files, const std::stri
     return allGood;
 }
 
+/**
+ * Prepend a prefix to the basename of a path, preserving the directory component.
+ * e.g. prefixBasename("../out/x.tsv", "log_") -> "../out/log_x.tsv"
+ *      prefixBasename("x.tsv", "log_")        -> "log_x.tsv"
+ *
+ * @param fPath  File path (may include directory components).
+ * @param prefix  String to prepend to the basename.
+ * @return Path with prefix applied to the basename only.
+ */
+inline std::string prefixBasename(const std::string& fPath, const std::string& prefix) {
+    size_t slash = fPath.rfind('/');
+    if (slash == std::string::npos) {
+        return prefix + fPath;
+    }
+    return fPath.substr(0, slash + 1) + prefix + fPath.substr(slash + 1);
+}
+
 #endif // FILEUTIL_HPP_

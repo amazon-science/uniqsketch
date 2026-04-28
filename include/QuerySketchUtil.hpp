@@ -12,6 +12,7 @@
 #include "SequenceUtil.hpp"
 #include "BloomFilter.hpp"
 #include "ntHashIterator.hpp"
+#include "FileUtil.hpp"
 
 #include "kseq_gz.h"
 
@@ -223,7 +224,7 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
     outFile.close();
 
     // Detailed signature log
-    std::ofstream logSig("log_" + opt::out);
+    std::ofstream logSig(prefixBasename(opt::out, "log_"));
     logSig << "ref\ttotal_reads\tsignature\tcount\n";
     for (unsigned i = 0; i < refSigCount.size(); i++) {
         for (const auto& [sig, count] : refSigCount[i]) {
@@ -235,7 +236,7 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
     }
 
     // Read-level log: matched read ids per reference
-    std::ofstream logRead("logread_" + opt::out);
+    std::ofstream logRead(prefixBasename(opt::out, "logread_"));
     logRead << "ref\tnum_reads\treads\n";
     for (unsigned i = 0; i < refRead.size(); i++) {
         if (refRead[i].size() > 1) {
