@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.3.0 (2026-06-11)
+
+### Features
+* `comparesketch`: added `--auto` to size the Bloom filter from an ntCard cardinality estimate of the reference set, fixing the load factor (bits per distinct k-mer) so the false-positive rate is the design value regardless of genome size.
+* `comparesketch`: added `--auto-gsize` to size the Bloom filter from the largest input genome (`estimateMaxGenomeSize`), removing the need to set `--gsize` manually.
+* `comparesketch`: added `--fpr=F` to set bits-per-element for a target Bloom-filter false-positive rate (e.g. `--fpr 0.001` selects 29 bits/element).
+* The comparesketch false-positive rate can now be controlled precisely; the default (`--gsize`-based sizing) behavior is unchanged.
+
 ## 1.2.2 (2026-04-28)
 
 ### Bug Fixes

@@ -1,10 +1,12 @@
 #include <getopt.h>
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
 #include "CompareSketchUtil.hpp"
+#include "ntcard.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -14,7 +16,7 @@
 #define PROGRAM "comparesketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.2.2\n";
+    PROGRAM " Version 1.3.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] LIST1 LIST2\n"
@@ -29,13 +31,16 @@ static const char USAGE_MESSAGE[] =
     "  -d, --hash=N\t\tBloom filter hash number [3]\n"
     "  -g, --gsize=N\t\tapproximate size for reference sequence [5000000]\n"
     "  -o, --out=STRING\tthe output similarity file name [reference_similarity.tsv]\n"
+    "      --auto-gsize\tsize the Bloom filter from the largest input genome\n"
+    "      --auto\t\tsize the Bloom filter from an ntCard cardinality estimate\n"
+    "      --fpr=F\t\ttarget Bloom-filter false-positive rate (sets bits; e.g. 0.001)\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\toutput version information and exit\n"
     "\n";
 
 static const char shortopts[] = "t:k:d:b:g:o:";
 
-enum { OPT_HELP = 1, OPT_VERSION };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_AUTO, OPT_AUTOGSIZE, OPT_FPR };
 
 static const struct option longopts[] = {
     {"threads", required_argument, nullptr, 't'},
@@ -44,6 +49,9 @@ static const struct option longopts[] = {
     {"bits",    required_argument, nullptr, 'b'},
     {"gsize",   required_argument, nullptr, 'g'},
     {"out",     required_argument, nullptr, 'o'},
+    {"auto-gsize", no_argument,    nullptr, OPT_AUTOGSIZE},
+    {"auto",    no_argument,       nullptr, OPT_AUTO},
+    {"fpr",     required_argument, nullptr, OPT_FPR},
     {"help",    no_argument,       nullptr, OPT_HELP},
     {"version", no_argument,       nullptr, OPT_VERSION},
     {nullptr, 0, nullptr, 0}
@@ -67,6 +75,9 @@ int main(int argc, char** argv) {
         case 'd': arg >> opt::nhash;   break;
         case 'g': arg >> opt::dbfSize; break;
         case 'o': arg >> opt::outfile; break;
+        case OPT_AUTOGSIZE: opt::autoGsize = true; break;
+        case OPT_AUTO: opt::autoSize = true; break;
+        case OPT_FPR: arg >> opt::targetFpr; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -127,6 +138,39 @@ int main(int argc, char** argv) {
 #ifdef _OPENMP
     omp_set_num_threads(opt::threads);
 #endif
+
+    // Optional: derive bits-per-element from a target false-positive rate.
+    // FPR p = (1 - e^(-h/b))^h  =>  b = -h / ln(1 - p^(1/h)).
+    if (opt::targetFpr > 0.0 && opt::targetFpr < 1.0) {
+        double h = static_cast<double>(opt::nhash);
+        double b = -h / std::log(1.0 - std::pow(opt::targetFpr, 1.0 / h));
+        opt::bits = static_cast<unsigned>(std::ceil(b));
+        std::cerr << PROGRAM ": target FPR " << opt::targetFpr
+                  << " -> " << opt::bits << " bits/element\n";
+    }
+
+    // Optional Bloom-filter sizing. --auto uses an ntCard cardinality estimate of
+    // the reference set; --auto-gsize uses the largest input genome size. Both fix
+    // the load factor (bits per distinct k-mer) so the false-positive rate is the
+    // design value rather than depending on a manually chosen --gsize.
+    if (opt::autoSize) {
+        size_t kmerNum = 0, dbsize = 0, sbsize = 0;
+        getCardinality(kmerNum, dbsize, sbsize, opt::kmerLen, opt::threads, refSet1);
+        if (dbsize > 0) opt::dbfSize = dbsize;
+        std::cerr << PROGRAM ": ntCard cardinality F0=" << dbsize
+                  << " -> dbfSize=" << opt::dbfSize << "\n";
+    } else if (opt::autoGsize) {
+        std::vector<std::string> allRefs(refSet1);
+        allRefs.insert(allRefs.end(), refSet2.begin(), refSet2.end());
+        opt::dbfSize = estimateMaxGenomeSize(allRefs);
+        std::cerr << PROGRAM ": largest input genome -> dbfSize=" << opt::dbfSize << "\n";
+    }
+    {
+        double load = static_cast<double>(opt::nhash) / opt::bits;  // h*n/m at n=dbfSize
+        double fpr = std::pow(1.0 - std::exp(-load), opt::nhash);
+        std::cerr << PROGRAM ": bits=" << opt::bits << ", dbfSize=" << opt::dbfSize
+                  << ", design FPR=" << fpr << "\n";
+    }
 
     identifyDifference(refSet1, refSet2);
 

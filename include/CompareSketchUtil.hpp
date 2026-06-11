@@ -16,6 +16,9 @@ unsigned nhash(3);                                      // number of hashes for 
 unsigned kmerLen(81);                                   // length of k-mer
 size_t dbfSize(5000000);                                // distinct BF size (approx genome size)
 std::string outfile("reference_similarity.tsv");        // output file name
+bool autoSize(false);                                   // size BF from ntCard cardinality estimate
+bool autoGsize(false);                                  // size BF from largest input genome
+double targetFpr(0.0);                                  // target Bloom-filter FPR (0 = use --bit)
 }
 
 /**

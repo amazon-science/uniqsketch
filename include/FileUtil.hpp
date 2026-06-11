@@ -1,6 +1,8 @@
 #ifndef FILEUTIL_HPP_
 #define FILEUTIL_HPP_
 
+#include <sys/stat.h>
+
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -64,6 +66,26 @@ inline std::string prefixBasename(const std::string& fPath, const std::string& p
         return prefix + fPath;
     }
     return fPath.substr(0, slash + 1) + prefix + fPath.substr(slash + 1);
+}
+
+/**
+ * Estimate the largest genome size (in bases) among a set of files, using file
+ * size as a fast proxy. Used to size Bloom filters to the largest input genome
+ * without scanning the sequences. FASTA headers/newlines overestimate by a few
+ * percent, which is harmless (and conservative) for Bloom-filter sizing.
+ *
+ * @param files  Vector of file paths.
+ * @return Largest file size in bytes, or 5000000 if none could be stat'd.
+ */
+inline size_t estimateMaxGenomeSize(const std::vector<std::string>& files) {
+    size_t maxSize = 0;
+    struct stat st;
+    for (const auto& f : files) {
+        if (stat(f.c_str(), &st) == 0 && static_cast<size_t>(st.st_size) > maxSize) {
+            maxSize = static_cast<size_t>(st.st_size);
+        }
+    }
+    return maxSize > 0 ? maxSize : 5000000;
 }
 
 #endif // FILEUTIL_HPP_
