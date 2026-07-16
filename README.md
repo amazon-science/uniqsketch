@@ -156,9 +156,20 @@ Two lists of files containing file paths in each row.
   -d, --hash=N          Bloom filter hash number [3]
   -g, --gsize=N         approximate size for reference sequence [5000000]
   -o, --out=STRING      the output similarity file name [reference_similarity.tsv]
+      --auto-gsize      size the Bloom filter from the largest input genome
+      --auto            size the Bloom filter from an ntCard cardinality estimate
+      --fpr=F           target Bloom-filter false-positive rate (sets bits; e.g. 0.001)
+      --low-mem         low-memory streaming mode for large reference sets
       --help            display this help and exit
       --version         output version information and exit
 ```
+
+For large reference sets (e.g. thousands of multi-megabase genomes), the default
+`comparesketch` caches every reference's k-mer hashes in memory, which can require
+more RAM than is available. Pass `--low-mem` to stream the comparison instead: it
+holds only one Bloom filter and one reference at a time per thread (memory scales
+with the thread count and genome size rather than the whole set), at the cost of
+re-reading the second list once per first-list reference. Results are identical.
 
 ## Dependencies
 

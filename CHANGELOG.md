@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.0 (2026-07-16)
+
+### Features
+* `comparesketch`: added `--low-mem`, a streaming M×N comparison mode for large reference sets. The default mode pre-caches every reference's k-mer hashes (M+N file reads) but its memory scales with the entire reference universe — for a few thousand multi-megabase genomes this can exceed 1 TB. With `--low-mem`, only one Bloom filter and one reference's k-mers are held per thread at a time: each first-set reference is loaded into a filter and every second-set reference is re-read from disk and queried against it. Memory is O(threads × genome) instead of O(all genomes), at the cost of M×N (rather than M+N) file reads. The similarity output is identical to the default mode; only the memory/I/O profile changes.
+
 ## 1.3.0 (2026-06-11)
 
 ### Features

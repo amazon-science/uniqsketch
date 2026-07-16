@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/build/
+*.o
+*.gch
+
+# Compiled test executables
+/test/uniqsketchtest
+/test/querysketchtest
+/test/bloomfiltertest
+/test/comparesketchtest
+
+# Test-generated outputs (the expected_* fixtures are tracked)
+/test/db_uniq_count.tsv
+/test/ref_test_1.tsv
+/test/ref_test_2.tsv
+/test/out_querysketch.tsv
+/test/log_out_querysketch.tsv
+/test/logread_out_querysketch.tsv
+/test/test_out_uniqsketch.txt
+
+# Editor / OS cruft
+.DS_Store

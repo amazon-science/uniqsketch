@@ -16,7 +16,7 @@
 #define PROGRAM "comparesketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.3.0\n";
+    PROGRAM " Version 1.4.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] LIST1 LIST2\n"
@@ -34,13 +34,14 @@ static const char USAGE_MESSAGE[] =
     "      --auto-gsize\tsize the Bloom filter from the largest input genome\n"
     "      --auto\t\tsize the Bloom filter from an ntCard cardinality estimate\n"
     "      --fpr=F\t\ttarget Bloom-filter false-positive rate (sets bits; e.g. 0.001)\n"
+    "      --low-mem\t\tlow-memory streaming mode for large reference sets\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\toutput version information and exit\n"
     "\n";
 
 static const char shortopts[] = "t:k:d:b:g:o:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_AUTO, OPT_AUTOGSIZE, OPT_FPR };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_AUTO, OPT_AUTOGSIZE, OPT_FPR, OPT_LOWMEM };
 
 static const struct option longopts[] = {
     {"threads", required_argument, nullptr, 't'},
@@ -52,6 +53,7 @@ static const struct option longopts[] = {
     {"auto-gsize", no_argument,    nullptr, OPT_AUTOGSIZE},
     {"auto",    no_argument,       nullptr, OPT_AUTO},
     {"fpr",     required_argument, nullptr, OPT_FPR},
+    {"low-mem", no_argument,       nullptr, OPT_LOWMEM},
     {"help",    no_argument,       nullptr, OPT_HELP},
     {"version", no_argument,       nullptr, OPT_VERSION},
     {nullptr, 0, nullptr, 0}
@@ -78,6 +80,7 @@ int main(int argc, char** argv) {
         case OPT_AUTOGSIZE: opt::autoGsize = true; break;
         case OPT_AUTO: opt::autoSize = true; break;
         case OPT_FPR: arg >> opt::targetFpr; break;
+        case OPT_LOWMEM: opt::lowMem = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -172,7 +175,12 @@ int main(int argc, char** argv) {
                   << ", design FPR=" << fpr << "\n";
     }
 
-    identifyDifference(refSet1, refSet2);
+    if (opt::lowMem) {
+        std::cerr << PROGRAM ": low-memory streaming mode (MxN file reads)\n";
+        identifyDifferenceLowMem(refSet1, refSet2);
+    } else {
+        identifyDifference(refSet1, refSet2);
+    }
 
 #ifdef _OPENMP
     std::cout << "Runtime(sec): " << std::setprecision(4) << std::fixed
