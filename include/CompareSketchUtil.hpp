@@ -1,12 +1,14 @@
 #ifndef COMPARESKETCHUTIL_HPP_
 #define COMPARESKETCHUTIL_HPP_
 
+#include <algorithm>
 #include <climits>
 #include <cstring>
 
 #include "SequenceUtil.hpp"
 #include "BloomFilter.hpp"
 #include "ntHashIterator.hpp"
+#include "FileUtil.hpp"
 #include "kseq_gz.h"
 
 namespace opt {
@@ -19,7 +21,7 @@ std::string outfile("reference_similarity.tsv");        // output file name
 bool autoSize(false);                                   // size BF from ntCard cardinality estimate
 bool autoGsize(false);                                  // size BF from largest input genome
 double targetFpr(0.0);                                  // target Bloom-filter FPR (0 = use --bit)
-bool lowMem(false);                                     // M×N streaming mode (trade I/O for memory)
+size_t memBudgetGB(64);                                 // memory budget (GB) for refSet2 hash caching; 0 = stream
 }
 
 /**
@@ -92,8 +94,7 @@ double checkBloomFilterFromHashes(const std::vector<uint64_t>& hashes,
 
 /**
  * Load k-mers from a FASTA reference directly into a Bloom filter, reading the
- * file once and not retaining the hashes. Used by the low-memory comparison
- * path (identifyDifferenceLowMem) and by the unit tests.
+ * file once and not retaining the hashes. Used by the unit tests.
  */
 void loadBloomFilter(const std::string& fPath, BloomFilter& dbFilter) {
     auto hashes = loadKmerHashes(fPath, opt::nhash, opt::kmerLen);
@@ -102,8 +103,7 @@ void loadBloomFilter(const std::string& fPath, BloomFilter& dbFilter) {
 
 /**
  * Check a FASTA reference's k-mers against a Bloom filter, reading the file once
- * and not retaining the hashes. Used by the low-memory comparison path
- * (identifyDifferenceLowMem) and by the unit tests.
+ * and not retaining the hashes. Used by the unit tests.
  */
 double checkBloomFilter(const std::string& fPath, const BloomFilter& dbFilter,
                         size_t& countAll, size_t& countUnique) {
@@ -112,116 +112,82 @@ double checkBloomFilter(const std::string& fPath, const BloomFilter& dbFilter,
 }
 
 /**
- * Calculate pairwise similarity between two sets of references (M x N comparison).
- * Pre-caches all k-mer hashes to avoid redundant file I/O.
+ * Pairwise similarity between two reference sets (M x N), under a memory budget.
+ *
+ * refSet2 is cached in batches sized to fit opt::memBudgetGB, and refSet1 is
+ * streamed (loaded per entry, per batch). This one function spans the whole
+ * memory/speed range:
+ *   - a budget large enough to hold all of refSet2 -> a single batch, so every
+ *     file is read once (M+N reads: fastest, highest memory);
+ *   - opt::memBudgetGB == 0 (or a genome bigger than the budget) -> batch size 1,
+ *     i.e. one refSet2 genome cached at a time -> M x N reads (lowest memory).
+ * The --low-mem flag is simply an alias for memBudgetGB == 0. Similarity values
+ * are identical for any budget; only the memory/I/O profile changes.
+ *
+ * The batch size is derived from a per-genome hash-memory estimate
+ * (largest input genome x nhash x 8 bytes), independent of the Bloom-filter
+ * sizing, so --auto (which sets dbfSize to the whole-set cardinality) does not
+ * distort it.
  *
  * @param refSet1  List of references in the first set.
  * @param refSet2  List of references in the second set.
  */
 void identifyDifference(const std::vector<std::string>& refSet1,
                         const std::vector<std::string>& refSet2) {
-    // Pre-compute hashes for refSet1 and refSet2 in parallel
-    std::vector<std::vector<uint64_t>> hashSet1(refSet1.size());
-    std::vector<std::vector<uint64_t>> hashSet2(refSet2.size());
     std::vector<std::string> names1(refSet1.size());
     std::vector<std::string> names2(refSet2.size());
-
-    #pragma omp parallel for schedule(dynamic)
-    for (unsigned i = 0; i < refSet1.size(); i++) {
-        hashSet1[i] = loadKmerHashes(refSet1[i], opt::nhash, opt::kmerLen);
-        names1[i] = getBaseId(refSet1[i]);
-    }
-
-    #pragma omp parallel for schedule(dynamic)
-    for (unsigned j = 0; j < refSet2.size(); j++) {
-        hashSet2[j] = loadKmerHashes(refSet2[j], opt::nhash, opt::kmerLen);
-        names2[j] = getBaseId(refSet2[j]);
-    }
+    for (unsigned i = 0; i < refSet1.size(); i++) names1[i] = getBaseId(refSet1[i]);
+    for (unsigned j = 0; j < refSet2.size(); j++) names2[j] = getBaseId(refSet2[j]);
 
     std::ofstream simOut(opt::outfile);
     simOut << "ref1\tref2\tuniq_ref1\tall_ref1\tsimilarity\n";
 
-    size_t bfBytes = opt::bits * opt::dbfSize;
+    size_t bfBits = opt::bits * opt::dbfSize;
 
-    // Pairwise comparison: parallelize over refSet1
-    #pragma omp parallel
-    {
-        // Each thread gets its own BF — allocated once, cleared per refSet1 entry
-        BloomFilter dbFilter(bfBytes, opt::nhash, opt::kmerLen);
-        unsigned char* filterPtr = dbFilter.getFilter();
-        size_t filterBytes = (bfBytes + CHAR_BIT - 1) / CHAR_BIT;
+    // Per-genome hash-memory estimate (bases ~ k-mers), independent of BF sizing.
+    size_t perGenome = std::max<size_t>(1, estimateMaxGenomeSize(refSet2));
+    size_t hashPerGenome = perGenome * opt::nhash * sizeof(uint64_t);
+    size_t memBudget = opt::memBudgetGB * 1024ULL * 1024 * 1024;
+    size_t batchSize = std::max<size_t>(1, memBudget / hashPerGenome);
+    batchSize = std::min(batchSize, refSet2.size());
 
-        #pragma omp for schedule(dynamic)
-        for (unsigned i = 0; i < refSet1.size(); i++) {
-            // Clear and reload BF for this reference
-            std::memset(filterPtr, 0, filterBytes);
-            loadBloomFilterFromHashes(hashSet1[i], opt::nhash, dbFilter);
+    std::cerr << "comparesketch: " << refSet1.size() << " x " << refSet2.size()
+              << " pairwise, refSet2 batch=" << batchSize << "/" << refSet2.size()
+              << " (budget " << opt::memBudgetGB << " GB)\n";
 
-            for (unsigned j = 0; j < refSet2.size(); j++) {
-                size_t countAll = 0, countUnique = 0;
-                double score = checkBloomFilterFromHashes(
-                    hashSet2[j], opt::nhash, dbFilter, countAll, countUnique);
-                #pragma omp critical(simout)
-                simOut << names2[j] << "\t" << names1[i]
-                       << "\t" << countUnique << "\t" << countAll
-                       << "\t" << score << "\n";
-            }
-        }
-    }
-    simOut.close();
-}
+    // Process refSet2 in batches that fit the budget; stream refSet1 within each.
+    for (size_t bStart = 0; bStart < refSet2.size(); bStart += batchSize) {
+        size_t bEnd = std::min(bStart + batchSize, refSet2.size());
+        size_t bCount = bEnd - bStart;
 
-/**
- * Memory-frugal variant of identifyDifference (M×N file reads).
- *
- * identifyDifference() pre-caches every reference's k-mer hashes in RAM. That
- * yields M+N file reads, but memory then scales with the entire reference
- * universe — for a few thousand multi-megabase genomes it can exceed 1 TB. This
- * variant instead keeps only one Bloom filter and one reference's k-mers per
- * thread at a time: each refSet1 entry is loaded into a filter, then every
- * refSet2 entry is re-read from disk and queried against it. Memory is therefore
- * O(threads × genome) rather than O(all genomes), at the cost of M×N (instead of
- * M+N) file reads. The similarity values written are identical to those from
- * identifyDifference(); only the memory/I/O profile differs.
- *
- * @param refSet1  List of references in the first set.
- * @param refSet2  List of references in the second set.
- */
-void identifyDifferenceLowMem(const std::vector<std::string>& refSet1,
-                              const std::vector<std::string>& refSet2) {
-    // Base names are cheap to precompute; no k-mer data is retained.
-    std::vector<std::string> names1(refSet1.size());
-    std::vector<std::string> names2(refSet2.size());
-    for (size_t i = 0; i < refSet1.size(); i++) names1[i] = getBaseId(refSet1[i]);
-    for (size_t j = 0; j < refSet2.size(); j++) names2[j] = getBaseId(refSet2[j]);
+        std::vector<std::vector<uint64_t>> batchHashes(bCount);
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t b = 0; b < bCount; b++)
+            batchHashes[b] = loadKmerHashes(refSet2[bStart + b], opt::nhash, opt::kmerLen);
 
-    std::ofstream simOut(opt::outfile);
-    simOut << "ref1\tref2\tuniq_ref1\tall_ref1\tsimilarity\n";
+        #pragma omp parallel
+        {
+            BloomFilter dbFilter(bfBits, opt::nhash, opt::kmerLen);
+            unsigned char* filterPtr = dbFilter.getFilter();
+            size_t filterBytes = (bfBits + CHAR_BIT - 1) / CHAR_BIT;
 
-    size_t bfBits = opt::bits * opt::dbfSize;  // total Bloom-filter bit size
+            #pragma omp for schedule(dynamic)
+            for (unsigned i = 0; i < refSet1.size(); i++) {
+                std::memset(filterPtr, 0, filterBytes);
+                auto hashes1 = loadKmerHashes(refSet1[i], opt::nhash, opt::kmerLen);
+                loadBloomFilterFromHashes(hashes1, opt::nhash, dbFilter);
+                hashes1.clear();
+                hashes1.shrink_to_fit();
 
-    // Parallelize over refSet1; each thread owns one reusable Bloom filter.
-    #pragma omp parallel
-    {
-        BloomFilter dbFilter(bfBits, opt::nhash, opt::kmerLen);
-        unsigned char* filterPtr = dbFilter.getFilter();
-        size_t filterBytes = (bfBits + CHAR_BIT - 1) / CHAR_BIT;
-
-        #pragma omp for schedule(dynamic)
-        for (unsigned i = 0; i < refSet1.size(); i++) {
-            // Load refSet1[i] into the cleared filter — this file is read once.
-            std::memset(filterPtr, 0, filterBytes);
-            loadBloomFilter(refSet1[i], dbFilter);
-
-            // Re-read and query every refSet2[j] from disk (M×N reads, low memory).
-            for (unsigned j = 0; j < refSet2.size(); j++) {
-                size_t countAll = 0, countUnique = 0;
-                double score = checkBloomFilter(refSet2[j], dbFilter,
-                                                countAll, countUnique);
-                #pragma omp critical(simout)
-                simOut << names2[j] << "\t" << names1[i]
-                       << "\t" << countUnique << "\t" << countAll
-                       << "\t" << score << "\n";
+                for (size_t b = 0; b < bCount; b++) {
+                    size_t countAll = 0, countUnique = 0;
+                    double score = checkBloomFilterFromHashes(
+                        batchHashes[b], opt::nhash, dbFilter, countAll, countUnique);
+                    #pragma omp critical(simout)
+                    simOut << names2[bStart + b] << "\t" << names1[i]
+                           << "\t" << countUnique << "\t" << countAll
+                           << "\t" << score << "\n";
+                }
             }
         }
     }
