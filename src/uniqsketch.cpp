@@ -10,6 +10,7 @@
 #include "ntcard.hpp"
 #include "UniqSketchUtil.hpp"
 #include "ClusterUtil.hpp"
+#include "TreeSketchUtil.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -39,6 +40,7 @@ static const char USAGE_MESSAGE[] =
     "  -r, --stat=STRING\tthe output unique kmer stat file name [db_uniq_count.tsv]\n"
     "  -e, --entropy\t\tsets the aggregate entropy rate threshold [0.65]\n"
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
+    "      --tree=T1,T2,..\tbuild hierarchical tree index with comma-separated thresholds\n"
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
@@ -49,7 +51,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE };
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -63,6 +65,7 @@ static const struct option longopts[] = {
     {"stat",           required_argument, nullptr, 'r'},
     {"entropy",        no_argument,       nullptr, 'e'},
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
+    {"tree",           required_argument, nullptr, OPT_TREE},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
     {"exact",          no_argument,       nullptr, OPT_EXACT},
     {"sensitive",      no_argument, &opt::sketchnum, 100},
@@ -79,6 +82,7 @@ int main(int argc, char** argv) {
 
     unsigned clusterThreshold = 0;  // 0 = clustering disabled
     bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
+    std::vector<unsigned> treeThresholds;  // empty = tree disabled
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -100,6 +104,18 @@ int main(int argc, char** argv) {
         case OPT_CLUSTER: arg >> clusterThreshold; break;
         case OPT_MINMARGIN: arg >> opt::minMargin; break;
         case OPT_EXACT: useExactCluster = true; break;
+        case OPT_TREE: {
+            std::string treeArg;
+            arg >> treeArg;
+            std::istringstream ts(treeArg);
+            std::string token;
+            while (std::getline(ts, token, ',')) {
+                if (!token.empty()) treeThresholds.push_back(std::stoi(token));
+            }
+            // Sort descending (coarsest first)
+            std::sort(treeThresholds.begin(), treeThresholds.end(), std::greater<unsigned>());
+            break;
+        }
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -163,6 +179,80 @@ int main(int argc, char** argv) {
     }
 
     mkdir(opt::outdir.c_str(), 0777);
+
+    // Optional: build hierarchical tree index with per-level sketches
+    if (!treeThresholds.empty()) {
+        std::string treeFile = opt::outdir + "/tree_index.tsv";
+        auto tree = buildHierarchicalTree(refFiles, treeThresholds, opt::kmerLen,
+                                          opt::nhash1, opt::bits,
+                                          estimateMaxGenomeSize(refFiles), treeFile);
+
+        // Report references per tree level
+        auto levelRefs = getTreeLevelRefs(tree);
+        for (const auto& [level, refs] : levelRefs) {
+            std::cerr << "Tree level " << level << ": " << refs.size() << " references\n";
+        }
+
+        // The main sketch is built from the leaf references (full-resolution level)
+        std::unordered_set<std::string> uniqueRefs;
+        for (const auto& node : tree) {
+            if (node.isLeaf) uniqueRefs.insert(node.filePath);
+        }
+        refFiles.assign(uniqueRefs.begin(), uniqueRefs.end());
+        std::cerr << "Building sketch from " << refFiles.size() << " tree leaf references\n";
+
+        // Build a coarse-level sketch for each internal level
+        for (const auto& [level, refs] : levelRefs) {
+            if (refs.empty()) continue;
+            std::string levelOutdir = opt::outdir + "/level_" + std::to_string(level);
+            mkdir(levelOutdir.c_str(), 0777);
+            std::string levelSketch = opt::outdir + "/sketch_level_" + std::to_string(level) + ".tsv";
+            std::string levelStat = levelOutdir + "/db_uniq_count.tsv";
+
+            // Save opt state mutated per level (buildSketch accumulates maxEntropy)
+            auto savedOutdir = opt::outdir;
+            auto savedOutfile = opt::outfile;
+            auto savedRefstat = opt::refstat;
+            auto savedNumRef = opt::numRef;
+            auto savedDbfSize = opt::dbfSize;
+            auto savedSbfSize = opt::sbfSize;
+            auto savedM1 = opt::m1;
+            auto savedM2 = opt::m2;
+            auto savedMaxEntropy = opt::maxEntropy;
+
+            opt::outdir = levelOutdir;
+            opt::outfile = levelSketch;
+            opt::refstat = levelStat;
+            opt::numRef = refs.size();
+
+            size_t levelTotalKmers = 0;
+            getCardinality(levelTotalKmers, opt::dbfSize, opt::sbfSize,
+                           opt::kmerLen, opt::threads, refs);
+
+            if (resolveBloomSizes(levelTotalKmers, opt::dbfSize, opt::sbfSize)) {
+                opt::m1 = opt::bits * opt::dbfSize;
+                opt::m2 = opt::bits * opt::sbfSize;
+                BloomFilter levelDbf(opt::m1, opt::nhash1, opt::kmerLen);
+                identifyUniqKmers(refs, levelDbf);
+                buildSketch(opt::refstat, levelDbf);
+                std::cerr << "Built sketch for tree level " << level
+                          << ": " << levelSketch << "\n";
+            } else {
+                std::cerr << "Warning: skipping sketch for tree level " << level
+                          << " (no k-mer content)\n";
+            }
+
+            opt::outdir = savedOutdir;
+            opt::outfile = savedOutfile;
+            opt::refstat = savedRefstat;
+            opt::numRef = savedNumRef;
+            opt::dbfSize = savedDbfSize;
+            opt::sbfSize = savedSbfSize;
+            opt::m1 = savedM1;
+            opt::m2 = savedM2;
+            opt::maxEntropy = savedMaxEntropy;
+        }
+    }
 
     // Optional clustering: merge nearly identical references
     if (clusterThreshold > 0) {
