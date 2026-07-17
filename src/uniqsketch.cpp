@@ -39,6 +39,7 @@ static const char USAGE_MESSAGE[] =
     "  -r, --stat=STRING\tthe output unique kmer stat file name [db_uniq_count.tsv]\n"
     "  -e, --entropy\t\tsets the aggregate entropy rate threshold [0.65]\n"
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
+    "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
@@ -48,7 +49,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT };
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -63,6 +64,7 @@ static const struct option longopts[] = {
     {"entropy",        no_argument,       nullptr, 'e'},
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
+    {"exact",          no_argument,       nullptr, OPT_EXACT},
     {"sensitive",      no_argument, &opt::sketchnum, 100},
     {"very-sensitive", no_argument, &opt::sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -76,6 +78,7 @@ int main(int argc, char** argv) {
 #endif
 
     unsigned clusterThreshold = 0;  // 0 = clustering disabled
+    bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -96,6 +99,7 @@ int main(int argc, char** argv) {
         case 'e': arg >> opt::entropyThreshold; break;
         case OPT_CLUSTER: arg >> clusterThreshold; break;
         case OPT_MINMARGIN: arg >> opt::minMargin; break;
+        case OPT_EXACT: useExactCluster = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -164,7 +168,8 @@ int main(int argc, char** argv) {
     if (clusterThreshold > 0) {
         std::string clusterFile = opt::outdir + "/clusters.tsv";
         refFiles = clusterReferences(refFiles, clusterThreshold, opt::kmerLen,
-                                     opt::nhash1, opt::bits, 5000000, clusterFile);
+                                     opt::nhash1, opt::bits, 5000000, clusterFile,
+                                     useExactCluster);
     }
 
     opt::numRef = refFiles.size();
