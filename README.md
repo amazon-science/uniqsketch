@@ -111,11 +111,20 @@ A list of files containing file names in each row can be passed with @ prefix.
   -r, --stat=STRING     the output unique kmer stat file name [db_uniq_count.tsv]
   -e, --entropy         sets the aggregate entropy rate threshold [0.65]
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
+      --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1]
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
       --version         output version information and exit
 ```
+
+With `--min-margin=2`, `uniqsketch` prefers signatures that lie at least 2 bases
+(Hamming distance) away from every k-mer in the other references, so a single
+sequencing substitution cannot turn a foreign k-mer into one of a reference's
+signatures (a source of false-positive hits). It is a soft preference with
+fallback — when a genomic region has no such signature, a normal one is used —
+so per-reference signature counts are preserved. The default `--min-margin=1`
+leaves selection unchanged.
 
 ### querysketch
 ```

@@ -19,7 +19,7 @@
 #define PROGRAM "uniqsketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.4.0\n";
+    PROGRAM " Version 1.5.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] @LIST_FILES (or FILES)\n"
@@ -39,6 +39,7 @@ static const char USAGE_MESSAGE[] =
     "  -r, --stat=STRING\tthe output unique kmer stat file name [db_uniq_count.tsv]\n"
     "  -e, --entropy\t\tsets the aggregate entropy rate threshold [0.65]\n"
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
+    "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -47,7 +48,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN };
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -61,6 +62,7 @@ static const struct option longopts[] = {
     {"stat",           required_argument, nullptr, 'r'},
     {"entropy",        no_argument,       nullptr, 'e'},
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
+    {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
     {"sensitive",      no_argument, &opt::sketchnum, 100},
     {"very-sensitive", no_argument, &opt::sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -93,6 +95,7 @@ int main(int argc, char** argv) {
         case 'r': arg >> opt::refstat;          break;
         case 'e': arg >> opt::entropyThreshold; break;
         case OPT_CLUSTER: arg >> clusterThreshold; break;
+        case OPT_MINMARGIN: arg >> opt::minMargin; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -105,6 +108,12 @@ int main(int argc, char** argv) {
                       << static_cast<char>(c) << optarg << "'\n";
             exit(EXIT_FAILURE);
         }
+    }
+
+    if (opt::minMargin < 1) opt::minMargin = 1;
+    if (opt::minMargin > 2) {
+        std::cerr << PROGRAM ": --min-margin > 2 is not supported; using 2\n";
+        opt::minMargin = 2;
     }
 
     if (argc - optind < 1) {
@@ -185,8 +194,9 @@ int main(int argc, char** argv) {
     opt::m1 = opt::bits * opt::dbfSize;
     opt::m2 = opt::bits * opt::sbfSize;
 
-    identifyUniqKmers(refFiles);
-    buildSketch(opt::refstat);
+    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
+    identifyUniqKmers(refFiles, dbFilter);
+    buildSketch(opt::refstat, dbFilter);
 
 #ifdef _OPENMP
     std::cerr << "Runtime(sec): " << std::setprecision(4) << std::fixed

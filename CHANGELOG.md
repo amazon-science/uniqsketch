@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.5.0 (2026-07-17)
+
+### Features
+* `uniqsketch`: added `--min-margin=N` to harden signature selection against single-base sequencing errors. With `--min-margin=2`, uniqsketch prefers signatures that lie at Hamming distance ≥ 2 from every k-mer in other references, so a single substitution error in a read cannot turn a foreign k-mer into one of a reference's signatures — a source of false-positive hits. It is a tiered preference: within each genomic selection slot a 2-safe, non-low-complexity candidate is chosen when available, falling back to the previous behavior only when a slot has no 2-safe option, so per-reference signature counts and genomic spacing are preserved. A summary line reports how many selected signatures met the margin. The default (`--min-margin=1`) leaves selection unchanged. Currently supports margins 1 and 2; higher margins are planned.
+
 ## 1.4.0 (2026-07-16)
 
 ### Features

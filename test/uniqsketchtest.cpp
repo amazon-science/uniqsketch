@@ -20,7 +20,8 @@ void testIdentifyUniqKmers(const std::vector<std::string>& refFiles) {
     ref_test_1: {AGGCTACAAA, GAGACTGAAC, AGACTGAACT}
     ref_test_2: {CTCAGCTAAG, CCTCAGCTAA, AGGCTACAAC}
     */
-    identifyUniqKmers(refFiles);
+    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
+    identifyUniqKmers(refFiles, dbFilter);
 
     assert(compareFiles("ref_test_1.tsv", "expected_ref_test_1.tsv") == true);
     assert(compareFiles("ref_test_2.tsv", "expected_ref_test_2.tsv") == true);
@@ -37,7 +38,8 @@ void testBuildSketch() {
     ref_test_2: {AGGCTACAAC, CTCAGCTAAG}
     Total sketch: 4 unique kmers
     */
-    buildSketch("expected_db_uniq_count.tsv");
+    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
+    buildSketch("expected_db_uniq_count.tsv", dbFilter);
     assert(compareFiles(opt::outfile, "expected_out_uniqsketch.txt") == true);
 
     std::cerr << "PASSED: Test buildSketch\n";

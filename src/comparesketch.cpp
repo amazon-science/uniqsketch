@@ -16,7 +16,7 @@
 #define PROGRAM "comparesketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.4.0\n";
+    PROGRAM " Version 1.5.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] LIST1 LIST2\n"
