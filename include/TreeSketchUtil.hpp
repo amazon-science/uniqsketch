@@ -16,6 +16,7 @@
 #include "SequenceUtil.hpp"
 #include "BloomFilter.hpp"
 #include "ntHashIterator.hpp"
+#include "ClusterUtil.hpp"
 #include "kseq_gz.h"
 
 /**
@@ -52,60 +53,51 @@ inline std::vector<TreeNode> buildHierarchicalTree(
         const std::string& treeFile) {
 
     size_t n = refFiles.size();
+    (void) nhash; (void) bits; (void) dbfSize;  // sizing is internal to the MinHash sketch
 
-    // Pre-compute k-mer hashes
-    std::vector<std::vector<uint64_t>> hashSets(n);
+    // MinHash sketch (bottom-s) + exact k-mer count per reference (near-linear;
+    // replaces the previous all-pairs O(n^2 * genome) unique-k-mer computation).
+    const unsigned sketchSize = MINHASH_SKETCH_SIZE;
+    std::vector<std::vector<uint64_t>> sketches(n);
+    std::vector<size_t> kmerCount(n, 0);
     std::vector<std::string> names(n);
 
     #pragma omp parallel for schedule(dynamic)
     for (unsigned i = 0; i < n; i++) {
-        gzFile fp = gzopen(refFiles[i].c_str(), "r");
-        kseq_t* ks = kseq_init(fp);
-        while (kseq_read(ks) >= 0) {
-            std::string seq(ks->seq.s, ks->seq.l);
-            ntHashIterator itr(seq, nhash, kmerLen);
-            while (itr != itr.end()) {
-                const uint64_t* hVec = *itr;
-                for (unsigned h = 0; h < nhash; h++) {
-                    hashSets[i].push_back(hVec[h]);
-                }
-                ++itr;
-            }
-        }
-        kseq_destroy(ks);
-        gzclose(fp);
+        sketches[i] = clusterMinhashSketch(refFiles[i], kmerLen, sketchSize, kmerCount[i]);
         names[i] = getBaseId(refFiles[i]);
     }
 
-    // Compute pairwise unique k-mer counts (symmetric: store both directions)
-    // uniqueKmers[i][j] = number of k-mers in j not found in i's BF
-    std::vector<std::vector<size_t>> uniqueKmers(n, std::vector<size_t>(n, 0));
-    size_t bfBits = bits * dbfSize;
+    // Candidate distinguishing-k-mer estimates: only pairs that share sketch hashes
+    // are scored (via an inverted index), rather than all O(n^2) pairs.
+    std::unordered_map<uint64_t, std::vector<unsigned>> hashIndex;
+    for (unsigned i = 0; i < n; i++)
+        for (uint64_t h : sketches[i]) hashIndex[h].push_back(i);
 
-    #pragma omp parallel
-    {
-        BloomFilter dbFilter(bfBits, nhash, kmerLen);
-        unsigned char* filterPtr = dbFilter.getFilter();
-        size_t filterBytes = (bfBits + CHAR_BIT - 1) / CHAR_BIT;
-
-        #pragma omp for schedule(dynamic)
-        for (unsigned i = 0; i < n; i++) {
-            std::memset(filterPtr, 0, filterBytes);
-            for (size_t h = 0; h < hashSets[i].size(); h += nhash) {
-                dbFilter.insert(&hashSets[i][h]);
+    const size_t POPULAR_CAP = 20000;  // skip hashes shared by too many refs (stay linear)
+    std::unordered_map<uint64_t, uint32_t> sharedCnt;
+    for (auto& kv : hashIndex) {
+        auto& refs = kv.second;
+        if (refs.size() < 2 || refs.size() > POPULAR_CAP) continue;
+        for (size_t a = 0; a < refs.size(); a++)
+            for (size_t b = a + 1; b < refs.size(); b++) {
+                unsigned i = refs[a], j = refs[b];
+                if (i > j) std::swap(i, j);
+                sharedCnt[(static_cast<uint64_t>(i) << 32) | j]++;
             }
-            for (unsigned j = 0; j < n; j++) {
-                if (i == j) continue;
-                size_t countUnique = 0;
-                for (size_t h = 0; h < hashSets[j].size(); h += nhash) {
-                    if (!dbFilter.contains(&hashSets[j][h])) {
-                        ++countUnique;
-                    }
-                }
-                uniqueKmers[i][j] = countUnique;
-            }
-        }
     }
+
+    // Estimated distinguishing k-mers between i and j (huge if they share no sketch
+    // hashes, i.e. too distant to be a merge candidate).
+    auto uniqueEst = [&](unsigned i, unsigned j) -> double {
+        if (i > j) std::swap(i, j);
+        auto it = sharedCnt.find((static_cast<uint64_t>(i) << 32) | j);
+        if (it == sharedCnt.end()) return 1e18;
+        size_t denom = std::min(sketches[i].size(), sketches[j].size());
+        if (denom == 0) return 1e18;
+        double jac = static_cast<double>(it->second) / static_cast<double>(denom);
+        return static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - jac);
+    };
 
     // Build tree nodes: start with leaf nodes for each reference
     std::vector<TreeNode> tree;
@@ -122,112 +114,78 @@ inline std::vector<TreeNode> buildHierarchicalTree(
         tree.push_back(std::move(leaf));
     }
 
-    // For each threshold level (coarsest to finest), cluster and create internal nodes
-    // Track which tree node each original reference currently belongs to
-    std::vector<unsigned> currentNodeId(n);
-    std::iota(currentNodeId.begin(), currentNodeId.end(), 0);
+    // Bottom-up agglomerative nesting. Thresholds are processed finest-first so that
+    // coarser levels are unions of finer clusters (a proper nested hierarchy, rather
+    // than re-clustering from scratch per level). Clusters merge by representative
+    // distance (representative-linkage) via union-find over the sparse candidate
+    // graph: near-linear, and it avoids single-linkage chaining. Level numbering is
+    // unchanged (0 = coarsest, thresholds.size() = leaves).
+    struct ActiveCluster { unsigned rep; unsigned node; };
+    std::vector<ActiveCluster> active;
+    active.reserve(n);
+    for (unsigned i = 0; i < n; i++) active.push_back({i, i});
 
-    for (unsigned lvl = 0; lvl < thresholds.size(); lvl++) {
-        unsigned threshold = thresholds[lvl];
+    for (int lvl = static_cast<int>(thresholds.size()) - 1; lvl >= 0; --lvl) {
+        double threshold = static_cast<double>(thresholds[lvl]);
+        unsigned m = static_cast<unsigned>(active.size());
 
-        // Complete-linkage agglomerative clustering:
-        // Two clusters merge only if the MAXIMUM unique k-mer count
-        // between any cross-cluster pair is below the threshold.
-        // This prevents chaining artifacts from single-linkage.
+        std::vector<unsigned> parent(m);
+        std::iota(parent.begin(), parent.end(), 0);
+        auto find = [&](unsigned x) -> unsigned {
+            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+        };
 
-        // Initialize: each reference is its own cluster
-        std::vector<std::vector<unsigned>> clusters(n);
-        for (unsigned i = 0; i < n; i++) {
-            clusters[i] = {i};
-        }
+        // Map each current cluster's representative ref to its active-cluster index.
+        std::unordered_map<unsigned, unsigned> repToIdx;
+        for (unsigned c = 0; c < m; c++) repToIdx[active[c].rep] = c;
 
-        // Iteratively merge the closest pair of clusters (complete-linkage distance)
-        bool merged = true;
-        while (merged) {
-            merged = false;
-            size_t bestDist = threshold; // only merge if below threshold
-            int bestA = -1, bestB = -1;
-
-            for (size_t a = 0; a < clusters.size(); a++) {
-                if (clusters[a].empty()) continue;
-                for (size_t b = a + 1; b < clusters.size(); b++) {
-                    if (clusters[b].empty()) continue;
-
-                    // Complete-linkage: max distance between any pair across clusters
-                    size_t maxDist = 0;
-                    for (unsigned i : clusters[a]) {
-                        for (unsigned j : clusters[b]) {
-                            size_t d = std::min(uniqueKmers[i][j], uniqueKmers[j][i]);
-                            maxDist = std::max(maxDist, d);
-                        }
-                    }
-
-                    if (maxDist < bestDist) {
-                        bestDist = maxDist;
-                        bestA = a;
-                        bestB = b;
-                    }
-                }
-            }
-
-            if (bestA >= 0) {
-                // Merge bestB into bestA
-                for (unsigned m : clusters[bestB]) {
-                    clusters[bestA].push_back(m);
-                }
-                clusters[bestB].clear();
-                merged = true;
+        // Merge clusters whose representatives form a candidate pair below threshold.
+        for (auto& kv : sharedCnt) {
+            unsigned i = static_cast<unsigned>(kv.first >> 32);
+            unsigned j = static_cast<unsigned>(kv.first & 0xffffffffu);
+            auto ii = repToIdx.find(i);
+            auto jj = repToIdx.find(j);
+            if (ii == repToIdx.end() || jj == repToIdx.end()) continue;
+            if (uniqueEst(i, j) < threshold) {
+                unsigned a = find(ii->second), b = find(jj->second);
+                if (a != b) parent[a] = b;
             }
         }
 
-        // Collect non-empty clusters into groups
         std::unordered_map<unsigned, std::vector<unsigned>> groups;
-        unsigned gid = 0;
-        for (size_t c = 0; c < clusters.size(); c++) {
-            if (!clusters[c].empty()) {
-                groups[gid++] = std::move(clusters[c]);
-            }
-        }
+        for (unsigned c = 0; c < m; c++) groups[find(c)].push_back(c);
 
-        // Create internal nodes for clusters with >1 member
-        for (auto& [root, members] : groups) {
-            if (members.size() <= 1) continue;
-
-            // Pick representative (most k-mers)
-            unsigned repIdx = members[0];
-            size_t maxK = hashSets[repIdx].size();
-            for (unsigned m : members) {
-                if (hashSets[m].size() > maxK) {
-                    maxK = hashSets[m].size();
-                    repIdx = m;
-                }
+        std::vector<ActiveCluster> next;
+        next.reserve(groups.size());
+        for (auto& kv : groups) {
+            auto& members = kv.second;
+            if (members.size() == 1) {
+                next.push_back(active[members[0]]);   // no merge at this level; carry up
+                continue;
             }
+            // Representative = largest genome among the merged clusters' representatives.
+            unsigned repIdx = active[members[0]].rep;
+            for (unsigned c : members)
+                if (kmerCount[active[c].rep] > kmerCount[repIdx]) repIdx = active[c].rep;
 
             TreeNode internal;
-            internal.id = tree.size();
+            internal.id = static_cast<unsigned>(tree.size());
             internal.name = "cluster_L" + std::to_string(lvl) + "_" + names[repIdx];
             internal.filePath = refFiles[repIdx];
-            internal.level = lvl;
+            internal.level = static_cast<unsigned>(lvl);
             internal.parentId = -1;
             internal.isLeaf = false;
-
-            // Set children: the current nodes of each member
-            for (unsigned m : members) {
-                unsigned childId = currentNodeId[m];
-                if (tree[childId].parentId == -1) {
-                    tree[childId].parentId = internal.id;
-                    internal.children.push_back(childId);
-                }
+            for (unsigned c : members) {
+                unsigned childNode = active[c].node;
+                tree[childNode].parentId = static_cast<int>(internal.id);
+                internal.children.push_back(childNode);
             }
-
+            unsigned newNode = static_cast<unsigned>(tree.size());
             tree.push_back(std::move(internal));
-
-            // Update current node mapping
-            unsigned newId = tree.size() - 1;
-            for (unsigned m : members) {
-                currentNodeId[m] = newId;
-            }
+            next.push_back({repIdx, newNode});
         }
+        active = std::move(next);
     }
 
     // Write tree structure to file
