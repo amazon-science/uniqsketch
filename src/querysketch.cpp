@@ -17,7 +17,7 @@
 #define PROGRAM "querysketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.5.0\n";
+    PROGRAM " Version 2.0.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTIONS] [ARGS]\n"
@@ -298,7 +298,7 @@ int main(int argc, char* const argv[]) {
         size_t totalKmers = 0;
         getCardinality(totalKmers, opt::dbfSize, opt::sbfSize, opt::kmerLen, opt::threads, sampleFiles);
 
-        if (opt::dbfSize == 0 || opt::sbfSize == 0 || opt::dbfSize > totalKmers || opt::sbfSize > totalKmers) {
+        if (!resolveBloomSizes(totalKmers, opt::dbfSize, opt::sbfSize)) {
             std::cerr << "Error: insufficient k-mer content for Bloom filter construction.\n"
                       << "  Total k-mers found: " << totalKmers << "\n"
                       << "  Distinct k-mers (F0): " << opt::dbfSize << "\n"

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.0.0 (2026-07-18)
+
+### Features
+* `uniqsketch`: added `--tree=T1,T2,...` to build a hierarchical (multi-resolution) index instead of a single flat sketch. References are clustered at each comma-separated unique-k-mer threshold — thresholds are sorted descending so the first is the coarsest level — producing a nested tree whose internal nodes are cluster representatives and whose leaves are individual references. The tree structure is written to `<outdir>/tree_index.tsv`, a coarse sketch per internal level to `<outdir>/sketch_level_<L>.tsv`, and the full-resolution leaf sketch to the usual `-o` output. Coarse levels summarize groups of near-identical references; fine levels resolve individual strains.
+* `querysketch`: added `--tree=DIR` to query a hierarchical index. Pass the `uniqsketch --tree` output directory (containing `tree_index.tsv` and the `sketch_level_*.tsv` files) as `--tree` and the leaf sketch as `--ref`. The query narrows candidates coarse-to-fine: the coarsest level is queried first, and only references whose cluster representative clears the hit/read thresholds are carried to the next finer level, so the search focuses on promising sub-trees rather than scoring every reference at full resolution.
+* `uniqsketch`: `--cluster` now uses a near-linear MinHash strategy (bottom-s sketch, inverted-index candidate generation, and representative-linkage union-find) in place of the previous all-pairs O(n^2 × genome) unique-k-mer computation, making clustering of large reference sets (thousands of genomes) practical. The new `--exact` flag restores the original exact O(n^2) clustering for small sets or when exact unique-k-mer counts are required.
+
+### Changes
+* `comparesketch`: unified the memory controls into a single `-m, --mem=N` budget in GB for reference caching (default 64). The tool caches as many second-list references as fit within the budget and streams the remainder, so peak memory stays bounded regardless of reference-set size. `--low-mem` is now an alias for `--mem 0` (fully streaming). Similarity output is unchanged.
+* `uniqsketch` / `querysketch`: harmonized Bloom-filter sizing between the flat and tree code paths. The flat paths now use the same `resolveBloomSizes` fallback as the tree paths, so low-coverage inputs that previously aborted on the flat path (but succeeded on the tree path) are handled consistently.
+
+### Tests
+* Added `treesketchtest`: tree TSV round-trip (`loadTree`, including leaf rows with an empty children column), per-level representative extraction (`getTreeLevelRefs`), and `buildHierarchicalTree` clustering (near-identical references grouped, distinct references kept apart). The suite now has 5 test executables.
+
 ## 1.5.0 (2026-07-17)
 
 ### Features

@@ -62,9 +62,16 @@ uniqsketch --sensitive -k81 -o sketch_index.tsv ref_1.fa ref_2.fa ref_3.fa
 ```bash
 uniqsketch --cluster=2000 --sensitive -k81 -o sketch_index.tsv @refs.txt
 ```
-References with fewer than 2000 unique k-mers between them are merged into clusters. A `clusters.tsv` file is written to the output directory mapping each reference to its cluster representative.
+References with fewer than 2000 unique k-mers between them are merged into clusters. A `clusters.tsv` file is written to the output directory mapping each reference to its cluster representative. Clustering uses a near-linear MinHash strategy by default; add `--exact` for the exact O(n^2) method on small reference sets.
 
-3. Query a metagenomics sample with read files `r1.fq.gz` and `r2.fq.gz`:
+3. Build a hierarchical (multi-resolution) tree index and query it. The full-resolution leaf sketch goes to `-o`; the tree structure and per-level sketches go to the output directory (`-f`):
+```bash
+uniqsketch --tree=5000,1000 --sensitive -k81 -o sketch_index.tsv -f tree_out @refs.txt
+querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --tree tree_out --out out_sample.tsv
+```
+The query narrows candidates from the coarsest level down to individual references.
+
+4. Query a metagenomics sample against a flat index with read files `r1.fq.gz` and `r2.fq.gz`:
 ```bash
 querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.tsv
 ```
@@ -111,6 +118,8 @@ A list of files containing file names in each row can be passed with @ prefix.
   -r, --stat=STRING     the output unique kmer stat file name [db_uniq_count.tsv]
   -e, --entropy         sets the aggregate entropy rate threshold [0.65]
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
+      --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
+      --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1]
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
@@ -125,6 +134,16 @@ signatures (a source of false-positive hits). It is a soft preference with
 fallback — when a genomic region has no such signature, a normal one is used —
 so per-reference signature counts are preserved. The default `--min-margin=1`
 leaves selection unchanged.
+
+With `--tree=T1,T2,...`, `uniqsketch` builds a hierarchical index instead of a flat
+sketch: references are clustered at each threshold (sorted descending, so the first
+is the coarsest level) into a nested tree. The tree is written to
+`<outdir>/tree_index.tsv`, a coarse sketch per level to
+`<outdir>/sketch_level_<L>.tsv`, and the full-resolution leaf sketch to `-o`. Query
+it with `querysketch --tree=DIR` (pointing at that output directory) together with
+`--ref` set to the leaf sketch; the query narrows candidates from the coarsest level
+down to individual references. By default `--cluster` uses a near-linear MinHash
+method; `--exact` selects the exact O(n^2) method for small reference sets.
 
 ### querysketch
 ```
@@ -147,6 +166,7 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --sensitive       sets sensitivity parameter h=10
       --very-sensitive  sets sensitivity parameter h=5
       --solid           only use solid k-mers in reads
+      --tree=DIR        hierarchical query using a --tree index directory
       --help            display this help and exit
       --version         version information and exit
 ```
@@ -165,20 +185,22 @@ Two lists of files containing file paths in each row.
   -d, --hash=N          Bloom filter hash number [3]
   -g, --gsize=N         approximate size for reference sequence [5000000]
   -o, --out=STRING      the output similarity file name [reference_similarity.tsv]
+  -m, --mem=N           memory budget in GB for reference caching (0 = stream) [64]
       --auto-gsize      size the Bloom filter from the largest input genome
       --auto            size the Bloom filter from an ntCard cardinality estimate
       --fpr=F           target Bloom-filter false-positive rate (sets bits; e.g. 0.001)
-      --low-mem         low-memory streaming mode for large reference sets
+      --low-mem         alias for --mem 0 (stream: minimal memory, more I/O)
       --help            display this help and exit
       --version         output version information and exit
 ```
 
-For large reference sets (e.g. thousands of multi-megabase genomes), the default
-`comparesketch` caches every reference's k-mer hashes in memory, which can require
-more RAM than is available. Pass `--low-mem` to stream the comparison instead: it
-holds only one Bloom filter and one reference at a time per thread (memory scales
-with the thread count and genome size rather than the whole set), at the cost of
-re-reading the second list once per first-list reference. Results are identical.
+For large reference sets (e.g. thousands of multi-megabase genomes), caching every
+reference's k-mer hashes in memory can require more RAM than is available. The
+`-m, --mem=N` budget (GB, default 64) bounds this: `comparesketch` caches as many
+second-list references as fit within the budget and streams the rest, re-reading
+them per first-list reference. `--mem 0` (equivalently `--low-mem`) streams fully,
+holding only one Bloom filter and one reference per thread at a time — minimal
+memory, more I/O. The similarity output is identical regardless of the budget.
 
 ## Dependencies
 

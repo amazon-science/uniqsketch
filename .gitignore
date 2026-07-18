@@ -9,6 +9,7 @@
 /test/querysketchtest
 /test/bloomfiltertest
 /test/comparesketchtest
+/test/treesketchtest
 
 # Test-generated outputs (the expected_* fixtures are tracked)
 /test/db_uniq_count.tsv
@@ -18,6 +19,11 @@
 /test/log_out_querysketch.tsv
 /test/logread_out_querysketch.tsv
 /test/test_out_uniqsketch.txt
+/test/tree_A.fa
+/test/tree_B.fa
+/test/tree_C.fa
+/test/tree_out.tsv
+/test/tree_test_index.tsv
 
 # Editor / OS cruft
 .DS_Store

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(UniqSketch VERSION 1.5.0 LANGUAGES CXX)
+project(UniqSketch VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,7 +50,10 @@ add_executable(bloomfiltertest test/bloomfiltertest.cpp)
 add_executable(comparesketchtest test/comparesketchtest.cpp)
 target_link_libraries(comparesketchtest PRIVATE ZLIB::ZLIB)
 
-set_target_properties(uniqsketchtest querysketchtest bloomfiltertest comparesketchtest
+add_executable(treesketchtest test/treesketchtest.cpp)
+target_link_libraries(treesketchtest PRIVATE ZLIB::ZLIB)
+
+set_target_properties(uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test)
 
 # Tests run from the test/ source directory so they can find test data files
@@ -58,3 +61,4 @@ add_test(NAME uniqsketchtest COMMAND uniqsketchtest WORKING_DIRECTORY ${CMAKE_SO
 add_test(NAME querysketchtest COMMAND querysketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME bloomfiltertest COMMAND bloomfiltertest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME comparesketchtest COMMAND comparesketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
+add_test(NAME treesketchtest COMMAND treesketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
