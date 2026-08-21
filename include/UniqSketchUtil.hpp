@@ -33,6 +33,8 @@ unsigned kRange(5);                                     // k-mer spectrum range 
 double maxEntropy(12.0);                                // initial entropy for k={1,2,3}
 double entropyThreshold(0.65);                          // entropy score rate threshold
 unsigned minMargin(1);                                  // min Hamming distance of signatures to other references (1 = off)
+unsigned maxHomopolymer(0);                             // max allowed homopolymer run in a signature (0 = off)
+bool strictMargin(false);                               // if true, --min-margin is a hard requirement (no fallback)
 }
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -165,6 +167,27 @@ unsigned digitize(const std::string& seq) {
         hVal = (hVal << 2) | b2f[static_cast<unsigned char>(seq[i])];
     }
     return static_cast<unsigned>(hVal);
+}
+
+/**
+ * Check whether a signature contains a homopolymer run longer than the allowed
+ * maximum. Aggregate entropy dilutes a short local run across the full k-mer, so
+ * this is a direct local-run-length gate for indel-prone tracts (e.g. poly-G).
+ *
+ * @param signature  Signature sequence to check.
+ * @return True if the longest single-base run exceeds opt::maxHomopolymer.
+ */
+bool hasLongHomopolymer(const std::string& signature) {
+    if (opt::maxHomopolymer == 0) return false;   // filter disabled
+    unsigned run = 1;
+    for (size_t i = 1; i < signature.size(); i++) {
+        if (signature[i] == signature[i - 1]) {
+            if (++run > opt::maxHomopolymer) return true;
+        } else {
+            run = 1;
+        }
+    }
+    return false;
 }
 
 /**
@@ -340,6 +363,7 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
             seqstm >> useq >> pos >> contig;
 
             if (lowComplexity(useq)) continue;
+            if (hasLongHomopolymer(useq)) continue;
             if (requireSafe && !isTwoSafe(useq, dbFilter)) continue;
 
             ntHashIterator itr(useq, opt::nhash1, opt::kmerLen);
@@ -364,9 +388,11 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
         size_t slotEnd = (s + 1 < needed) ? static_cast<size_t>((s + 1) * step) : total;
 
         if (useMargin) {
-            // Prefer a 2-safe candidate; fall back to a margin-1 one if none.
+            // Prefer a 2-safe candidate. In soft mode (default) fall back to a
+            // margin-1 candidate if the slot has no 2-safe option; in strict mode
+            // leave the slot empty rather than admit a margin-1 signature.
             if (trySlot(slotStart, slotEnd, true)) ++safeCount;
-            else trySlot(slotStart, slotEnd, false);
+            else if (!opt::strictMargin) trySlot(slotStart, slotEnd, false);
         } else {
             trySlot(slotStart, slotEnd, false);
         }
