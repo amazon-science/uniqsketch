@@ -58,6 +58,39 @@ void testLowComplexity() {
     std::cerr << "PASSED: Test lowComplexity\n";
 }
 
+void testHasLongHomopolymer() {
+    std::cerr << "START: Test hasLongHomopolymer... \t";
+
+    // Filter disabled (0 = off): even a pure homopolymer must pass.
+    opt::maxHomopolymer = 0;
+    assert(hasLongHomopolymer("AAAAAAAAAAAA") == false);
+
+    opt::maxHomopolymer = 5;
+
+    // Boundary: a run of exactly N is allowed, N+1 is rejected.
+    assert(hasLongHomopolymer("AAAAA") == false);
+    assert(hasLongHomopolymer("AAAAAA") == true);
+
+    // Run position must not matter (start, middle, end).
+    assert(hasLongHomopolymer("GGGGGGCTACTA") == true);
+    assert(hasLongHomopolymer("CTAGGGGGGCTA") == true);
+    assert(hasLongHomopolymer("CTACTAGGGGGG") == true);
+
+    // Run length resets on a base change: two runs of 5 are still acceptable.
+    assert(hasLongHomopolymer("AAAAACAAAAA") == false);
+
+    // Mixed sequence with only short runs.
+    assert(hasLongHomopolymer("AACCGGTTAACCGGTT") == false);
+
+    // Degenerate inputs.
+    assert(hasLongHomopolymer("") == false);
+    assert(hasLongHomopolymer("A") == false);
+
+    opt::maxHomopolymer = 0;   // restore default for later tests
+
+    std::cerr << "PASSED: Test hasLongHomopolymer\n";
+}
+
 void testGetCanonical() {
     std::cerr << "START: Test get_canonical... \t";
 
@@ -100,6 +133,7 @@ int main() {
     testIdentifyUniqKmers(refFiles);
     testBuildSketch();
     testLowComplexity();
+    testHasLongHomopolymer();
     testGetCanonical();
     testGetBaseId();
 
