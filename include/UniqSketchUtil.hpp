@@ -33,6 +33,7 @@ unsigned kRange(5);                                     // k-mer spectrum range 
 double maxEntropy(12.0);                                // initial entropy for k={1,2,3}
 double entropyThreshold(0.65);                          // entropy score rate threshold
 unsigned minMargin(1);                                  // min Hamming distance of signatures to other references (1 = off)
+unsigned maxHomopolymer(0);                             // max allowed homopolymer run in a signature (0 = off)
 }
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -165,6 +166,27 @@ unsigned digitize(const std::string& seq) {
         hVal = (hVal << 2) | b2f[static_cast<unsigned char>(seq[i])];
     }
     return static_cast<unsigned>(hVal);
+}
+
+/**
+ * Check whether a signature contains a homopolymer run longer than the allowed
+ * maximum. Aggregate entropy dilutes a short local run across the full k-mer, so
+ * this is a direct local-run-length gate for indel-prone tracts (e.g. poly-G).
+ *
+ * @param signature  Signature sequence to check.
+ * @return True if the longest single-base run exceeds opt::maxHomopolymer.
+ */
+bool hasLongHomopolymer(const std::string& signature) {
+    if (opt::maxHomopolymer == 0) return false;   // filter disabled
+    unsigned run = 1;
+    for (size_t i = 1; i < signature.size(); i++) {
+        if (signature[i] == signature[i - 1]) {
+            if (++run > opt::maxHomopolymer) return true;
+        } else {
+            run = 1;
+        }
+    }
+    return false;
 }
 
 /**
@@ -340,6 +362,7 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
             seqstm >> useq >> pos >> contig;
 
             if (lowComplexity(useq)) continue;
+            if (hasLongHomopolymer(useq)) continue;
             if (requireSafe && !isTwoSafe(useq, dbFilter)) continue;
 
             ntHashIterator itr(useq, opt::nhash1, opt::kmerLen);
