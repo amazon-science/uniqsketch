@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.6.0 (2026-08-21)
+
+### Features
+* `uniqsketch`: added `--max-homopolymer=N` to drop signature candidates containing a single-base run longer than N bp. The aggregate entropy filter scores a signature over the whole k-mer, so a short local run (e.g. a poly-G tract) is diluted and can survive; this adds a direct local-run-length gate for such indel-prone tracts. Because the filter is applied while scanning each genomic selection slot, a rejected candidate is replaced by another candidate from the same slot wherever one exists, so signature counts and spacing are largely preserved. The default (`--max-homopolymer=0`) disables the filter and leaves selection unchanged.
+* `uniqsketch`: added `--strict-margin` to enforce `--min-margin` as a hard requirement. By default, `--min-margin=2` falls back to a margin-1 candidate when a selection slot contains no 2-safe option; with `--strict-margin` such slots are left empty instead, so every emitted signature satisfies the requested margin at the cost of a smaller sketch. The default (off) leaves `--min-margin` behavior unchanged.
+
+Both options are contributed features and are off by default, so 1.6.0 is backward compatible with 1.5.0 output.
+
 ## 1.5.0 (2026-07-17)
 
 ### Features

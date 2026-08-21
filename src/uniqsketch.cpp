@@ -19,7 +19,7 @@
 #define PROGRAM "uniqsketch"
 
 static const char VERSION_MESSAGE[] =
-    PROGRAM " Version 1.5.0\n";
+    PROGRAM " Version 1.6.0\n";
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] @LIST_FILES (or FILES)\n"
