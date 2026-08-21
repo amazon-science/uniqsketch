@@ -121,6 +121,8 @@ A list of files containing file names in each row can be passed with @ prefix.
       --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1]
+      --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
+      --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback)
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
@@ -133,7 +135,16 @@ sequencing substitution cannot turn a foreign k-mer into one of a reference's
 signatures (a source of false-positive hits). It is a soft preference with
 fallback — when a genomic region has no such signature, a normal one is used —
 so per-reference signature counts are preserved. The default `--min-margin=1`
-leaves selection unchanged.
+leaves selection unchanged. Pass `--strict-margin` to remove that fallback: slots
+with no 2-safe candidate are left empty, so every signature meets the requested
+margin, at the cost of a smaller sketch.
+
+`--max-homopolymer=N` drops signature candidates containing a single-base run
+longer than N bp. The entropy filter scores a signature across the whole k-mer, so
+a short local run (a poly-G tract, say) gets diluted and can slip through;
+this is a direct gate on such indel-prone tracts. Rejected candidates are replaced
+from the same genomic slot where possible, so signature counts and spacing are
+largely preserved. The default `--max-homopolymer=0` disables the filter.
 
 With `--tree=T1,T2,...`, `uniqsketch` builds a hierarchical index instead of a flat
 sketch: references are clustered at each threshold (sorted descending, so the first

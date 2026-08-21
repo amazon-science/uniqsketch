@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.0.0 (2026-07-18)
+## 2.0.0 (unreleased)
 
 ### Features
 * `uniqsketch`: added `--tree=T1,T2,...` to build a hierarchical (multi-resolution) index instead of a single flat sketch. References are clustered at each comma-separated unique-k-mer threshold — thresholds are sorted descending so the first is the coarsest level — producing a nested tree whose internal nodes are cluster representatives and whose leaves are individual references. The tree structure is written to `<outdir>/tree_index.tsv`, a coarse sketch per internal level to `<outdir>/sketch_level_<L>.tsv`, and the full-resolution leaf sketch to the usual `-o` output. Coarse levels summarize groups of near-identical references; fine levels resolve individual strains.
@@ -15,6 +15,17 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 * Added `treesketchtest`: tree TSV round-trip (`loadTree`, including leaf rows with an empty children column), per-level representative extraction (`getTreeLevelRefs`), and `buildHierarchicalTree` clustering (near-identical references grouped, distinct references kept apart). The suite now has 5 test executables.
+
+### Inherited from 1.6.0
+* The `uniqsketch --max-homopolymer=N` and `--strict-margin` options released in 1.6.0 apply to the tree index paths as well: both act inside the shared signature-selection stage, so every tree level is filtered on the same terms as a flat sketch.
+
+## 1.6.0 (2026-08-21)
+
+### Features
+* `uniqsketch`: added `--max-homopolymer=N` to drop signature candidates containing a single-base run longer than N bp. The aggregate entropy filter scores a signature over the whole k-mer, so a short local run (e.g. a poly-G tract) is diluted and can survive; this adds a direct local-run-length gate for such indel-prone tracts. Because the filter is applied while scanning each genomic selection slot, a rejected candidate is replaced by another candidate from the same slot wherever one exists, so signature counts and spacing are largely preserved. The default (`--max-homopolymer=0`) disables the filter and leaves selection unchanged.
+* `uniqsketch`: added `--strict-margin` to enforce `--min-margin` as a hard requirement. By default, `--min-margin=2` falls back to a margin-1 candidate when a selection slot contains no 2-safe option; with `--strict-margin` such slots are left empty instead, so every emitted signature satisfies the requested margin at the cost of a smaller sketch. The default (off) leaves `--min-margin` behavior unchanged.
+
+Both options are contributed features and are off by default, so 1.6.0 is backward compatible with 1.5.0 output.
 
 ## 1.5.0 (2026-07-17)
 
