@@ -41,6 +41,7 @@ static const char USAGE_MESSAGE[] =
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
+    "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures)\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -49,7 +50,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_MAXHOMOP };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_MAXHOMOP, OPT_STRICTMARGIN };
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -65,6 +66,7 @@ static const struct option longopts[] = {
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
     {"max-homopolymer",required_argument, nullptr, OPT_MAXHOMOP},
+    {"strict-margin",  no_argument,       nullptr, OPT_STRICTMARGIN},
     {"sensitive",      no_argument, &opt::sketchnum, 100},
     {"very-sensitive", no_argument, &opt::sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -99,6 +101,7 @@ int main(int argc, char** argv) {
         case OPT_CLUSTER: arg >> clusterThreshold; break;
         case OPT_MINMARGIN: arg >> opt::minMargin; break;
         case OPT_MAXHOMOP: arg >> opt::maxHomopolymer; break;
+        case OPT_STRICTMARGIN: opt::strictMargin = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);

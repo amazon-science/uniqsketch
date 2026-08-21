@@ -34,6 +34,7 @@ double maxEntropy(12.0);                                // initial entropy for k
 double entropyThreshold(0.65);                          // entropy score rate threshold
 unsigned minMargin(1);                                  // min Hamming distance of signatures to other references (1 = off)
 unsigned maxHomopolymer(0);                             // max allowed homopolymer run in a signature (0 = off)
+bool strictMargin(false);                               // if true, --min-margin is a hard requirement (no fallback)
 }
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -387,9 +388,11 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
         size_t slotEnd = (s + 1 < needed) ? static_cast<size_t>((s + 1) * step) : total;
 
         if (useMargin) {
-            // Prefer a 2-safe candidate; fall back to a margin-1 one if none.
+            // Prefer a 2-safe candidate. In soft mode (default) fall back to a
+            // margin-1 candidate if the slot has no 2-safe option; in strict mode
+            // leave the slot empty rather than admit a margin-1 signature.
             if (trySlot(slotStart, slotEnd, true)) ++safeCount;
-            else trySlot(slotStart, slotEnd, false);
+            else if (!opt::strictMargin) trySlot(slotStart, slotEnd, false);
         } else {
             trySlot(slotStart, slotEnd, false);
         }
