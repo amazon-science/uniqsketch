@@ -1,12 +1,50 @@
-# UniqSketch: Sensitive and resource-efficient strain/abundance identification in metagenomics data
+# UniqSketch
+
+**Sensitive, resource-efficient strain-level detection and abundance estimation in metagenomes.**
 
 [![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](http://bioconda.github.io/recipes/uniqsketch/README.html)
+[![conda version](https://img.shields.io/conda/vn/bioconda/uniqsketch.svg)](https://anaconda.org/bioconda/uniqsketch)
+[![conda downloads](https://img.shields.io/conda/dn/bioconda/uniqsketch.svg)](https://anaconda.org/bioconda/uniqsketch)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-UniqSketch is a sensitive tool for identifying strains and their relative abundances in metagenomics samples. The algorithm consists of two stages: Indexing and Querying.
+Give UniqSketch a set of reference genomes and a sequencing sample; it reports which
+references are present and at what relative abundance. It is built for the case where
+the candidates are closely related — strains of the same species that differ across a
+small fraction of their sequence.
 
-* **Indexing**: takes a list of target sequences (usually reference genomes) and identifies all k-mers within each target that uniquely belong to that specific sequence. It then checks a set of criteria such as low-complexity on the k-mer candidates to refine the list and provide the final set of unique k-mers for each target. To efficiently keep track of k-mers and their frequencies, UniqSketch utilizes the Bloom filter data structure as an alternative to hash tables.
+## How it works
 
-* **Querying**: raw read sequencing data are queried against the sketch index. To remove k-mers caused by sequencing errors (k-mers with very low depth), UniqSketch utilizes a cascading Bloom filter to discard weak k-mers. The solid k-mers are then queried against the index and the count for the related reference target is updated accordingly. After all solid k-mers in the raw read input data are queried, the reference count table is computed to generate the final output of most abundant references.
+Strain-level assignment is hard because near-identical genomes share almost all of
+their sequence. Most reads are therefore consistent with several references at once,
+and deciding which one they came from is guesswork.
+
+UniqSketch avoids that ambiguity rather than trying to resolve it. It considers only
+**signatures**: k-mers that occur in exactly one reference across the entire database.
+A read carrying a signature is unambiguous evidence for that single reference, so
+counting signature hits gives a direct read-out of which references are present. Two
+choices make this work in practice — a long k (81 bp by default), which makes a
+coincidental match between unrelated genomes vanishingly unlikely, and Bloom filters
+in place of hash tables, which track k-mer frequencies in a fraction of the space
+storing every k-mer would require.
+
+The workflow has two stages:
+
+* **Indexing** (`uniqsketch`) scans the reference set, finds the k-mers unique to each
+  reference, and filters the candidates for qualities that make a signature
+  trustworthy — discarding low-complexity sequence, and optionally long homopolymer
+  tracts (`--max-homopolymer`) or k-mers lying only one substitution away from another
+  reference (`--min-margin`). Surviving candidates are sampled across the genome so
+  coverage is even, producing the sketch index.
+
+* **Querying** (`querysketch`) streams the reads and matches their k-mers against the
+  index. A cascading Bloom filter can first drop k-mers seen only once (`--solid`),
+  which removes most sequencing-error artefacts before they reach the index. Hits are
+  tallied per reference, thresholded to suppress spurious calls, and reported as a
+  ranked table of references with relative abundances.
+
+A third utility, `comparesketch`, measures pairwise similarity within a reference set
+— useful for deciding which references are too close to separate and should be
+clustered before indexing.
 
 ## Installation
 
@@ -86,6 +124,20 @@ ref_1       0.7862      3033
 ref_2       0.1993      769
 ref_3       0.01426     55
 ```
+
+Reading this table:
+
+* `count` is the number of signature k-mer hits observed for that reference.
+* `abundance` is `count` divided by the summed `count` of all **reported** references.
+  Rows are sorted by descending `count`.
+
+Two consequences worth knowing. First, `abundance` is a *relative* figure: it sums
+to 1.0 across the rows in the file, so it answers "of the material I could identify,
+what fraction is this reference?" — not "what fraction of the sample is this
+reference?" Reads from organisms absent from your index, and reads filtered out by
+the thresholds below, are not in the denominator. Second, references failing any
+reporting threshold are omitted entirely rather than listed with a zero, so an
+absent row means "not called", which is not the same as "not present".
 
 * `log_out_sample.tsv`: detailed log showing for each reference the total number of assigned reads and all `signature:count` pairs.
 * `logread_out_sample.tsv`: read-level log listing all matched read IDs per reference.
@@ -198,6 +250,36 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --version         version information and exit
 ```
 
+Reads may be paired or single-end. Pass both `--r1` and `--r2` for paired data; pass
+`--r1` alone for single-end. `--ref` takes the sketch file produced by `uniqsketch`
+(the `-o` output), and `k` is read from that file rather than supplied again.
+
+**How a reference gets called.** A reference is reported only if it clears all three
+thresholds:
+
+| flag | default | meaning |
+|---|---|---|
+| `-h, --hit=N` | 10 | needs **at least** N signature k-mer hits |
+| `-s, --rcutoff=N` | 2 | needs **more than** N distinct matching reads |
+| `-a, --acutoff=F` | 0.0 | needs relative abundance **greater than** F |
+
+The first two are the ones that matter in practice. `--hit` guards against a
+reference being called on a handful of stray k-mer matches, and `--rcutoff` guards
+against many hits that all came from a single read — which is what a chimeric or
+low-quality read looks like. Lower values make detection more sensitive at low
+abundance and raise the false-positive rate; higher values do the reverse.
+`--sensitive` sets `h=10` (the same as the default) and `--very-sensitive` sets
+`h=5`, so reach for `--very-sensitive` when hunting trace-level organisms.
+
+**`--solid`** discards the first occurrence of every k-mer in the sample and queries
+only k-mers seen at least twice. A sequencing error creates a k-mer that almost
+never recurs, so this removes most error-induced k-mers before they can be matched
+against the index. It is worth enabling on real data of reasonable depth. The
+trade-off is coverage-dependent: at very low coverage a genuine signature may
+legitimately appear only once, so `--solid` can suppress a true low-abundance call.
+Prefer it for typical-depth samples, and leave it off when chasing organisms near
+the detection floor.
+
 ### comparesketch
 ```
 Usage: comparesketch [OPTION] LIST1 LIST2
@@ -226,6 +308,68 @@ more RAM than is available. Pass `--low-mem` to stream the comparison instead: i
 holds only one Bloom filter and one reference at a time per thread (memory scales
 with the thread count and genome size rather than the whole set), at the cost of
 re-reading the second list once per first-list reference. Results are identical.
+
+## Choosing parameters
+
+The defaults are sensible for bacterial-scale references and typical short-read
+samples. The knobs below are the ones worth reaching for, roughly in order of how
+often they matter.
+
+**`-k, --kmer` (default 81).** A long k is what makes signatures specific: the
+chance of an 81-mer occurring in an unrelated genome by coincidence is negligible,
+so a match is strong evidence. The cost is that k must fit inside your reads, and
+every sequencing error invalidates the k-mers overlapping it — with k=81, one error
+knocks out up to 81 k-mer positions. Keep 81 for 100 bp+ reads. Lower it for shorter
+reads, accepting that specificity drops with it. `k` is baked into the index, so the
+same value is used automatically at query time.
+
+**Number of signatures per reference (`-c`, `--sensitive`, `--very-sensitive`,
+default 100).** This sets how many signatures represent each reference. More
+signatures means more chances to hit a low-abundance organism, at the cost of a
+larger index and slower queries. `--sensitive` selects 100 — identical to the
+default — and `--very-sensitive` selects 1000, which is the setting to use when you
+care about trace-level detection. Signatures are spread across the genome rather
+than clustered, so a higher count also buys robustness against uneven coverage.
+
+**`--cluster=N`.** When your reference set contains near-identical genomes, their
+signatures compete and abundance gets split arbitrarily between them. Clustering
+collapses references within N distinguishing k-mers of each other and indexes one
+representative, which produces cleaner quantification at the cost of strain-level
+resolution within a cluster. Consult `clusters.tsv` to see what was merged.
+
+**`--max-homopolymer` and `--min-margin`.** Both harden signatures against read
+errors and are described in detail above. `--max-homopolymer=6` is a reasonable
+default to adopt; `--min-margin=2` is worth it when your references include close
+relatives and you are seeing cross-assignment.
+
+**`-t, --threads`.** Set this to your core count for both indexing and querying;
+both stages parallelize well.
+
+## Troubleshooting
+
+**`Error: insufficient k-mer content for Bloom filter construction`.** The sample or
+reference set does not contain enough distinct k-mers to size the Bloom filters. The
+usual cause is reads shorter than `k`: with the default k=81, 75 bp reads yield no
+k-mers at all. Check your read length and, if it is short, rebuild the index with a
+smaller `-k`. Near-empty or truncated input files produce the same error.
+
+**No references reported (output has only the header).** Nothing cleared the
+reporting thresholds. Confirm the sample really should contain something in your
+index, then retry with `--very-sensitive` (`h=5`) and without `--solid`, which is the
+most permissive combination. Inspect `log_out_sample.tsv` — it lists per-signature
+counts regardless of whether the reference was reported, so it shows whether there
+were hits that merely fell short of the thresholds.
+
+**Abundances do not match expectations across similar strains.** Near-identical
+references split each other's signatures. Run `comparesketch` on the reference set to
+quantify how similar they are, then use `--cluster=N` to collapse the ones that are
+too close to separate reliably.
+
+**A reference gets called that should not be there.** Check `log_out_sample.tsv` for
+how many distinct signatures carried the hits. Many hits concentrated on one or two
+signatures suggests cross-mapping or a repeat, rather than genuine presence. Raising
+`-s, --rcutoff`, enabling `--solid`, or rebuilding with `--min-margin=2` and
+`--max-homopolymer=6` all reduce this class of false positive.
 
 ## Dependencies
 
