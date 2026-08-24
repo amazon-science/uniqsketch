@@ -46,6 +46,9 @@ add_executable(querysketchtest test/querysketchtest.cpp)
 target_link_libraries(querysketchtest PRIVATE ZLIB::ZLIB)
 
 add_executable(bloomfiltertest test/bloomfiltertest.cpp)
+# The concurrency test for insert_make_change uses std::thread
+find_package(Threads REQUIRED)
+target_link_libraries(bloomfiltertest PRIVATE Threads::Threads)
 
 add_executable(comparesketchtest test/comparesketchtest.cpp)
 target_link_libraries(comparesketchtest PRIVATE ZLIB::ZLIB)

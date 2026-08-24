@@ -2,6 +2,9 @@
 #include <cstdio>
 #include <string>
 #include <cassert>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 #include "BloomFilter.hpp"
 
@@ -50,6 +53,70 @@ void testInsertMakeChange() {
     assert(bFilter.insert_make_change(hVec2) == true);
 
     std::cerr << "PASSED: Test insert_make_change\n";
+}
+
+// insert_make_change must report true to exactly one caller for a given k-mer,
+// whatever the thread scheduling. uniqsketch's cascading distinct/solid filter
+// pair depends on this: a k-mer shared by two references has to be seen as
+// already present by the second caller, so it is recorded as a repeat and
+// excluded from both references' signatures. Setting the individual bits
+// atomically is not sufficient on its own, because two threads inserting the
+// same k-mer can each win a subset of the bits and both conclude they inserted
+// it -- which silently turns a shared k-mer into a signature for both
+// references, and makes the index depend on thread timing.
+void testInsertMakeChangeConcurrent() {
+    std::cerr << "START: Test insert_make_change concurrency... \t";
+
+    const unsigned NTHREADS = 16;
+    const unsigned NTRIALS = 300;
+    // Many hash functions widen the window between setting the first and last
+    // bit, which is the interval in which the unfixed implementation lets two
+    // threads each claim a subset of the bits.
+    const unsigned NHASH = 64;
+
+    for (unsigned trial = 0; trial < NTRIALS; trial++) {
+        BloomFilter bFilter(opt::size, NHASH, opt::k);
+        std::vector<uint64_t> hVec(NHASH);
+        for (unsigned i = 0; i < NHASH; i++) {
+            hVec[i] = (trial + 1) * 1299709ULL + i * 7919ULL;
+        }
+
+        // Release all threads at once so they collide inside the same call,
+        // rather than each finishing before the next is spawned.
+        std::atomic<unsigned> arrived(0);
+        std::atomic<bool> go(false);
+        std::vector<unsigned> won(NTHREADS, 0);
+        std::vector<std::thread> pool;
+        pool.reserve(NTHREADS);
+
+        for (unsigned t = 0; t < NTHREADS; t++) {
+            pool.emplace_back([&bFilter, &won, &hVec, &arrived, &go, t]() {
+                arrived.fetch_add(1);
+                while (!go.load()) {
+                    std::this_thread::yield();
+                }
+                if (bFilter.insert_make_change(hVec.data())) {
+                    won[t] = 1;
+                }
+            });
+        }
+        while (arrived.load() < NTHREADS) {
+            std::this_thread::yield();
+        }
+        go.store(true);
+        for (auto& th : pool) {
+            th.join();
+        }
+
+        unsigned winners = 0;
+        for (unsigned t = 0; t < NTHREADS; t++) {
+            winners += won[t];
+        }
+        assert(winners == 1);
+        assert(bFilter.contains(hVec.data()) == true);
+    }
+
+    std::cerr << "PASSED: Test insert_make_change concurrency\n";
 }
 
 // Test that an empty Bloom filter contains nothing
@@ -123,6 +190,7 @@ int main() {
     initialize();
     testInsertContain();
     testInsertMakeChange();
+    testInsertMakeChangeConcurrent();
     testEmptyFilter();
     testGetPop();
     testStoreLoad();

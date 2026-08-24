@@ -31,7 +31,7 @@ querysketchtest: test/querysketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
 
 bloomfiltertest: test/bloomfiltertest.cpp
-	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -pthread -o test/$@ $^
 
 comparesketchtest: test/comparesketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
