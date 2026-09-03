@@ -100,7 +100,7 @@ uniqsketch --sensitive -k81 -o sketch_index.tsv ref_1.fa ref_2.fa ref_3.fa
 ```bash
 uniqsketch --cluster=2000 --sensitive -k81 -o sketch_index.tsv @refs.txt
 ```
-References with fewer than 2000 unique k-mers between them are merged into clusters. A `clusters.tsv` file is written to the output directory mapping each reference to its cluster representative. Clustering uses a near-linear MinHash strategy by default; add `--exact` for the exact O(n^2) method on small reference sets.
+References with fewer than 2000 unique k-mers between them are merged into clusters, and only one representative per cluster is indexed. Note that the other members of a cluster then disappear from the output: a sample containing one of them is reported under the representative's name. Use `--tree` (example 3) if you need results at individual-reference resolution. A `clusters.tsv` file is written to the output directory mapping each reference to its cluster representative. Clustering uses a near-linear MinHash strategy by default; add `--exact` for the exact O(n^2) method on small reference sets.
 
 3. Build a hierarchical (multi-resolution) tree index and query it. The full-resolution leaf sketch goes to `-o`; the tree structure and per-level sketches go to the output directory (`-f`):
 ```bash
@@ -241,8 +241,18 @@ is the coarsest level) into a nested tree. The tree is written to
 `<outdir>/sketch_level_<L>.tsv`, and the full-resolution leaf sketch to `-o`. Query
 it with `querysketch --tree=DIR` (pointing at that output directory) together with
 `--ref` set to the leaf sketch; the query narrows candidates from the coarsest level
-down to individual references. By default `--cluster` uses a near-linear MinHash
-method; `--exact` selects the exact O(n^2) method for small reference sets.
+down to individual references.
+
+The distinction from `--cluster` matters: clustering is used here only to *guide*
+the search, and the final scoring runs against the leaf sketch, so **the output
+names individual references rather than cluster representatives.** That is the
+reason to prefer `--tree` over `--cluster` whenever strain identity matters — you
+get the narrowing without giving up resolution. See
+[Choosing parameters](#choosing-parameters) for a direct comparison of the three
+index layouts.
+
+By default `--cluster` uses a near-linear MinHash method; `--exact` selects the
+exact O(n^2) method for small reference sets.
 
 ### querysketch
 ```
@@ -353,11 +363,40 @@ default — and `--very-sensitive` selects 1000, which is the setting to use whe
 care about trace-level detection. Signatures are spread across the genome rather
 than clustered, so a higher count also buys robustness against uneven coverage.
 
-**`--cluster=N`.** When your reference set contains near-identical genomes, their
-signatures compete and abundance gets split arbitrarily between them. Clustering
-collapses references within N distinguishing k-mers of each other and indexes one
-representative, which produces cleaner quantification at the cost of strain-level
-resolution within a cluster. Consult `clusters.tsv` to see what was merged.
+**Index layout: flat, `--cluster=N`, or `--tree`.** This is the choice that most
+affects what your results mean, so it is worth understanding before picking one.
+
+A flat index (the default) holds every reference at full resolution and reports each
+one by name. Query cost grows with the size of the whole reference set, since every
+signature is in play.
+
+`--cluster=N` merges references that lie within N distinguishing k-mers of each
+other and indexes a single representative per cluster. This makes the index smaller
+and the query cheaper, and it stops near-identical references from splitting each
+other's abundance. The cost is easy to understate: **the members of a cluster stop
+existing as far as the output is concerned.** If the organism in your sample is a
+cluster member that is not the representative, its abundance is reported correctly
+but attributed to the representative's name. In an 8-genome test set where four
+near-identical references clustered under one representative, samples containing
+each of the three non-representative members were all reported as the
+representative, at the correct ~90% abundance. That is a confident wrong
+identification rather than a missing one, which is worse if strain identity is what
+you care about. Check `clusters.tsv` to see exactly which references were folded
+together, and only use `--cluster` when resolution within a cluster genuinely does
+not matter to you.
+
+`--tree=T1,T2,...` is the option to reach for when you want both. It clusters
+internally to build a hierarchy and uses it to narrow the search coarse-to-fine, but
+the final query runs against the full-resolution leaf sketch, so **results come back
+as individual references, not representatives.** On the same test set, tree mode
+resolved all three non-representative members to their own names at the correct
+abundance. At matched signature count its accuracy and low-abundance sensitivity
+track a flat index closely, so the hierarchy is about keeping queries tractable as
+the reference set grows rather than about accuracy.
+
+In short: flat for full resolution on a reference set small enough to query
+directly, `--tree` for full resolution with the search narrowed, and `--cluster`
+only when you accept representative-level answers.
 
 **`--max-homopolymer` and `--min-margin`.** Both harden signatures against read
 errors and are described in detail above. `--max-homopolymer=6` is a reasonable
