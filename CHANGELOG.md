@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.6.1 (2026-08-24)
+
+### Fixes
+* Fixed a data race in `BloomFilter::insert_make_change` that made index construction non-deterministic and could cause a k-mer shared by two references to be used as a signature for both. Each hash bit was written atomically, but the composite "was this k-mer newly inserted?" answer was not: two threads inserting the same k-mer could each win a subset of the bits and both report success. `uniqsketch` builds its distinct and solid Bloom filters in parallel across references and relies on exactly one caller observing success, so that a k-mer occurring in more than one reference is recorded as a repeat and excluded from every reference's unique set. When the race hid that repeat, the k-mer remained a signature for both references, and reads from one inflated the reported abundance of the other.
+
+  The impact is limited to reference sets containing near-identical genomes, but there it is significant. On an 8-genome test set with four near-identical members, repeated index builds differed from one another and a reference that was absent from the sample was reported at up to 15% abundance in two to three of every six builds. After the fix, six consecutive builds are byte-identical and no spurious call appears in any configuration. Users who previously worked around this with `--cluster` no longer need to.
+
+  The test-then-insert sequence is now serialised on a lock striped by the leading hash value, so inserts of the same k-mer are ordered while unrelated k-mers proceed in parallel. The lock is only taken when the k-mer appears to be absent, so its cost is per distinct k-mer rather than per occurrence and index build time is unchanged. Signature selection and `querysketch --solid` are deterministic as a result. Single-threaded behaviour is unchanged, and indexes built with earlier versions remain readable — but rebuilding is recommended if your reference set contains near-identical genomes.
+
+### Tests
+* Added a concurrency regression test for `insert_make_change`: sixteen threads released from a spin barrier insert the same k-mer, and exactly one must observe success. Verified to fail against the previous implementation and pass against the fixed one. `bloomfiltertest` now links against pthreads (`-pthread` under make, `Threads::Threads` under CMake).
+
 ## 1.6.0 (2026-08-21)
 
 ### Features

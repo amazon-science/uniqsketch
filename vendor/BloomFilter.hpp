@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 
 #include "nthash.hpp"
 
@@ -80,16 +81,31 @@ public:
      * @return True if the k-mer was inserted for the first time.
      */
     bool insert_make_change(const uint64_t* hVal) {
-        bool change = false;
-        for (unsigned i = 0; i < m_hashNum; i++) {
-            size_t hLoc = hVal[i] % m_size;
-            unsigned char mask = 1 << (CHAR_BIT - 1 - hLoc % CHAR_BIT);
-            unsigned char oldByte = __sync_fetch_and_or(&m_filter[hLoc / CHAR_BIT], mask);
-            if ((oldByte & mask) == 0) {
-                change = true;
-            }
+        // Callers rely on exactly one caller observing true for any given k-mer:
+        // the cascading distinct/solid filter pair, signature claiming, and the
+        // solid read filter all use the return value to decide "am I the first to
+        // see this k-mer?".
+        //
+        // Setting each bit with __sync_fetch_and_or is individually atomic, but
+        // the composite answer is not. Two threads inserting the same k-mer can
+        // each win a subset of the m_hashNum bits and both report true, which
+        // breaks that contract and makes the result depend on thread timing.
+        //
+        // Serialise the test-then-insert sequence on a lock striped by the first
+        // hash. The same k-mer always maps to the same stripe, so concurrent
+        // inserts of it are ordered; unrelated k-mers almost always land on
+        // different stripes and stay parallel. The lock is only taken when the
+        // k-mer looks absent, so its cost is per distinct k-mer rather than per
+        // occurrence.
+        if (contains(hVal)) {
+            return false;
         }
-        return change;
+        std::lock_guard<std::mutex> lock(stripe_lock(hVal[0]));
+        if (contains(hVal)) {
+            return false;   // another thread inserted it while we waited
+        }
+        insert(hVal);
+        return true;
     }
 
     /**
@@ -176,6 +192,21 @@ public:
     unsigned char* getFilter() { return m_filter; }
 
 private:
+    /**
+     * Lock guarding first-insertion of k-mers whose leading hash falls in one
+     * stripe. Shared across instances, which keeps BloomFilter copyable (a
+     * std::mutex member would not be) and costs nothing in practice, since the
+     * lock is only contended by concurrent first-insertions of the same k-mer.
+     *
+     * @param h  Leading hash value of the k-mer.
+     * @return The stripe lock for that hash.
+     */
+    static std::mutex& stripe_lock(uint64_t h) {
+        static constexpr size_t STRIPES = 4096;   // power of two, for masking
+        static std::mutex locks[STRIPES];
+        return locks[h & (STRIPES - 1)];
+    }
+
     unsigned char* m_filter;
     size_t m_size;
     unsigned m_hashNum;
