@@ -31,6 +31,7 @@ int sketchHit(10);                                      // unique k-mer hits to 
 int solid(0);                                           // flag: only use solid k-mers from reads
 double abundanceCutoff(0.0);                            // abundance cutoff to report
 int readCutoff(2);                                      // read number cutoff to report
+int treePruneHit(1);                                    // min coarse-level hits to keep a subtree in play
 }
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -186,6 +187,132 @@ void querySampleBatch(const std::vector<std::string>& sampleFiles,
  * @param refRead  Per-reference distinct read id sets.
  * @param fPath  Path to the output result TSV file.
  */
+/**
+ * A detection made at an internal (coarse) tree level: a cluster representative
+ * whose signatures cleared the reporting thresholds. Used to report a family-level
+ * call when the evidence identifies a group of near-identical references but no
+ * single leaf in that group can be resolved.
+ */
+struct FamilyCall {
+    std::string name;                                   // internal node name, e.g. cluster_L1_AWS_Ec377
+    unsigned level;                                     // tree level the detection was made at
+    unsigned count;                                     // signature hits at that level
+    size_t reads;                                       // distinct reads carrying those hits
+    std::unordered_set<std::string> coveredLeaves;      // leaves descended from this node
+};
+
+/**
+ * Write the query result for a tree index.
+ *
+ * Leaf references are reported exactly as in the flat case. In addition, a
+ * family-level row is emitted for any coarse-level detection that cleared the
+ * reporting thresholds but whose descendant leaves were all left unreported.
+ *
+ * The motivation is sensitivity. A cluster representative is chosen among distant
+ * references, so its signatures are drawn from a far larger pool of candidates than
+ * any of its near-identical members can offer, and it stays detectable at
+ * abundances where no individual member is separable. Reporting only leaves throws
+ * that evidence away and returns nothing; reporting the family instead degrades
+ * gracefully, naming the group when the member cannot be pinned down. Family rows
+ * carry the internal node name from the index's tree_index.tsv, which lists the
+ * members they stand for.
+ *
+ * @param sketchCount  Per-leaf signature hit counts.
+ * @param sketchRef  Leaf reference names.
+ * @param refSigCount  Per-leaf signature:count maps, for the detailed log.
+ * @param refRead  Per-leaf sets of matching read ids.
+ * @param families  Coarse-level detections, ordered coarsest first.
+ * @param fPath  Unused; retained to mirror generateQueryResult's signature.
+ */
+void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
+                             const std::vector<std::string>& sketchRef,
+                             const std::vector<SketchHash>& refSigCount,
+                             const std::vector<std::unordered_set<std::string>>& refRead,
+                             const std::vector<FamilyCall>& families,
+                             const std::string& fPath) {
+    (void) fPath;
+
+    auto leafReported = [&](unsigned i) {
+        return refRead[i].size() > static_cast<size_t>(opt::readCutoff) &&
+               sketchCount[i] >= static_cast<unsigned>(opt::sketchHit);
+    };
+
+    // Which leaves clear the reporting thresholds.
+    std::unordered_set<std::string> reportedLeaves;
+    for (unsigned i = 0; i < sketchCount.size(); i++) {
+        if (leafReported(i)) reportedLeaves.insert(sketchRef[i]);
+    }
+
+    // A family is only worth reporting when it is itself confident and none of the
+    // leaves it covers was resolved; otherwise the leaf rows already say more.
+    std::vector<const FamilyCall*> reportedFamilies;
+    for (const FamilyCall& f : families) {
+        if (f.count < static_cast<unsigned>(opt::sketchHit) ||
+            f.reads <= static_cast<size_t>(opt::readCutoff)) {
+            continue;
+        }
+        bool anyLeafResolved = false;
+        for (const std::string& leaf : f.coveredLeaves) {
+            if (reportedLeaves.count(leaf)) { anyLeafResolved = true; break; }
+        }
+        if (!anyLeafResolved) reportedFamilies.push_back(&f);
+    }
+
+    // Abundance is relative to everything reported, families included, so the
+    // column still sums to 1 over the rows in the file.
+    size_t sketchSum = 0;
+    for (unsigned i = 0; i < sketchCount.size(); i++) {
+        if (leafReported(i)) sketchSum += sketchCount[i];
+    }
+    for (const FamilyCall* f : reportedFamilies) sketchSum += f->count;
+
+    // Merge leaf and family rows, then order by descending count.
+    struct Row { std::string name; unsigned count; bool isFamily; };
+    std::vector<Row> rows;
+    for (unsigned i = 0; i < sketchCount.size(); i++) {
+        if (leafReported(i)) rows.push_back({sketchRef[i], sketchCount[i], false});
+    }
+    for (const FamilyCall* f : reportedFamilies) {
+        rows.push_back({f->name, f->count, true});
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.count > b.count; });
+
+    std::ofstream outFile(opt::out);
+    outFile << "ref\tabundance\tcount\n";
+    if (sketchSum != 0) {
+        for (const Row& r : rows) {
+            double abundance = static_cast<double>(r.count) / sketchSum;
+            if (abundance > opt::abundanceCutoff) {
+                outFile << r.name << "\t" << abundance << "\t" << r.count << "\n";
+            }
+        }
+    }
+    outFile.close();
+
+    if (!reportedFamilies.empty()) {
+        std::cerr << "Tree query: " << reportedFamilies.size()
+                  << " family-level call(s) reported where no leaf could be resolved:";
+        for (const FamilyCall* f : reportedFamilies) {
+            std::cerr << " " << f->name << "(" << f->coveredLeaves.size() << " members)";
+        }
+        std::cerr << "\n";
+    }
+
+    // Detailed signature log, over leaves as before.
+    std::ofstream logSig(prefixBasename(opt::out, "log_"));
+    logSig << "ref\ttotal_reads\tsignature\tcount\n";
+    for (unsigned i = 0; i < refSigCount.size(); i++) {
+        for (const auto& [sig, count] : refSigCount[i]) {
+            if (count) {
+                logSig << sketchRef[i] << "\t" << refRead[i].size()
+                       << "\t" << sig << "\t" << count << "\n";
+            }
+        }
+    }
+    logSig.close();
+}
+
 void generateQueryResult(std::vector<unsigned>& sketchCount,
                          const std::vector<std::string>& sketchRef,
                          const std::vector<SketchHash>& refSigCount,

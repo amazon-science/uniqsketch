@@ -39,13 +39,14 @@ static const char USAGE_MESSAGE[] =
     "      --very-sensitive\tsets sensitivity parameter h=5\n"
     "      --solid\t\tonly use solid k-mers in reads\n"
     "      --tree=DIR\thierarchical query using a --tree index directory\n"
+    "      --tree-prune=N\tmin coarse-level hits to keep a sub-tree in play (with --tree) [1]\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\tversion information and exit\n"
     "\n";
 
 static const char shortopts[] = "t:g:l:r:o:h:a:s:b:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE };
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -61,6 +62,7 @@ static const struct option longopts[] = {
     {"very-sensitive", no_argument, &opt::sketchHit, 5},
     {"solid",          no_argument, &opt::solid, 1},
     {"tree",           required_argument, nullptr, OPT_TREE},
+    {"tree-prune",     required_argument, nullptr, OPT_TREEPRUNE},
     {"help",           no_argument, nullptr, OPT_HELP},
     {"version",        no_argument, nullptr, OPT_VERSION},
     {nullptr, 0, nullptr, 0}
@@ -108,10 +110,16 @@ static void runTreeQuery(const std::string& treeDir,
     // never-clustered leaves placed at the deepest internal level.
     std::unordered_map<unsigned,
         std::unordered_map<std::string, std::unordered_set<std::string>>> levelMap;
+    // Internal node name per (level, representative), so a family-level call can be
+    // reported under the same name the index's tree_index.tsv uses for that group.
+    std::unordered_map<unsigned,
+        std::unordered_map<std::string, std::string>> levelNodeName;
     for (size_t idx = 0; idx < tree.size(); idx++) {
         const TreeNode& node = tree[idx];
-        if (!node.isLeaf)
+        if (!node.isLeaf) {
             levelMap[node.level][getBaseId(node.filePath)] = descLeaves[idx];
+            levelNodeName[node.level][getBaseId(node.filePath)] = node.name;
+        }
     }
     if (anyInternal) {
         for (size_t idx = 0; idx < tree.size(); idx++) {
@@ -148,6 +156,7 @@ static void runTreeQuery(const std::string& treeDir,
 
     std::unordered_set<std::string> candidates;  // surviving candidate leaf names
     bool firstLevel = true;
+    std::vector<FamilyCall> familyCalls;         // coarse detections, for level-appropriate reporting
 
     for (size_t li = 0; li < levelSketches.size(); li++) {
         unsigned level = levelSketches[li].first;
@@ -186,21 +195,55 @@ static void runTreeQuery(const std::string& treeDir,
         querySampleBatch(sampleFiles, levelHash, levelCount, levelSig, levelRead);
 
         if (isLeaf) {
-            generateQueryResult(levelCount, levelRef, levelSig, levelRead, opt::out);
+            generateTreeQueryResult(levelCount, levelRef, levelSig, levelRead,
+                                    familyCalls, opt::out);
             std::cerr << "Tree query: leaf level " << level << " ("
                       << levelRef.size() << " leaves) -> " << opt::out << "\n";
             break;
         }
 
-        // Narrow: descendants of representatives that cleared the thresholds.
-        std::unordered_set<std::string> nextCandidates;
         const auto& lm = levelMap[level];
+
+        // Two independent decisions are made from the same coarse-level evidence.
+        //
+        // Pruning decides which sub-trees are still worth querying, and is
+        // deliberately permissive: anything with a trace of evidence stays in play,
+        // because a sub-tree dropped here can never be recovered at a finer level.
+        // Requiring the full reporting thresholds to survive pruning made the tree
+        // strictly less sensitive than a flat index, since a representative that
+        // fell just short took all of its leaves down with it.
+        //
+        // Reporting decides whether this level's evidence is strong enough to stand
+        // on its own as a family-level call, and uses the ordinary thresholds. Both
+        // levels emit the same number of signatures per reference, so the counts are
+        // on a comparable scale and no separate reporting threshold is needed.
+        std::unordered_set<std::string> nextCandidates;
         for (unsigned i = 0; i < levelRef.size(); i++) {
-            if (levelCount[i] >= static_cast<unsigned>(opt::sketchHit) &&
-                levelRead[i].size() > static_cast<size_t>(opt::readCutoff)) {
-                auto it = lm.find(levelRef[i]);
-                if (it != lm.end())
-                    nextCandidates.insert(it->second.begin(), it->second.end());
+            auto it = lm.find(levelRef[i]);
+            if (it == lm.end()) continue;
+
+            bool survivesPruning =
+                levelCount[i] >= static_cast<unsigned>(opt::treePruneHit) &&
+                !levelRead[i].empty();
+            if (survivesPruning) {
+                nextCandidates.insert(it->second.begin(), it->second.end());
+            }
+
+            bool worthReporting =
+                levelCount[i] >= static_cast<unsigned>(opt::sketchHit) &&
+                levelRead[i].size() > static_cast<size_t>(opt::readCutoff);
+            if (worthReporting) {
+                // Held as a candidate family call; only emitted if the leaf level
+                // fails to resolve any member of this group.
+                const auto& nameMap = levelNodeName[level];
+                auto nit = nameMap.find(levelRef[i]);
+                FamilyCall fc;
+                fc.name = (nit != nameMap.end()) ? nit->second : levelRef[i];
+                fc.level = level;
+                fc.count = levelCount[i];
+                fc.reads = levelRead[i].size();
+                fc.coveredLeaves = it->second;
+                familyCalls.push_back(std::move(fc));
             }
         }
         candidates.swap(nextCandidates);
@@ -234,6 +277,7 @@ int main(int argc, char* const argv[]) {
         case 's': arg >> opt::readCutoff;      break;
         case 'b': arg >> opt::bits;            break;
         case OPT_TREE: arg >> treeDir;         break;
+        case OPT_TREEPRUNE: arg >> opt::treePruneHit; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
