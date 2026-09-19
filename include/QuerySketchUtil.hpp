@@ -389,6 +389,50 @@ inline size_t countSigsHit(const SketchHash& sigCount) {
 }
 
 /**
+ * Write the per-signature hit log (`log_<out>`): one row per signature that was
+ * seen at least once, with the number of distinct reads supporting its reference.
+ * Shared by the flat and tree writers so both produce the same evidence trail.
+ */
+inline void writeSignatureLog(const QuerySketchConfig& cfg,
+                              const std::vector<std::string>& sketchRef,
+                              const std::vector<SketchHash>& refSigCount,
+                              const std::vector<std::unordered_set<std::string>>& refRead) {
+    std::ofstream logSig(prefixBasename(cfg.out, "log_"));
+    logSig << "ref\ttotal_reads\tsignature\tcount\n";
+    for (unsigned i = 0; i < refSigCount.size(); i++) {
+        for (const auto& [sig, count] : refSigCount[i]) {
+            if (count) {
+                logSig << sketchRef[i] << "\t" << refRead[i].size()
+                       << "\t" << sig << "\t" << count << "\n";
+            }
+        }
+    }
+}
+
+/**
+ * Write the read-level log (`logread_<out>`): for every reference with at least
+ * one matching read, the ids of those reads. This is the only place the tool
+ * exposes which reads carried a call, so a reference supported by a single read
+ * is listed too -- at low abundance that one read is the whole case for or
+ * against the call, and hiding it would leave the log unable to explain the
+ * `reads` column of the result table.
+ */
+inline void writeReadLog(const QuerySketchConfig& cfg,
+                         const std::vector<std::string>& sketchRef,
+                         const std::vector<std::unordered_set<std::string>>& refRead) {
+    std::ofstream logRead(prefixBasename(cfg.out, "logread_"));
+    logRead << "ref\tnum_reads\treads\n";
+    for (unsigned i = 0; i < refRead.size(); i++) {
+        if (refRead[i].empty()) continue;
+        logRead << sketchRef[i] << "\t" << refRead[i].size() << "\t";
+        for (const auto& rd : refRead[i]) {
+            logRead << rd << "\t";
+        }
+        logRead << "\n";
+    }
+}
+
+/**
  * Write the query result for a tree index.
  *
  * Leaf references are reported exactly as in the flat case. In addition, a
@@ -502,18 +546,9 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         std::cerr << "\n";
     }
 
-    // Detailed signature log, over leaves as before.
-    std::ofstream logSig(prefixBasename(cfg.out, "log_"));
-    logSig << "ref\ttotal_reads\tsignature\tcount\n";
-    for (unsigned i = 0; i < refSigCount.size(); i++) {
-        for (const auto& [sig, count] : refSigCount[i]) {
-            if (count) {
-                logSig << sketchRef[i] << "\t" << refRead[i].size()
-                       << "\t" << sig << "\t" << count << "\n";
-            }
-        }
-    }
-    logSig.close();
+    // Signature and read logs over leaves, same files as the flat writer.
+    writeSignatureLog(cfg, sketchRef, refSigCount, refRead);
+    writeReadLog(cfg, sketchRef, refRead);
 }
 
 void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sketchCount,
@@ -566,30 +601,8 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     }
     outFile.close();
 
-    // Detailed signature log
-    std::ofstream logSig(prefixBasename(cfg.out, "log_"));
-    logSig << "ref\ttotal_reads\tsignature\tcount\n";
-    for (unsigned i = 0; i < refSigCount.size(); i++) {
-        for (const auto& [sig, count] : refSigCount[i]) {
-            if (count) {
-                logSig << sketchRef[i] << "\t" << refRead[i].size()
-                       << "\t" << sig << "\t" << count << "\n";
-            }
-        }
-    }
-
-    // Read-level log: matched read ids per reference
-    std::ofstream logRead(prefixBasename(cfg.out, "logread_"));
-    logRead << "ref\tnum_reads\treads\n";
-    for (unsigned i = 0; i < refRead.size(); i++) {
-        if (refRead[i].size() > 1) {
-            logRead << sketchRef[i] << "\t" << refRead[i].size() << "\t";
-            for (const auto& rd : refRead[i]) {
-                logRead << rd << "\t";
-            }
-            logRead << "\n";
-        }
-    }
+    writeSignatureLog(cfg, sketchRef, refSigCount, refRead);
+    writeReadLog(cfg, sketchRef, refRead);
 }
 
 #endif // QUERYSKETCHUTIL_HPP_
