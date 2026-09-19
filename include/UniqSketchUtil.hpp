@@ -318,12 +318,14 @@ bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomF
  * @param fPath  Path to a reference's candidate unique k-mers.
  * @param refId  Integer id assigned to the reference.
  * @param sketchFilter  Bloom filter for the unique sketch.
- * @param out  Output file stream for the uniqsketch.
+ * @param out  Stream receiving this reference's signatures. buildSketch passes a
+ *             per-reference buffer so output order is independent of thread
+ *             scheduling.
  * @param dbFilter  Distinct Bloom filter over the whole universe (margin check).
  * @return Number of signatures selected and how many met the margin.
  */
 SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, unsigned refId,
-                      BloomFilter& sketchFilter, std::ofstream& out,
+                      BloomFilter& sketchFilter, std::ostream& out,
                       const BloomFilter& dbFilter) {
     // Read all candidate lines
     std::vector<std::string> lines;
@@ -403,7 +405,7 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
                 if (sketchFilter.insert_make_change(*itr)) {
                     ++count;
                     found = true;
-                    #pragma omp critical(out)
+                    // `out` is this reference's private buffer, so no lock is needed.
                     out << useq << "\t" << refId << "\t" << getBaseId(fPath)
                         << "\t" << cfg.numRef << "\t" << contig << "\t" << pos << "\n";
                 }
@@ -465,9 +467,16 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
                   return sketchRank(s1) < sketchRank(s2);
               });
 
-    std::ofstream out(cfg.outfile);
     BloomFilter sketchFilter(cfg.bits * cfg.sketchnum * uniqStats.size(),
                              cfg.nhash1, cfg.kmerLen);
+
+    // Each reference writes its signatures into its own buffer, and the buffers
+    // are emitted in reference order once the parallel loop is done. Writing
+    // straight to the file from inside the loop (as this used to) made the block
+    // order follow thread completion, so two builds of the same index produced
+    // the same signatures in a different line order -- a real reproducibility
+    // gap, invisible to any check that sorted the file first.
+    std::vector<std::ostringstream> perRef(uniqStats.size());
 
     size_t totalSel = 0, totalSafe = 0;
     #pragma omp parallel for schedule(dynamic) reduction(+:totalSel, totalSafe)
@@ -476,10 +485,13 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
         std::string sketchPath;
         size_t sketchCount, sketchRefId;
         uniqstm >> sketchPath >> sketchCount >> sketchRefId;
-        SketchStat st = getUniqSet(cfg, sketchPath, sketchRefId, sketchFilter, out, dbFilter);
+        SketchStat st = getUniqSet(cfg, sketchPath, sketchRefId, sketchFilter, perRef[i], dbFilter);
         totalSel += st.selected;
         totalSafe += st.safe;
     }
+
+    std::ofstream out(cfg.outfile);
+    for (const auto& buf : perRef) out << buf.str();
     out.close();
 
     if (cfg.minMargin >= 2) {

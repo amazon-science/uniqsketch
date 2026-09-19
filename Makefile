@@ -42,8 +42,13 @@ treesketchtest: test/treesketchtest.cpp
 headerstest: test/headerstest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
 
-test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest
-	cd test; ./uniqsketchtest > /dev/null; ./querysketchtest > /dev/null; ./bloomfiltertest > /dev/null; ./comparesketchtest > /dev/null; ./treesketchtest > /dev/null; ./headerstest > /dev/null
+# End-to-end: builds an index and queries it in-process, so it needs OpenMP like
+# the real tools (the pipeline functions carry omp pragmas).
+e2etest: test/e2etest.cpp
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
+
+test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest e2etest
+	cd test; ./uniqsketchtest > /dev/null; ./querysketchtest > /dev/null; ./bloomfiltertest > /dev/null; ./comparesketchtest > /dev/null; ./treesketchtest > /dev/null; ./headerstest > /dev/null; ./e2etest > /dev/null
 
 clean:
 	rm bin/uniqsketch bin/querysketch bin/comparesketch 

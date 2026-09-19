@@ -61,7 +61,15 @@ target_link_libraries(treesketchtest PRIVATE ZLIB::ZLIB)
 add_executable(headerstest test/headerstest.cpp)
 target_link_libraries(headerstest PRIVATE ZLIB::ZLIB)
 
-set_target_properties(uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest
+# End-to-end: builds an index from the synthetic genomes in test/e2e/ and queries
+# them in-process. Runs the pipeline functions, which carry OpenMP pragmas.
+add_executable(e2etest test/e2etest.cpp)
+target_link_libraries(e2etest PRIVATE ZLIB::ZLIB)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(e2etest PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+set_target_properties(uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest e2etest
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test)
 
 # Tests run from the test/ source directory so they can find test data files
@@ -71,3 +79,4 @@ add_test(NAME bloomfiltertest COMMAND bloomfiltertest WORKING_DIRECTORY ${CMAKE_
 add_test(NAME comparesketchtest COMMAND comparesketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME treesketchtest COMMAND treesketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME headerstest COMMAND headerstest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
+add_test(NAME e2etest COMMAND e2etest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)

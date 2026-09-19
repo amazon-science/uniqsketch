@@ -1,0 +1,4 @@
+ref	reads	expected_abundance
+refA	7000	0.666667
+refB	3000	0.285714
+refA_var	500	0.047619

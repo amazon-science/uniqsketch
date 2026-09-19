@@ -11,6 +11,8 @@
 /test/comparesketchtest
 /test/treesketchtest
 /test/headerstest
+/test/e2etest
+/test/e2e_work/
 
 # Test-generated outputs (the expected_* fixtures are tracked)
 /test/db_uniq_count.tsv
