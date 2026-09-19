@@ -39,8 +39,11 @@ comparesketchtest: test/comparesketchtest.cpp
 treesketchtest: test/treesketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
 
-test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest
-	cd test; ./uniqsketchtest > /dev/null; ./querysketchtest > /dev/null; ./bloomfiltertest > /dev/null; ./comparesketchtest > /dev/null; ./treesketchtest > /dev/null
+headerstest: test/headerstest.cpp
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
+
+test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest
+	cd test; ./uniqsketchtest > /dev/null; ./querysketchtest > /dev/null; ./bloomfiltertest > /dev/null; ./comparesketchtest > /dev/null; ./treesketchtest > /dev/null; ./headerstest > /dev/null
 
 clean:
 	rm bin/uniqsketch bin/querysketch bin/comparesketch 

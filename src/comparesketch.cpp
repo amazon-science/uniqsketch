@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
     double sTime = omp_get_wtime();
 #endif
 
+    CompareSketchConfig cfg;
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
         std::istringstream arg(optarg != nullptr ? optarg : "");
@@ -73,17 +74,17 @@ int main(int argc, char** argv) {
         case '?':
             die = true;
             break;
-        case 't': arg >> opt::threads; break;
-        case 'k': arg >> opt::kmerLen; break;
-        case 'b': arg >> opt::bits;    break;
-        case 'd': arg >> opt::nhash;   break;
-        case 'g': arg >> opt::dbfSize; break;
-        case 'o': arg >> opt::outfile; break;
-        case 'm': arg >> opt::memBudgetGB; break;
-        case OPT_AUTOGSIZE: opt::autoGsize = true; break;
-        case OPT_AUTO: opt::autoSize = true; break;
-        case OPT_FPR: arg >> opt::targetFpr; break;
-        case OPT_LOWMEM: opt::memBudgetGB = 0; break;
+        case 't': arg >> cfg.threads; break;
+        case 'k': arg >> cfg.kmerLen; break;
+        case 'b': arg >> cfg.bits;    break;
+        case 'd': arg >> cfg.nhash;   break;
+        case 'g': arg >> cfg.dbfSize; break;
+        case 'o': arg >> cfg.outfile; break;
+        case 'm': arg >> cfg.memBudgetGB; break;
+        case OPT_AUTOGSIZE: cfg.autoGsize = true; break;
+        case OPT_AUTO: cfg.autoSize = true; break;
+        case OPT_FPR: arg >> cfg.targetFpr; break;
+        case OPT_LOWMEM: cfg.memBudgetGB = 0; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
         std::cerr << PROGRAM ": missing arguments\n";
         die = true;
     }
-    if (opt::outfile.empty()) {
+    if (cfg.outfile.empty()) {
         std::cerr << PROGRAM ": missing outfile argument\n";
         die = true;
     }
@@ -142,43 +143,43 @@ int main(int argc, char** argv) {
     if (!validateFiles(refSet2, "reference file (list 2)")) exit(EXIT_FAILURE);
 
 #ifdef _OPENMP
-    omp_set_num_threads(opt::threads);
+    omp_set_num_threads(cfg.threads);
 #endif
 
     // Optional: derive bits-per-element from a target false-positive rate.
     // FPR p = (1 - e^(-h/b))^h  =>  b = -h / ln(1 - p^(1/h)).
-    if (opt::targetFpr > 0.0 && opt::targetFpr < 1.0) {
-        double h = static_cast<double>(opt::nhash);
-        double b = -h / std::log(1.0 - std::pow(opt::targetFpr, 1.0 / h));
-        opt::bits = static_cast<unsigned>(std::ceil(b));
-        std::cerr << PROGRAM ": target FPR " << opt::targetFpr
-                  << " -> " << opt::bits << " bits/element\n";
+    if (cfg.targetFpr > 0.0 && cfg.targetFpr < 1.0) {
+        double h = static_cast<double>(cfg.nhash);
+        double b = -h / std::log(1.0 - std::pow(cfg.targetFpr, 1.0 / h));
+        cfg.bits = static_cast<unsigned>(std::ceil(b));
+        std::cerr << PROGRAM ": target FPR " << cfg.targetFpr
+                  << " -> " << cfg.bits << " bits/element\n";
     }
 
     // Optional Bloom-filter sizing. --auto uses an ntCard cardinality estimate of
     // the reference set; --auto-gsize uses the largest input genome size. Both fix
     // the load factor (bits per distinct k-mer) so the false-positive rate is the
     // design value rather than depending on a manually chosen --gsize.
-    if (opt::autoSize) {
+    if (cfg.autoSize) {
         size_t kmerNum = 0, dbsize = 0, sbsize = 0;
-        getCardinality(kmerNum, dbsize, sbsize, opt::kmerLen, opt::threads, refSet1);
-        if (dbsize > 0) opt::dbfSize = dbsize;
+        getCardinality(kmerNum, dbsize, sbsize, cfg.kmerLen, cfg.threads, refSet1);
+        if (dbsize > 0) cfg.dbfSize = dbsize;
         std::cerr << PROGRAM ": ntCard cardinality F0=" << dbsize
-                  << " -> dbfSize=" << opt::dbfSize << "\n";
-    } else if (opt::autoGsize) {
+                  << " -> dbfSize=" << cfg.dbfSize << "\n";
+    } else if (cfg.autoGsize) {
         std::vector<std::string> allRefs(refSet1);
         allRefs.insert(allRefs.end(), refSet2.begin(), refSet2.end());
-        opt::dbfSize = estimateMaxGenomeSize(allRefs);
-        std::cerr << PROGRAM ": largest input genome -> dbfSize=" << opt::dbfSize << "\n";
+        cfg.dbfSize = estimateMaxGenomeSize(allRefs);
+        std::cerr << PROGRAM ": largest input genome -> dbfSize=" << cfg.dbfSize << "\n";
     }
     {
-        double load = static_cast<double>(opt::nhash) / opt::bits;  // h*n/m at n=dbfSize
-        double fpr = std::pow(1.0 - std::exp(-load), opt::nhash);
-        std::cerr << PROGRAM ": bits=" << opt::bits << ", dbfSize=" << opt::dbfSize
+        double load = static_cast<double>(cfg.nhash) / cfg.bits;  // h*n/m at n=dbfSize
+        double fpr = std::pow(1.0 - std::exp(-load), cfg.nhash);
+        std::cerr << PROGRAM ": bits=" << cfg.bits << ", dbfSize=" << cfg.dbfSize
                   << ", design FPR=" << fpr << "\n";
     }
 
-    identifyDifference(refSet1, refSet2);
+    identifyDifference(cfg, refSet1, refSet2);
 
 #ifdef _OPENMP
     std::cout << "Runtime(sec): " << std::setprecision(4) << std::fixed

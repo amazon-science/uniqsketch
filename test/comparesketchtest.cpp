@@ -7,7 +7,7 @@
 #include "CompareSketchUtil.hpp"
 
 // Test that loadBloomFilter populates the filter so known k-mers are found
-void testLoadBloomFilter() {
+void testLoadBloomFilter(const CompareSketchConfig& cfg) {
     std::cerr << "START: Test loadBloomFilter... \t";
 
     /*
@@ -15,8 +15,8 @@ void testLoadBloomFilter() {
     With k=10, the 4 k-mers are: CAGGCTACAA, AGGCTACAAA, GAGACTGAAC, AGACTGAACT.
     After loading into a BF, querying these k-mers by hash should return true.
     */
-    BloomFilter dbFilter(opt::bits * opt::dbfSize, opt::nhash, opt::kmerLen);
-    loadBloomFilter("ref_test_1.fa", dbFilter);
+    BloomFilter dbFilter(cfg.bits * cfg.dbfSize, cfg.nhash, cfg.kmerLen);
+    loadBloomFilter(cfg, "ref_test_1.fa", dbFilter);
 
     // Verify a known k-mer is present by hashing it
     std::string kmer("CAGGCTACAA");
@@ -30,18 +30,18 @@ void testLoadBloomFilter() {
 }
 
 // Test checkBloomFilter computes correct similarity between identical references
-void testCheckBloomFilterIdentical() {
+void testCheckBloomFilterIdentical(const CompareSketchConfig& cfg) {
     std::cerr << "START: Test checkBloomFilter (identical)... \t";
 
     /*
     Load ref_test_1 into BF, then check ref_test_1 against itself.
     All k-mers should be found -> similarity = 1.0, countUnique = 0.
     */
-    BloomFilter dbFilter(opt::bits * opt::dbfSize, opt::nhash, opt::kmerLen);
-    loadBloomFilter("ref_test_1.fa", dbFilter);
+    BloomFilter dbFilter(cfg.bits * cfg.dbfSize, cfg.nhash, cfg.kmerLen);
+    loadBloomFilter(cfg, "ref_test_1.fa", dbFilter);
 
     size_t countAll = 0, countUnique = 0;
-    double similarity = checkBloomFilter("ref_test_1.fa", dbFilter, countAll, countUnique);
+    double similarity = checkBloomFilter(cfg, "ref_test_1.fa", dbFilter, countAll, countUnique);
 
     assert(countAll == 4);      // 4 k-mers of length 10 from two 11bp sequences
     assert(countUnique == 0);   // all found in BF
@@ -51,7 +51,7 @@ void testCheckBloomFilterIdentical() {
 }
 
 // Test checkBloomFilter between different references
-void testCheckBloomFilterDifferent() {
+void testCheckBloomFilterDifferent(const CompareSketchConfig& cfg) {
     std::cerr << "START: Test checkBloomFilter (different)... \t";
 
     /*
@@ -63,11 +63,11 @@ void testCheckBloomFilterDifferent() {
     Note: BF uses ntHash (canonical), so we check by hash not exact string.
     countAll = 4, similarity should be ~0.25 (1 shared / 4 total).
     */
-    BloomFilter dbFilter(opt::bits * opt::dbfSize, opt::nhash, opt::kmerLen);
-    loadBloomFilter("ref_test_1.fa", dbFilter);
+    BloomFilter dbFilter(cfg.bits * cfg.dbfSize, cfg.nhash, cfg.kmerLen);
+    loadBloomFilter(cfg, "ref_test_1.fa", dbFilter);
 
     size_t countAll = 0, countUnique = 0;
-    double similarity = checkBloomFilter("ref_test_2.fa", dbFilter, countAll, countUnique);
+    double similarity = checkBloomFilter(cfg, "ref_test_2.fa", dbFilter, countAll, countUnique);
 
     assert(countAll == 4);
     // At least some k-mers should be unique to ref_test_2
@@ -78,14 +78,15 @@ void testCheckBloomFilterDifferent() {
 }
 
 int main() {
-    opt::kmerLen = 10;
-    opt::bits = 128;
-    opt::nhash = 3;
-    opt::dbfSize = 100;
+    CompareSketchConfig cfg;
+    cfg.kmerLen = 10;
+    cfg.bits = 128;
+    cfg.nhash = 3;
+    cfg.dbfSize = 100;
 
-    testLoadBloomFilter();
-    testCheckBloomFilterIdentical();
-    testCheckBloomFilterDifferent();
+    testLoadBloomFilter(cfg);
+    testCheckBloomFilterIdentical(cfg);
+    testCheckBloomFilterDifferent(cfg);
 
     std::cerr << "CompareSketch: All tests PASSED!\n\n";
     return 0;
