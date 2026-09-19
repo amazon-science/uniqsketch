@@ -126,10 +126,10 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
 
 ```
-ref         abundance   count
-ref_1       0.7862      3033
-ref_2       0.1993      769
-ref_3       0.01426     55
+ref         abundance   count   reads   sigs_hit   sigs_total   resolution
+ref_1       0.7862      3033    2871    100        100          strain
+ref_2       0.1993      769     751     98         100          strain
+ref_3       0.01426     55      7       27         100          strain
 ```
 
 Reading this table:
@@ -137,6 +137,14 @@ Reading this table:
 * `count` is the number of signature k-mer hits observed for that reference.
 * `abundance` is `count` divided by the summed `count` of all **reported** references.
   Rows are sorted by descending `count`.
+* `reads` is the number of distinct reads that contributed at least one hit.
+* `sigs_hit` / `sigs_total` is how many of the reference's signatures were observed
+  at least once, out of how many it has.
+* `resolution` is `strain` for an individually resolved reference. With a `--tree`
+  index it may also be `family` — see [querysketch](#querysketch-1) below.
+
+The first three columns are unchanged from earlier versions; the rest are appended,
+so existing parsers keep working.
 
 Two consequences worth knowing. First, `abundance` is a *relative* figure: it sums
 to 1.0 across the rows in the file, so it answers "of the material I could identify,
@@ -145,6 +153,34 @@ reference?" Reads from organisms absent from your index, and reads filtered out 
 the thresholds below, are not in the denominator. Second, references failing any
 reporting threshold are omitted entirely rather than listed with a zero, so an
 absent row means "not called", which is not the same as "not present".
+
+**Judging a call.** `abundance` says how much; the remaining columns say how much to
+trust it, which the abundance figure alone hides — two references can share an
+abundance while one rests on thousands of reads and the other on three. Read them
+together:
+
+* **`reads` is per-call evidence. Do not compare it across references.** A read
+  overlapping several signatures at once counts once in `reads` but several times in
+  `count`, and how often that happens depends on how tightly a reference's signatures
+  are packed along its genome. Near-identical strains have their few unique k-mers
+  concentrated in the short regions where they differ, so a single read can carry 20
+  of their signatures, while a distinct genome's signatures are spread out and a read
+  carries about one. At the same depth these two references show similar `count` but
+  `reads` figures 20-fold apart. `count` is the right basis for abundance precisely
+  because this packing effect cancels in expectation; `reads` does not, which is why
+  it is reported as evidence rather than used for abundance.
+* **`count / reads` is the per-read multiplicity.** A high ratio means a clustered
+  signature region, and it also means a spurious read there is amplified: one
+  chimeric read on such a region contributes many hits. `count=60, reads=3` is three
+  reads sitting on a signature cluster and deserves suspicion; `count=60, reads=55`
+  is independent evidence.
+* **`sigs_hit` low relative to `sigs_total`, with a high `count`,** means many hits on
+  few signatures — the pattern of a repeat or a cross-mapping rather than genuine
+  presence. Support spread across most of a reference's signatures is what a real
+  detection looks like.
+* Every call has already cleared `--hit` (on `count`) and `--rcutoff` (on `reads`).
+  These columns let you see how far above those floors a call sits: `reads=3` is one
+  read above the default cutoff; `reads=30000` is unimpeachable.
 
 * `log_out_sample.tsv`: detailed log showing for each reference the total number of assigned reads and all `signature:count` pairs.
 * `logread_out_sample.tsv`: read-level log listing all matched read IDs per reference.
@@ -276,6 +312,7 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --very-sensitive  sets sensitivity parameter h=5
       --solid           only use solid k-mers in reads
       --tree=DIR        hierarchical query using a --tree index directory
+      --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
       --help            display this help and exit
       --version         version information and exit
 ```
@@ -309,6 +346,34 @@ trade-off is coverage-dependent: at very low coverage a genuine signature may
 legitimately appear only once, so `--solid` can suppress a true low-abundance call.
 Prefer it for typical-depth samples, and leave it off when chasing organisms near
 the detection floor.
+
+**Tree queries and family-level calls.** With `--tree=DIR`, the query walks the
+hierarchy from the coarsest level down and reports at the finest level it can
+resolve. Each row's `resolution` column says which:
+
+* `strain` — an individual reference, resolved at the leaf level. Identical in
+  meaning to a flat-index call.
+* `family` — a group of near-identical references that the coarse level detected
+  confidently but none of whose members could be told apart at the leaf level. The
+  `ref` column carries the group's node name from the index's `tree_index.tsv`
+  (e.g. `cluster_L1_AWS_Ec377`), where that file lists the members it stands for.
+
+Family rows exist because the coarse level is far more sensitive than the leaf
+level for near-identical strains. A cluster representative competes only with
+distant genomes, so its signatures are drawn from a pool orders of magnitude larger
+than any member's (94,406 vs 151 candidates in the 8-genome test set), and it stays
+detectable at abundances where no individual member has enough unique sequence to
+be separated. Rather than report nothing, the query reports the family. A family
+row is a reliable presence flag; its abundance reads high, because the
+representative's signatures collect reads from every member, so treat it as "one of
+these is here" rather than a precise quantity. A family row is never emitted when
+any of its members is reported as a strain.
+
+`--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
+sub-tree stays in play if its representative gathers at least N hits and one read
+at the coarse level; the default of 1 is deliberately permissive, because a sub-tree
+pruned here can never be recovered at a finer level. Raise it to speed up queries
+against very large reference sets at some cost in sensitivity at the detection floor.
 
 ### comparesketch
 ```

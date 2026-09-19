@@ -242,6 +242,8 @@ static void runTreeQuery(const std::string& treeDir,
                 fc.level = level;
                 fc.count = levelCount[i];
                 fc.reads = levelRead[i].size();
+                fc.sigsHit = countSigsHit(levelSig[i]);
+                fc.sigsTotal = levelSig[i].size();
                 fc.coveredLeaves = it->second;
                 familyCalls.push_back(std::move(fc));
             }

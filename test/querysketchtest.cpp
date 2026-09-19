@@ -47,8 +47,10 @@ void testGenerateQueryResult() {
 
     /*
     After querying r.fq:
-      expected_ref_test_1: count=3, expected_ref_test_2: count=0
-    Output should be: ref\tabundance\tcount -> expected_ref_test_1\t1\t3
+      expected_ref_test_1: count=3 (2 of its 2 signatures hit, 1 supporting read)
+      expected_ref_test_2: count=0 -> not reported
+    Output row: expected_ref_test_1  abundance=1  count=3  reads=1
+                sigs_hit=2  sigs_total=2  resolution=strain
     */
     std::vector<unsigned> sketchCount = {3, 0};
     std::vector<std::string> sketchRef = {"expected_ref_test_1", "expected_ref_test_2"};
@@ -56,7 +58,10 @@ void testGenerateQueryResult() {
         {{"AGGCTACAAA", 2}, {"AGACTGAACT", 1}},
         {{"CTCAGCTAAG", 0}, {"AGGCTACAAC", 0}}
     };
-    std::vector<std::unordered_set<std::string>> refRead{{"1"}};
+    // One entry per reference (the second has no supporting reads). Previously
+    // sized 1 for 2 references -- an out-of-bounds access that happened not to
+    // crash.
+    std::vector<std::unordered_set<std::string>> refRead{{"1"}, {}};
 
     generateQueryResult(sketchCount, sketchRef, refSigCount, refRead, opt::out);
     assert(compareFiles(opt::out, "expected_out_querysketch.tsv") == true);

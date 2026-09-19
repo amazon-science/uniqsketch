@@ -437,24 +437,40 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     for (const FamilyCall* f : reportedFamilies) sketchSum += f->count;
 
     // Merge leaf and family rows, then order by descending count.
-    struct Row { std::string name; unsigned count; bool isFamily; };
+    struct Row {
+        std::string name;
+        unsigned count;
+        size_t reads;
+        size_t sigsHit;
+        size_t sigsTotal;
+        bool isFamily;
+    };
     std::vector<Row> rows;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (leafReported(i)) rows.push_back({sketchRef[i], sketchCount[i], false});
+        if (leafReported(i)) {
+            rows.push_back({sketchRef[i], sketchCount[i], refRead[i].size(),
+                            countSigsHit(refSigCount[i]), refSigCount[i].size(), false});
+        }
     }
     for (const FamilyCall* f : reportedFamilies) {
-        rows.push_back({f->name, f->count, true});
+        rows.push_back({f->name, f->count, f->reads, f->sigsHit, f->sigsTotal, true});
     }
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.count > b.count; });
 
+    // Same schema as the flat writer; `resolution` distinguishes individually
+    // resolved references (`strain`) from group calls (`family`), so a family
+    // row can never be mistaken for a strain call downstream.
     std::ofstream outFile(opt::out);
-    outFile << "ref\tabundance\tcount\n";
+    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
     if (sketchSum != 0) {
         for (const Row& r : rows) {
             double abundance = static_cast<double>(r.count) / sketchSum;
             if (abundance > opt::abundanceCutoff) {
-                outFile << r.name << "\t" << abundance << "\t" << r.count << "\n";
+                outFile << r.name << "\t" << abundance << "\t" << r.count
+                        << "\t" << r.reads << "\t" << r.sigsHit
+                        << "\t" << r.sigsTotal
+                        << "\t" << (r.isFamily ? "family" : "strain") << "\n";
             }
         }
     }
@@ -502,9 +518,18 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
         }
     }
 
-    // Primary output: reference abundance table
+    // Primary output: reference abundance table. Columns beyond the third expose
+    // the evidence behind each call: `reads` is the number of distinct reads
+    // supporting it (two references can share an abundance while one rests on
+    // thousands of reads and the other on three), and `sigs_hit`/`sigs_total`
+    // show how many of the reference's signatures were seen at least once -- a
+    // call carried by a handful of its signatures suggests a repeat or
+    // cross-mapping, one supported across most of them does not. `resolution` is
+    // `strain` for individually resolved references; the tree query may also
+    // emit `family` rows (see generateTreeQueryResult). Columns are appended so
+    // parsers of the original three are unaffected.
     std::ofstream outFile(opt::out);
-    outFile << "ref\tabundance\tcount\n";
+    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
     if (sketchSum != 0) {
         for (unsigned i = 0; i < sketchCount.size(); i++) {
             unsigned idx = sketchIndex[i];
@@ -513,7 +538,11 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
                 double abundance = static_cast<double>(sketchCount[idx]) / sketchSum;
                 if (abundance > opt::abundanceCutoff) {
                     outFile << sketchRef[idx] << "\t" << abundance
-                            << "\t" << sketchCount[idx] << "\n";
+                            << "\t" << sketchCount[idx]
+                            << "\t" << refRead[idx].size()
+                            << "\t" << countSigsHit(refSigCount[idx])
+                            << "\t" << refSigCount[idx].size()
+                            << "\tstrain\n";
                 }
             }
         }
