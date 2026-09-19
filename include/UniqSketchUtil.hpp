@@ -14,28 +14,59 @@
 #include "BloomFilter.hpp"
 #include "ntHashIterator.hpp"
 
-namespace opt {
-unsigned numRef;                                        // number of references in the universe
-unsigned threads(1);                                    // number of threads
-unsigned bits(128);                                     // bits per element in Bloom filter
-unsigned nhash1(5);                                     // number of hashes for distinct BF
-unsigned nhash2(5);                                     // number of hashes for solid BF
-unsigned kmerLen(81);                                   // length of k-mer
-int sketchnum(100);                                     // unique k-mers to represent a reference
-size_t m1;                                              // bit size of distinct BF
-size_t m2;                                              // bit size of solid BF
-size_t dbfSize(0);                                      // distinct BF size (number of elements)
-size_t sbfSize(0);                                      // solid BF size (number of elements)
-std::string outdir("outdir_uniqsketch");                // dir for universe unique k-mers
-std::string refstat("db_uniq_count.tsv");               // unique k-mers stat filename
-std::string outfile("sketch_uniq.tsv");                 // output sketch file name
-unsigned kRange(5);                                     // k-mer spectrum range for entropy filter
-double maxEntropy(12.0);                                // initial entropy for k={1,2,3}
-double entropyThreshold(0.65);                          // entropy score rate threshold
-unsigned minMargin(1);                                  // min Hamming distance of signatures to other references (1 = off)
-unsigned maxHomopolymer(0);                             // max allowed homopolymer run in a signature (0 = off)
-bool strictMargin(false);                               // if true, --min-margin is a hard requirement (no fallback)
-}
+/**
+ * Settings for one index build.
+ *
+ * Passed explicitly to every function that needs it. Previously these lived in a
+ * mutable `namespace opt` defined in this header, which meant three things: no
+ * two *Util headers could be included in one translation unit (each defined the
+ * same names), no function could be tested under two settings in one process,
+ * and the tree path had to save and restore nine globals around every level
+ * because buildSketch mutated one of them as a side effect. A value type fixes
+ * all three: copy it, change the copy, pass the copy.
+ */
+struct UniqSketchConfig {
+    // Inputs and outputs
+    std::string outdir = "outdir_uniqsketch";           // dir for per-reference unique k-mer candidates
+    std::string refstat = "db_uniq_count.tsv";          // unique k-mer stat filename
+    std::string outfile = "sketch_uniq.tsv";            // output sketch filename
+    unsigned numRef = 0;                                // number of references in the universe
+
+    // Core parameters
+    unsigned threads = 1;                               // number of threads
+    unsigned kmerLen = 81;                              // k-mer length
+    int sketchnum = 100;                                // signatures per reference (-c)
+
+    // Bloom filters
+    unsigned bits = 128;                                // bits per element
+    unsigned nhash1 = 5;                                // hashes, distinct BF
+    unsigned nhash2 = 5;                                // hashes, solid BF
+    size_t dbfSize = 0;                                 // distinct BF element count (from ntCard)
+    size_t sbfSize = 0;                                 // solid BF element count (from ntCard)
+
+    // Signature filters
+    unsigned kRange = 5;                                // k'-mer spectrum range for the entropy filter
+    double entropyThreshold = 0.65;                     // low-complexity threshold (fraction of max entropy)
+    unsigned minMargin = 1;                             // min Hamming distance to other references (1 = off)
+    unsigned maxHomopolymer = 0;                        // max homopolymer run in a signature (0 = off)
+    bool strictMargin = false;                          // --min-margin is a hard requirement (no fallback)
+
+    // Derived Bloom-filter bit sizes.
+    size_t m1() const { return static_cast<size_t>(bits) * dbfSize; }
+    size_t m2() const { return static_cast<size_t>(bits) * sbfSize; }
+
+    /**
+     * Maximum aggregate entropy A_K for a signature of length kmerLen: 2k' for
+     * k' <= 3 (all 4^k' k'-mers can appear), log2(kmerLen - k' + 1) beyond that
+     * (bounded by the number of k'-mer positions). Was previously accumulated into
+     * a global by buildSketch, which is why the tree path had to snapshot it.
+     */
+    double maxEntropy() const {
+        double e = 12.0;                                // 2 + 4 + 6 for k' = 1, 2, 3
+        for (unsigned i = 4; i <= kRange; i++) e += std::log2(kmerLen - i + 1);
+        return e;
+    }
+};
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
 
@@ -46,7 +77,7 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  * @param dbFilter  Distinct Bloom filter for tracking distinct k-mers.
  * @param sbFilter  Solid Bloom filter for tracking repeat k-mers.
  */
-void loadBFfa(const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFilter) {
+void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFilter) {
     std::ifstream refFile(fPath);
     std::string seq;
     bool good = static_cast<bool>(std::getline(refFile, seq));
@@ -57,7 +88,7 @@ void loadBFfa(const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFi
             faSeq += seq;
             good = static_cast<bool>(std::getline(refFile, seq));
         }
-        ntHashIterator itr(faSeq, std::max(opt::nhash1, opt::nhash2), opt::kmerLen);
+        ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
         while (itr != itr.end()) {
             if (!dbFilter.insert_make_change(*itr)) {
                 sbFilter.insert(*itr);
@@ -75,11 +106,11 @@ void loadBFfa(const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFi
  * @param sbFilter  Solid Bloom filter for tracking repeat k-mers.
  * @param refCount  Vector of unique k-mer counts per reference.
  */
-void checkRef(const std::string& fPath, int refId,
+void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
               const BloomFilter& sbFilter, std::vector<int>& refCount) {
     std::ifstream refFile(fPath);
     std::string sampleId = getBaseId(fPath);
-    std::ofstream uniqFile(opt::outdir + "/" + sampleId + ".tsv");
+    std::ofstream uniqFile(cfg.outdir + "/" + sampleId + ".tsv");
     std::string seq;
     size_t countUnique = 0;
 
@@ -94,12 +125,12 @@ void checkRef(const std::string& fPath, int refId,
             faSeq += seq;
             good = static_cast<bool>(std::getline(refFile, seq));
         }
-        ntHashIterator itr(faSeq, opt::nhash2, opt::kmerLen);
+        ntHashIterator itr(faSeq, cfg.nhash2, cfg.kmerLen);
         while (itr != itr.end()) {
             if (!sbFilter.contains(*itr)) {
                 ++countUnique;
                 size_t seqLoc = itr.get_pos();
-                uniqFile << get_canonical(faSeq.substr(seqLoc, opt::kmerLen))
+                uniqFile << get_canonical(faSeq.substr(seqLoc, cfg.kmerLen))
                          << "\t" << seqLoc << "\t" << headerSeq << "\n";
             }
             ++itr;
@@ -120,36 +151,36 @@ void checkRef(const std::string& fPath, int refId,
  * @param dbFilter  Distinct Bloom filter, owned by the caller so it can be
  *                  reused for the cross-reference margin check in buildSketch.
  */
-void identifyUniqKmers(const std::vector<std::string>& refFiles, BloomFilter& dbFilter) {
-    std::cout << "k-mer length: " << opt::kmerLen << "\n"
-              << "Number of distinct k-mers: " << opt::dbfSize << "\n"
-              << "Number of repeat k-mers: " << opt::sbfSize << "\n"
-              << "Number of unique k-mers: " << opt::dbfSize - opt::sbfSize << "\n";
+void identifyUniqKmers(const UniqSketchConfig& cfg, const std::vector<std::string>& refFiles, BloomFilter& dbFilter) {
+    std::cout << "k-mer length: " << cfg.kmerLen << "\n"
+              << "Number of distinct k-mers: " << cfg.dbfSize << "\n"
+              << "Number of repeat k-mers: " << cfg.sbfSize << "\n"
+              << "Number of unique k-mers: " << cfg.dbfSize - cfg.sbfSize << "\n";
 
-    BloomFilter sbFilter(opt::m2, opt::nhash2, opt::kmerLen);
+    BloomFilter sbFilter(cfg.m2(), cfg.nhash2, cfg.kmerLen);
 
     #pragma omp parallel for schedule(dynamic)
     for (unsigned i = 0; i < refFiles.size(); ++i) {
-        loadBFfa(refFiles[i], dbFilter, sbFilter);
+        loadBFfa(cfg, refFiles[i], dbFilter, sbFilter);
     }
 
-    std::vector<int> refCount(opt::numRef);
+    std::vector<int> refCount(cfg.numRef);
     #pragma omp parallel for schedule(dynamic)
     for (unsigned i = 0; i < refFiles.size(); ++i) {
-        checkRef(refFiles[i], i, sbFilter, refCount);
+        checkRef(cfg, refFiles[i], i, sbFilter, refCount);
     }
 
-    std::ofstream tsvOut(opt::refstat);
+    std::ofstream tsvOut(cfg.refstat);
     for (size_t i = 0; i < refCount.size(); i++) {
-        tsvOut << opt::outdir << "/" << getBaseId(refFiles[i]) << ".tsv\t"
+        tsvOut << cfg.outdir << "/" << getBaseId(refFiles[i]) << ".tsv\t"
                << refCount[i] << "\t" << i << "\n";
     }
     tsvOut.close();
 
     std::cout << "Distinct BF actual fpr: " << std::setprecision(4) << std::fixed
-              << std::pow(static_cast<double>(dbFilter.get_pop()) / opt::m1, opt::nhash1) << "\n"
+              << std::pow(static_cast<double>(dbFilter.get_pop()) / cfg.m1(), cfg.nhash1) << "\n"
               << "Solid BF actual fpr: " << std::setprecision(4) << std::fixed
-              << std::pow(static_cast<double>(sbFilter.get_pop()) / opt::m2, opt::nhash2) << "\n";
+              << std::pow(static_cast<double>(sbFilter.get_pop()) / cfg.m2(), cfg.nhash2) << "\n";
 }
 
 /**
@@ -158,8 +189,8 @@ void identifyUniqKmers(const std::vector<std::string>& refFiles, BloomFilter& db
  * @param seq  DNA sequence to digitize.
  * @return Integer representation of the DNA sequence.
  */
-unsigned digitize(const std::string& seq) {
-    if (seq.length() > opt::kRange) {
+unsigned digitize(const UniqSketchConfig& cfg, const std::string& seq) {
+    if (seq.length() > cfg.kRange) {
         return 0;
     }
     uint64_t hVal = 0;
@@ -175,14 +206,14 @@ unsigned digitize(const std::string& seq) {
  * this is a direct local-run-length gate for indel-prone tracts (e.g. poly-G).
  *
  * @param signature  Signature sequence to check.
- * @return True if the longest single-base run exceeds opt::maxHomopolymer.
+ * @return True if the longest single-base run exceeds cfg.maxHomopolymer.
  */
-bool hasLongHomopolymer(const std::string& signature) {
-    if (opt::maxHomopolymer == 0) return false;   // filter disabled
+bool hasLongHomopolymer(const UniqSketchConfig& cfg, const std::string& signature) {
+    if (cfg.maxHomopolymer == 0) return false;   // filter disabled
     unsigned run = 1;
     for (size_t i = 1; i < signature.size(); i++) {
         if (signature[i] == signature[i - 1]) {
-            if (++run > opt::maxHomopolymer) return true;
+            if (++run > cfg.maxHomopolymer) return true;
         } else {
             run = 1;
         }
@@ -196,8 +227,8 @@ bool hasLongHomopolymer(const std::string& signature) {
  * @param signature  Signature sequence to check.
  * @return True if the signature is low-complexity, false otherwise.
  */
-bool lowComplexity(const std::string& signature) {
-    if (opt::kmerLen <= opt::kRange) {
+bool lowComplexity(const UniqSketchConfig& cfg, const std::string& signature) {
+    if (cfg.kmerLen <= cfg.kRange) {
         return true;
     }
 
@@ -206,7 +237,7 @@ bool lowComplexity(const std::string& signature) {
     unsigned kmerSpec[MAX_SPEC];
 
     double aggEntropy = 0.0;
-    for (unsigned k = 1; k <= opt::kRange; k++) {
+    for (unsigned k = 1; k <= cfg.kRange; k++) {
         unsigned specSize = 1u << (2 * k);
         unsigned mask = specSize - 1;
         std::memset(kmerSpec, 0, specSize * sizeof(unsigned));
@@ -234,7 +265,7 @@ bool lowComplexity(const std::string& signature) {
         }
         aggEntropy += entropy;
     }
-    return (aggEntropy / opt::maxEntropy <= opt::entropyThreshold);
+    return (aggEntropy / cfg.maxEntropy() <= cfg.entropyThreshold);
 }
 
 /**
@@ -257,20 +288,20 @@ struct SketchStat {
  * drop an otherwise-good signature but never keeps an unsafe one. ntHash is
  * canonical, so probing a mutated neighbor is reverse-complement-correct.
  *
- * @param sig  Candidate signature (length opt::kmerLen).
+ * @param sig  Candidate signature (length cfg.kmerLen).
  * @param dbFilter  Distinct Bloom filter over all universe k-mers.
  * @return True if no Hamming-1 neighbor is present in the universe.
  */
-bool isTwoSafe(const std::string& sig, const BloomFilter& dbFilter) {
+bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomFilter& dbFilter) {
     static const char BASES[4] = {'A', 'C', 'G', 'T'};
     std::string neighbor = sig;
-    uint64_t hVal[opt::nhash1];
+    uint64_t hVal[cfg.nhash1];
     for (size_t i = 0; i < neighbor.size(); ++i) {
         const char orig = neighbor[i];
         for (char b : BASES) {
             if (b == orig) continue;
             neighbor[i] = b;
-            NTMC64(neighbor.c_str(), opt::kmerLen, opt::nhash1, hVal);
+            NTMC64(neighbor.c_str(), cfg.kmerLen, cfg.nhash1, hVal);
             if (dbFilter.contains(hVal)) {
                 neighbor[i] = orig;
                 return false;
@@ -291,7 +322,7 @@ bool isTwoSafe(const std::string& sig, const BloomFilter& dbFilter) {
  * @param dbFilter  Distinct Bloom filter over the whole universe (margin check).
  * @return Number of signatures selected and how many met the margin.
  */
-SketchStat getUniqSet(const std::string& fPath, unsigned refId,
+SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, unsigned refId,
                       BloomFilter& sketchFilter, std::ofstream& out,
                       const BloomFilter& dbFilter) {
     // Read all candidate lines
@@ -345,12 +376,12 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
               });
 
     // Select evenly spaced candidates, checking low-complexity (and, when
-    // opt::minMargin >= 2, the cross-reference Hamming margin) lazily.
+    // cfg.minMargin >= 2, the cross-reference Hamming margin) lazily.
     int count = 0;
     size_t safeCount = 0;
-    size_t needed = std::min(static_cast<size_t>(opt::sketchnum), total);
+    size_t needed = std::min(static_cast<size_t>(cfg.sketchnum), total);
     double step = static_cast<double>(total) / needed;
-    const bool useMargin = (opt::minMargin >= 2);
+    const bool useMargin = (cfg.minMargin >= 2);
 
     // Commit the first usable candidate in [a, b). When requireSafe is set, only
     // 2-safe candidates are accepted. Returns true if a signature was committed.
@@ -362,11 +393,11 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
             unsigned pos;
             seqstm >> useq >> pos >> contig;
 
-            if (lowComplexity(useq)) continue;
-            if (hasLongHomopolymer(useq)) continue;
-            if (requireSafe && !isTwoSafe(useq, dbFilter)) continue;
+            if (lowComplexity(cfg, useq)) continue;
+            if (hasLongHomopolymer(cfg, useq)) continue;
+            if (requireSafe && !isTwoSafe(cfg, useq, dbFilter)) continue;
 
-            ntHashIterator itr(useq, opt::nhash1, opt::kmerLen);
+            ntHashIterator itr(useq, cfg.nhash1, cfg.kmerLen);
             bool found = false;
             while (itr != itr.end()) {
                 if (sketchFilter.insert_make_change(*itr)) {
@@ -374,7 +405,7 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
                     found = true;
                     #pragma omp critical(out)
                     out << useq << "\t" << refId << "\t" << getBaseId(fPath)
-                        << "\t" << opt::numRef << "\t" << contig << "\t" << pos << "\n";
+                        << "\t" << cfg.numRef << "\t" << contig << "\t" << pos << "\n";
                 }
                 ++itr;
             }
@@ -383,7 +414,7 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
         return false;
     };
 
-    for (size_t s = 0; s < needed && count < opt::sketchnum; s++) {
+    for (size_t s = 0; s < needed && count < cfg.sketchnum; s++) {
         size_t slotStart = static_cast<size_t>(s * step);
         size_t slotEnd = (s + 1 < needed) ? static_cast<size_t>((s + 1) * step) : total;
 
@@ -392,7 +423,7 @@ SketchStat getUniqSet(const std::string& fPath, unsigned refId,
             // margin-1 candidate if the slot has no 2-safe option; in strict mode
             // leave the slot empty rather than admit a margin-1 signature.
             if (trySlot(slotStart, slotEnd, true)) ++safeCount;
-            else if (!opt::strictMargin) trySlot(slotStart, slotEnd, false);
+            else if (!cfg.strictMargin) trySlot(slotStart, slotEnd, false);
         } else {
             trySlot(slotStart, slotEnd, false);
         }
@@ -421,7 +452,7 @@ inline int sketchRank(const std::string& sketchLine) {
  * @param statFile  Path to the unique k-mer stat file for all references.
  * @param dbFilter  Distinct Bloom filter over the whole universe (margin check).
  */
-void buildSketch(const std::string& statFile, const BloomFilter& dbFilter) {
+void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const BloomFilter& dbFilter) {
     std::ifstream tsvIn(statFile);
     std::vector<std::string> uniqStats;
     std::string line;
@@ -434,13 +465,9 @@ void buildSketch(const std::string& statFile, const BloomFilter& dbFilter) {
                   return sketchRank(s1) < sketchRank(s2);
               });
 
-    std::ofstream out(opt::outfile);
-    BloomFilter sketchFilter(opt::bits * opt::sketchnum * uniqStats.size(),
-                             opt::nhash1, opt::kmerLen);
-
-    for (unsigned i = 4; i <= opt::kRange; i++) {
-        opt::maxEntropy += std::log2(opt::kmerLen - i + 1);
-    }
+    std::ofstream out(cfg.outfile);
+    BloomFilter sketchFilter(cfg.bits * cfg.sketchnum * uniqStats.size(),
+                             cfg.nhash1, cfg.kmerLen);
 
     size_t totalSel = 0, totalSafe = 0;
     #pragma omp parallel for schedule(dynamic) reduction(+:totalSel, totalSafe)
@@ -449,14 +476,14 @@ void buildSketch(const std::string& statFile, const BloomFilter& dbFilter) {
         std::string sketchPath;
         size_t sketchCount, sketchRefId;
         uniqstm >> sketchPath >> sketchCount >> sketchRefId;
-        SketchStat st = getUniqSet(sketchPath, sketchRefId, sketchFilter, out, dbFilter);
+        SketchStat st = getUniqSet(cfg, sketchPath, sketchRefId, sketchFilter, out, dbFilter);
         totalSel += st.selected;
         totalSafe += st.safe;
     }
     out.close();
 
-    if (opt::minMargin >= 2) {
-        std::cout << "Signatures satisfying margin >= " << opt::minMargin << ": "
+    if (cfg.minMargin >= 2) {
+        std::cout << "Signatures satisfying margin >= " << cfg.minMargin << ": "
                   << totalSafe << " / " << totalSel;
         if (totalSel) {
             std::cout << " (" << std::setprecision(1) << std::fixed

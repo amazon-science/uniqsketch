@@ -56,6 +56,11 @@ static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
        OPT_MAXHOMOP, OPT_STRICTMARGIN };
 
+// --sensitive / --very-sensitive are getopt flag entries, which store through a
+// pointer at parse time and so cannot target a struct member. They write here and
+// the value is copied into the config once parsing is complete.
+static int g_sketchnum = 100;
+
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
     {"kmer",           required_argument, nullptr, 'k'},
@@ -73,8 +78,8 @@ static const struct option longopts[] = {
     {"exact",          no_argument,       nullptr, OPT_EXACT},
     {"max-homopolymer",required_argument, nullptr, OPT_MAXHOMOP},
     {"strict-margin",  no_argument,       nullptr, OPT_STRICTMARGIN},
-    {"sensitive",      no_argument, &opt::sketchnum, 100},
-    {"very-sensitive", no_argument, &opt::sketchnum, 1000},
+    {"sensitive",      no_argument, &g_sketchnum, 100},
+    {"very-sensitive", no_argument, &g_sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
     {"version",        no_argument,       nullptr, OPT_VERSION},
     {nullptr, 0, nullptr, 0}
@@ -85,6 +90,7 @@ int main(int argc, char** argv) {
     double sTime = omp_get_wtime();
 #endif
 
+    UniqSketchConfig cfg;
     unsigned clusterThreshold = 0;  // 0 = clustering disabled
     bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
     std::vector<unsigned> treeThresholds;  // empty = tree disabled
@@ -96,18 +102,18 @@ int main(int argc, char** argv) {
         case '?':
             die = true;
             break;
-        case 't': arg >> opt::threads;          break;
-        case 'k': arg >> opt::kmerLen;          break;
-        case 'b': arg >> opt::bits;             break;
-        case 'd': arg >> opt::nhash1;           break;
-        case 's': arg >> opt::nhash2;           break;
-        case 'c': arg >> opt::sketchnum;        break;
-        case 'o': arg >> opt::outfile;          break;
-        case 'f': arg >> opt::outdir;           break;
-        case 'r': arg >> opt::refstat;          break;
-        case 'e': arg >> opt::entropyThreshold; break;
+        case 't': arg >> cfg.threads;          break;
+        case 'k': arg >> cfg.kmerLen;          break;
+        case 'b': arg >> cfg.bits;             break;
+        case 'd': arg >> cfg.nhash1;           break;
+        case 's': arg >> cfg.nhash2;           break;
+        case 'c': arg >> g_sketchnum;          break;
+        case 'o': arg >> cfg.outfile;          break;
+        case 'f': arg >> cfg.outdir;           break;
+        case 'r': arg >> cfg.refstat;          break;
+        case 'e': arg >> cfg.entropyThreshold; break;
         case OPT_CLUSTER: arg >> clusterThreshold; break;
-        case OPT_MINMARGIN: arg >> opt::minMargin; break;
+        case OPT_MINMARGIN: arg >> cfg.minMargin; break;
         case OPT_EXACT: useExactCluster = true; break;
         case OPT_TREE: {
             std::string treeArg;
@@ -121,8 +127,8 @@ int main(int argc, char** argv) {
             std::sort(treeThresholds.begin(), treeThresholds.end(), std::greater<unsigned>());
             break;
         }
-        case OPT_MAXHOMOP: arg >> opt::maxHomopolymer; break;
-        case OPT_STRICTMARGIN: opt::strictMargin = true; break;
+        case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
+        case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -137,17 +143,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (opt::minMargin < 1) opt::minMargin = 1;
-    if (opt::minMargin > 2) {
+    cfg.sketchnum = g_sketchnum;
+
+    if (cfg.minMargin < 1) cfg.minMargin = 1;
+    if (cfg.minMargin > 2) {
         std::cerr << PROGRAM ": --min-margin > 2 is not supported; using 2\n";
-        opt::minMargin = 2;
+        cfg.minMargin = 2;
     }
 
     if (argc - optind < 1) {
         std::cerr << PROGRAM ": missing arguments\n";
         die = true;
     }
-    if (opt::outfile.empty()) {
+    if (cfg.outfile.empty()) {
         std::cerr << PROGRAM ": missing outfile argument\n";
         die = true;
     }
@@ -185,13 +193,13 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    mkdir(opt::outdir.c_str(), 0777);
+    mkdir(cfg.outdir.c_str(), 0777);
 
     // Optional: build hierarchical tree index with per-level sketches
     if (!treeThresholds.empty()) {
-        std::string treeFile = opt::outdir + "/tree_index.tsv";
-        auto tree = buildHierarchicalTree(refFiles, treeThresholds, opt::kmerLen,
-                                          opt::nhash1, opt::bits,
+        std::string treeFile = cfg.outdir + "/tree_index.tsv";
+        auto tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
+                                          cfg.nhash1, cfg.bits,
                                           estimateMaxGenomeSize(refFiles), treeFile);
 
         // Report references per tree level
@@ -208,97 +216,71 @@ int main(int argc, char** argv) {
         refFiles.assign(uniqueRefs.begin(), uniqueRefs.end());
         std::cerr << "Building sketch from " << refFiles.size() << " tree leaf references\n";
 
-        // Build a coarse-level sketch for each internal level
+        // Build a coarse-level sketch for each internal level. Each level gets its
+        // own copy of the configuration, so nothing here can leak into the
+        // leaf-level build below.
         for (const auto& [level, refs] : levelRefs) {
             if (refs.empty()) continue;
-            std::string levelOutdir = opt::outdir + "/level_" + std::to_string(level);
-            mkdir(levelOutdir.c_str(), 0777);
-            std::string levelSketch = opt::outdir + "/sketch_level_" + std::to_string(level) + ".tsv";
-            std::string levelStat = levelOutdir + "/db_uniq_count.tsv";
 
-            // Save opt state mutated per level (buildSketch accumulates maxEntropy)
-            auto savedOutdir = opt::outdir;
-            auto savedOutfile = opt::outfile;
-            auto savedRefstat = opt::refstat;
-            auto savedNumRef = opt::numRef;
-            auto savedDbfSize = opt::dbfSize;
-            auto savedSbfSize = opt::sbfSize;
-            auto savedM1 = opt::m1;
-            auto savedM2 = opt::m2;
-            auto savedMaxEntropy = opt::maxEntropy;
-
-            opt::outdir = levelOutdir;
-            opt::outfile = levelSketch;
-            opt::refstat = levelStat;
-            opt::numRef = refs.size();
+            UniqSketchConfig lvl = cfg;
+            lvl.outdir = cfg.outdir + "/level_" + std::to_string(level);
+            lvl.outfile = cfg.outdir + "/sketch_level_" + std::to_string(level) + ".tsv";
+            lvl.refstat = lvl.outdir + "/db_uniq_count.tsv";
+            lvl.numRef = refs.size();
+            mkdir(lvl.outdir.c_str(), 0777);
 
             size_t levelTotalKmers = 0;
-            getCardinality(levelTotalKmers, opt::dbfSize, opt::sbfSize,
-                           opt::kmerLen, opt::threads, refs);
+            getCardinality(levelTotalKmers, lvl.dbfSize, lvl.sbfSize,
+                           lvl.kmerLen, lvl.threads, refs);
 
-            if (resolveBloomSizes(levelTotalKmers, opt::dbfSize, opt::sbfSize)) {
-                opt::m1 = opt::bits * opt::dbfSize;
-                opt::m2 = opt::bits * opt::sbfSize;
-                BloomFilter levelDbf(opt::m1, opt::nhash1, opt::kmerLen);
-                identifyUniqKmers(refs, levelDbf);
-                buildSketch(opt::refstat, levelDbf);
+            if (resolveBloomSizes(levelTotalKmers, lvl.dbfSize, lvl.sbfSize)) {
+                BloomFilter levelDbf(lvl.m1(), lvl.nhash1, lvl.kmerLen);
+                identifyUniqKmers(lvl, refs, levelDbf);
+                buildSketch(lvl, lvl.refstat, levelDbf);
                 std::cerr << "Built sketch for tree level " << level
-                          << ": " << levelSketch << "\n";
+                          << ": " << lvl.outfile << "\n";
             } else {
                 std::cerr << "Warning: skipping sketch for tree level " << level
                           << " (no k-mer content)\n";
             }
-
-            opt::outdir = savedOutdir;
-            opt::outfile = savedOutfile;
-            opt::refstat = savedRefstat;
-            opt::numRef = savedNumRef;
-            opt::dbfSize = savedDbfSize;
-            opt::sbfSize = savedSbfSize;
-            opt::m1 = savedM1;
-            opt::m2 = savedM2;
-            opt::maxEntropy = savedMaxEntropy;
         }
     }
 
     // Optional clustering: merge nearly identical references
     if (clusterThreshold > 0) {
-        std::string clusterFile = opt::outdir + "/clusters.tsv";
-        refFiles = clusterReferences(refFiles, clusterThreshold, opt::kmerLen,
-                                     opt::nhash1, opt::bits, 5000000, clusterFile,
+        std::string clusterFile = cfg.outdir + "/clusters.tsv";
+        refFiles = clusterReferences(refFiles, clusterThreshold, cfg.kmerLen,
+                                     cfg.nhash1, cfg.bits, 5000000, clusterFile,
                                      useExactCluster);
     }
 
-    opt::numRef = refFiles.size();
+    cfg.numRef = refFiles.size();
 
 #ifdef _OPENMP
-    omp_set_num_threads(opt::threads);
+    omp_set_num_threads(cfg.threads);
 #endif
 
     // Get cardinality of input reference universe data to set Bloom filter parameter
     size_t totalKmers = 0;
-    getCardinality(totalKmers, opt::dbfSize, opt::sbfSize, opt::kmerLen, opt::threads, refFiles);
+    getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, refFiles);
 
-    if (!resolveBloomSizes(totalKmers, opt::dbfSize, opt::sbfSize)) {
+    if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
         std::cerr << "Error: insufficient k-mer content for Bloom filter construction.\n"
                   << "  Total k-mers found: " << totalKmers << "\n"
-                  << "  Distinct k-mers (F0): " << opt::dbfSize << "\n"
-                  << "  Solid k-mers: " << opt::sbfSize << "\n"
-                  << "  k-mer length: " << opt::kmerLen << "\n"
+                  << "  Distinct k-mers (F0): " << cfg.dbfSize << "\n"
+                  << "  Solid k-mers: " << cfg.sbfSize << "\n"
+                  << "  k-mer length: " << cfg.kmerLen << "\n"
                   << "  Number of input files: " << refFiles.size() << "\n"
                   << "Possible causes:\n"
-                  << "  - Input sequences are shorter than k (" << opt::kmerLen << ")\n"
+                  << "  - Input sequences are shorter than k (" << cfg.kmerLen << ")\n"
                   << "  - Input files are empty or contain too few sequences\n"
                   << "  - Try a smaller k value with -k\n";
         exit(EXIT_FAILURE);
     }
 
-    opt::m1 = opt::bits * opt::dbfSize;
-    opt::m2 = opt::bits * opt::sbfSize;
-
-    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
-    identifyUniqKmers(refFiles, dbFilter);
-    buildSketch(opt::refstat, dbFilter);
+    BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+    identifyUniqKmers(cfg, refFiles, dbFilter);
+    buildSketch(cfg, cfg.refstat, dbFilter);
 
 #ifdef _OPENMP
     std::cerr << "Runtime(sec): " << std::setprecision(4) << std::fixed

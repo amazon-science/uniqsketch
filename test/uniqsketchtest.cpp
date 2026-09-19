@@ -9,7 +9,8 @@
 #include "TestUtil.hpp"
 #include "UniqSketchUtil.hpp"
 
-void testIdentifyUniqKmers(const std::vector<std::string>& refFiles) {
+void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
+                           const std::vector<std::string>& refFiles) {
     std::cerr << "START: Test identifyUniqKmers... \t";
 
     /*
@@ -20,8 +21,8 @@ void testIdentifyUniqKmers(const std::vector<std::string>& refFiles) {
     ref_test_1: {AGGCTACAAA, GAGACTGAAC, AGACTGAACT}
     ref_test_2: {CTCAGCTAAG, CCTCAGCTAA, AGGCTACAAC}
     */
-    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
-    identifyUniqKmers(refFiles, dbFilter);
+    BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+    identifyUniqKmers(cfg, refFiles, dbFilter);
 
     assert(compareFiles("ref_test_1.tsv", "expected_ref_test_1.tsv") == true);
     assert(compareFiles("ref_test_2.tsv", "expected_ref_test_2.tsv") == true);
@@ -29,31 +30,37 @@ void testIdentifyUniqKmers(const std::vector<std::string>& refFiles) {
     std::cerr << "PASSED: Test identifyUniqKmers\n";
 }
 
-void testBuildSketch() {
+void testBuildSketch(const UniqSketchConfig& cfg) {
     std::cerr << "START: Test buildSketch... \t";
 
     /*
-    With opt::sketchnum = 2, each ref gets 2 unique kmers uniformly selected:
+    With sketchnum = 2, each ref gets 2 unique kmers uniformly selected:
     ref_test_1: {AGACTGAACT, AGGCTACAAA}
     ref_test_2: {AGGCTACAAC, CTCAGCTAAG}
     Total sketch: 4 unique kmers
     */
-    BloomFilter dbFilter(opt::m1, opt::nhash1, opt::kmerLen);
-    buildSketch("expected_db_uniq_count.tsv", dbFilter);
-    assert(compareFiles(opt::outfile, "expected_out_uniqsketch.txt") == true);
+    BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+    buildSketch(cfg, "expected_db_uniq_count.tsv", dbFilter);
+    assert(compareFiles(cfg.outfile, "expected_out_uniqsketch.txt") == true);
 
     std::cerr << "PASSED: Test buildSketch\n";
 }
 
 void testLowComplexity() {
-    opt::maxEntropy = 24.56;
     std::cerr << "START: Test lowComplexity... \t";
+
+    // These are 81-mers, so the entropy ceiling is that of the default k=81
+    // configuration. Previously the test had to hard-code the ceiling (24.56)
+    // because buildSketch computed it as a side effect on a global; now it
+    // follows from the config.
+    UniqSketchConfig cfg;   // kmerLen = 81
+    assert(std::abs(cfg.maxEntropy() - 24.56) < 0.01);
 
     std::string sig1("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGCT");
     std::string sig2("CGTTGCATGGCATGCGGTTCGTCTGCGCGTGCGTGCTGATGCAGTAAAAAAGCTGCATAAAATCGATCGAAAGTACATGCG");
 
-    assert(lowComplexity(sig1) == true);
-    assert(lowComplexity(sig2) == false);
+    assert(lowComplexity(cfg, sig1) == true);
+    assert(lowComplexity(cfg, sig2) == false);
 
     std::cerr << "PASSED: Test lowComplexity\n";
 }
@@ -62,31 +69,32 @@ void testHasLongHomopolymer() {
     std::cerr << "START: Test hasLongHomopolymer... \t";
 
     // Filter disabled (0 = off): even a pure homopolymer must pass.
-    opt::maxHomopolymer = 0;
-    assert(hasLongHomopolymer("AAAAAAAAAAAA") == false);
+    UniqSketchConfig off;
+    off.maxHomopolymer = 0;
+    assert(hasLongHomopolymer(off, "AAAAAAAAAAAA") == false);
 
-    opt::maxHomopolymer = 5;
+    // Two configs side by side: no shared state, no restore step needed.
+    UniqSketchConfig cfg;
+    cfg.maxHomopolymer = 5;
 
     // Boundary: a run of exactly N is allowed, N+1 is rejected.
-    assert(hasLongHomopolymer("AAAAA") == false);
-    assert(hasLongHomopolymer("AAAAAA") == true);
+    assert(hasLongHomopolymer(cfg, "AAAAA") == false);
+    assert(hasLongHomopolymer(cfg, "AAAAAA") == true);
 
     // Run position must not matter (start, middle, end).
-    assert(hasLongHomopolymer("GGGGGGCTACTA") == true);
-    assert(hasLongHomopolymer("CTAGGGGGGCTA") == true);
-    assert(hasLongHomopolymer("CTACTAGGGGGG") == true);
+    assert(hasLongHomopolymer(cfg, "GGGGGGCTACTA") == true);
+    assert(hasLongHomopolymer(cfg, "CTAGGGGGGCTA") == true);
+    assert(hasLongHomopolymer(cfg, "CTACTAGGGGGG") == true);
 
     // Run length resets on a base change: two runs of 5 are still acceptable.
-    assert(hasLongHomopolymer("AAAAACAAAAA") == false);
+    assert(hasLongHomopolymer(cfg, "AAAAACAAAAA") == false);
 
     // Mixed sequence with only short runs.
-    assert(hasLongHomopolymer("AACCGGTTAACCGGTT") == false);
+    assert(hasLongHomopolymer(cfg, "AACCGGTTAACCGGTT") == false);
 
     // Degenerate inputs.
-    assert(hasLongHomopolymer("") == false);
-    assert(hasLongHomopolymer("A") == false);
-
-    opt::maxHomopolymer = 0;   // restore default for later tests
+    assert(hasLongHomopolymer(cfg, "") == false);
+    assert(hasLongHomopolymer(cfg, "A") == false);
 
     std::cerr << "PASSED: Test hasLongHomopolymer\n";
 }
@@ -117,21 +125,22 @@ void testGetBaseId() {
 }
 
 int main() {
-    opt::kmerLen = 10;
-    opt::bits = 128;
-    opt::dbfSize = 7;
-    opt::sbfSize = 1;
-    opt::m1 = opt::bits * opt::dbfSize;
-    opt::m2 = opt::bits * opt::sbfSize;
-    opt::numRef = 2;
-    opt::sketchnum = 2;
-    opt::outfile = "test_out_uniqsketch.txt";
-    opt::outdir = ".";
+    // Shared fixture for the two-reference, k=10 index tests. m1/m2 are now
+    // derived (bits * size) rather than set by hand.
+    UniqSketchConfig cfg;
+    cfg.kmerLen = 10;
+    cfg.bits = 128;
+    cfg.dbfSize = 7;
+    cfg.sbfSize = 1;
+    cfg.numRef = 2;
+    cfg.sketchnum = 2;
+    cfg.outfile = "test_out_uniqsketch.txt";
+    cfg.outdir = ".";
 
     std::vector<std::string> refFiles = {"ref_test_1.fa", "ref_test_2.fa"};
 
-    testIdentifyUniqKmers(refFiles);
-    testBuildSketch();
+    testIdentifyUniqKmers(cfg, refFiles);
+    testBuildSketch(cfg);
     testLowComplexity();
     testHasLongHomopolymer();
     testGetCanonical();
