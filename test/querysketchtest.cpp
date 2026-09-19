@@ -9,7 +9,7 @@
 #include "TestUtil.hpp"
 #include "QuerySketchUtil.hpp"
 
-void testQuerySampleBatch(const std::vector<std::string>& sampleFiles) {
+void testQuerySampleBatch(QuerySketchConfig cfg, const std::vector<std::string>& sampleFiles) {
     std::cerr << "START: Test querySample... \t";
 
     /*
@@ -33,8 +33,8 @@ void testQuerySampleBatch(const std::vector<std::string>& sampleFiles) {
     std::vector<unsigned> sketchCount(sketchRef.size());
     std::vector<std::unordered_set<std::string>> refRead(sketchRef.size());
 
-    loadSketch(opt::ref, sketchHash, sketchRef, refSigCount);
-    querySampleBatch(sampleFiles, sketchHash, sketchCount, refSigCount, refRead);
+    loadSketch(cfg, cfg.ref, sketchHash, sketchRef, refSigCount);
+    querySampleBatch(cfg, sampleFiles, sketchHash, sketchCount, refSigCount, refRead);
 
     std::vector<unsigned> expected{3, 0};
     assert(std::equal(sketchCount.begin(), sketchCount.end(), expected.begin()) == true);
@@ -42,7 +42,7 @@ void testQuerySampleBatch(const std::vector<std::string>& sampleFiles) {
     std::cerr << "PASSED: Test querySample\n";
 }
 
-void testGenerateQueryResult() {
+void testGenerateQueryResult(const QuerySketchConfig& cfg) {
     std::cerr << "START: Test generateQueryResult... \t";
 
     /*
@@ -63,27 +63,30 @@ void testGenerateQueryResult() {
     // crash.
     std::vector<std::unordered_set<std::string>> refRead{{"1"}, {}};
 
-    generateQueryResult(sketchCount, sketchRef, refSigCount, refRead, opt::out);
-    assert(compareFiles(opt::out, "expected_out_querysketch.tsv") == true);
+    generateQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, cfg.out);
+    assert(compareFiles(cfg.out, "expected_out_querysketch.tsv") == true);
 
     std::cerr << "PASSED: Test generateQueryResult\n";
 }
 
 int main() {
-    opt::ref = "expected_out_uniqsketch.txt";
-    opt::bits = 64;
-    opt::dbfSize = 32;
-    opt::sbfSize = 16;
-    opt::nhash = 3;
-    opt::kmerLen = 10;
-    opt::sketchHit = 1;
-    opt::readCutoff = 0;
-    opt::out = "out_querysketch.tsv";
+    QuerySketchConfig cfg;
+    cfg.ref = "expected_out_uniqsketch.txt";
+    cfg.bits = 64;
+    cfg.dbfSize = 32;
+    cfg.sbfSize = 16;
+    cfg.nhash = 3;
+    cfg.kmerLen = 10;
+    cfg.sketchHit = 1;
+    cfg.readCutoff = 0;
+    cfg.out = "out_querysketch.tsv";
 
     std::vector<std::string> sampleFiles = {"r.fq"};
 
-    testQuerySampleBatch(sampleFiles);
-    testGenerateQueryResult();
+    // testQuerySampleBatch takes cfg by value: loadSketch sets kmerLen from the
+    // index, and that must not leak into the second test.
+    testQuerySampleBatch(cfg, sampleFiles);
+    testGenerateQueryResult(cfg);
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;

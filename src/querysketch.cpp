@@ -48,6 +48,13 @@ static const char shortopts[] = "t:g:l:r:o:h:a:s:b:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE };
 
+// --sensitive / --very-sensitive / --solid are getopt flag entries, which store
+// through a pointer at parse time and so cannot target a struct member. They write
+// here and the values are copied into the config once parsing is complete. -h also
+// routes through g_sketchHit so the flags and the explicit option share one source.
+static int g_sketchHit = 10;
+static int g_solid = 0;
+
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
     {"out",            required_argument, nullptr, 'o'},
@@ -58,9 +65,9 @@ static const struct option longopts[] = {
     {"acutoff",        required_argument, nullptr, 'a'},
     {"rcutoff",        required_argument, nullptr, 's'},
     {"bit",            required_argument, nullptr, 'b'},
-    {"sensitive",      no_argument, &opt::sketchHit, 10},
-    {"very-sensitive", no_argument, &opt::sketchHit, 5},
-    {"solid",          no_argument, &opt::solid, 1},
+    {"sensitive",      no_argument, &g_sketchHit, 10},
+    {"very-sensitive", no_argument, &g_sketchHit, 5},
+    {"solid",          no_argument, &g_solid, 1},
     {"tree",           required_argument, nullptr, OPT_TREE},
     {"tree-prune",     required_argument, nullptr, OPT_TREEPRUNE},
     {"help",           no_argument, nullptr, OPT_HELP},
@@ -75,15 +82,15 @@ static const struct option longopts[] = {
  * hit/read thresholds mark their descendant leaves as candidates. Each finer level is
  * then queried with its sketch restricted to signatures of references that are still
  * candidates, so the search narrows down the tree. The final (leaf) level sketch
- * (opt::ref) is queried restricted to the surviving candidate leaves and its result is
+ * (cfg.ref) is queried restricted to the surviving candidate leaves and its result is
  * written. This applies the candidate narrowing that the flat port computed but never
  * used, so the tree actually focuses the query on promising sub-trees.
  */
-static void runTreeQuery(const std::string& treeDir,
+static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                          const std::vector<std::string>& sampleFiles) {
     std::string treeFile = treeDir + "/tree_index.tsv";
     if (!validateFile(treeFile, "tree index file")) exit(EXIT_FAILURE);
-    if (!validateFile(opt::ref, "leaf sketch (--ref)")) exit(EXIT_FAILURE);
+    if (!validateFile(cfg.ref, "leaf sketch (--ref)")) exit(EXIT_FAILURE);
 
     std::vector<TreeNode> tree = loadTree(treeFile);
 
@@ -130,7 +137,7 @@ static void runTreeQuery(const std::string& treeDir,
         }
     }
 
-    // Level sketches coarsest-first, then the leaf/full-resolution sketch (opt::ref).
+    // Level sketches coarsest-first, then the leaf/full-resolution sketch (cfg.ref).
     std::vector<std::pair<unsigned, std::string>> levelSketches;
     for (unsigned lvl = 0; lvl < 100; lvl++) {
         std::string p = treeDir + "/sketch_level_" + std::to_string(lvl) + ".tsv";
@@ -139,17 +146,17 @@ static void runTreeQuery(const std::string& treeDir,
     unsigned leafLevel = 0;
     for (const TreeNode& node : tree)
         if (node.isLeaf) leafLevel = std::max(leafLevel, node.level);
-    levelSketches.emplace_back(leafLevel, opt::ref);
+    levelSketches.emplace_back(leafLevel, cfg.ref);
     std::sort(levelSketches.begin(), levelSketches.end());
 
-    // Prime opt::kmerLen from a sketch, then size read Bloom filters once from the sample.
+    // Prime cfg.kmerLen from a sketch, then size read Bloom filters once from the sample.
     {
         SketchHash h; std::vector<std::string> r; std::vector<SketchHash> sc;
-        loadSketch(levelSketches.front().second, h, r, sc);
+        loadSketch(cfg, levelSketches.front().second, h, r, sc);
     }
     size_t totalKmers = 0;
-    getCardinality(totalKmers, opt::dbfSize, opt::sbfSize, opt::kmerLen, opt::threads, sampleFiles);
-    if (!resolveBloomSizes(totalKmers, opt::dbfSize, opt::sbfSize)) {
+    getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
+    if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
         std::cerr << "Error: insufficient k-mer content in the sample for query.\n";
         exit(EXIT_FAILURE);
     }
@@ -166,7 +173,7 @@ static void runTreeQuery(const std::string& treeDir,
         SketchHash levelHash;
         std::vector<std::string> levelRef;
         std::vector<SketchHash> levelSig;
-        loadSketch(sketchPath, levelHash, levelRef, levelSig);
+        loadSketch(cfg, sketchPath, levelHash, levelRef, levelSig);
 
         // Restrict to candidate references (all are in play on the coarsest level).
         if (!firstLevel) {
@@ -192,13 +199,13 @@ static void runTreeQuery(const std::string& treeDir,
 
         std::vector<unsigned> levelCount(levelRef.size(), 0);
         std::vector<std::unordered_set<std::string>> levelRead(levelRef.size());
-        querySampleBatch(sampleFiles, levelHash, levelCount, levelSig, levelRead);
+        querySampleBatch(cfg, sampleFiles, levelHash, levelCount, levelSig, levelRead);
 
         if (isLeaf) {
-            generateTreeQueryResult(levelCount, levelRef, levelSig, levelRead,
-                                    familyCalls, opt::out);
+            generateTreeQueryResult(cfg, levelCount, levelRef, levelSig, levelRead,
+                                    familyCalls, cfg.out);
             std::cerr << "Tree query: leaf level " << level << " ("
-                      << levelRef.size() << " leaves) -> " << opt::out << "\n";
+                      << levelRef.size() << " leaves) -> " << cfg.out << "\n";
             break;
         }
 
@@ -223,15 +230,15 @@ static void runTreeQuery(const std::string& treeDir,
             if (it == lm.end()) continue;
 
             bool survivesPruning =
-                levelCount[i] >= static_cast<unsigned>(opt::treePruneHit) &&
+                levelCount[i] >= static_cast<unsigned>(cfg.treePruneHit) &&
                 !levelRead[i].empty();
             if (survivesPruning) {
                 nextCandidates.insert(it->second.begin(), it->second.end());
             }
 
             bool worthReporting =
-                levelCount[i] >= static_cast<unsigned>(opt::sketchHit) &&
-                levelRead[i].size() > static_cast<size_t>(opt::readCutoff);
+                levelCount[i] >= static_cast<unsigned>(cfg.sketchHit) &&
+                levelRead[i].size() > static_cast<size_t>(cfg.readCutoff);
             if (worthReporting) {
                 // Held as a candidate family call; only emitted if the leaf level
                 // fails to resolve any member of this group.
@@ -260,6 +267,7 @@ int main(int argc, char* const argv[]) {
     double sTime = omp_get_wtime();
 #endif
 
+    QuerySketchConfig cfg;
     std::string treeDir;  // --tree: hierarchical query index directory (empty = flat)
 
     bool die = false;
@@ -269,17 +277,17 @@ int main(int argc, char* const argv[]) {
         case '?':
             die = true;
             break;
-        case 't': arg >> opt::threads;         break;
-        case 'o': arg >> opt::out;             break;
-        case 'l': arg >> opt::r1;              break;
-        case 'r': arg >> opt::r2;              break;
-        case 'g': arg >> opt::ref;             break;
-        case 'h': arg >> opt::sketchHit;       break;
-        case 'a': arg >> opt::abundanceCutoff; break;
-        case 's': arg >> opt::readCutoff;      break;
-        case 'b': arg >> opt::bits;            break;
+        case 't': arg >> cfg.threads;         break;
+        case 'o': arg >> cfg.out;             break;
+        case 'l': arg >> cfg.r1;              break;
+        case 'r': arg >> cfg.r2;              break;
+        case 'g': arg >> cfg.ref;             break;
+        case 'h': arg >> g_sketchHit;          break;
+        case 'a': arg >> cfg.abundanceCutoff; break;
+        case 's': arg >> cfg.readCutoff;      break;
+        case 'b': arg >> cfg.bits;            break;
         case OPT_TREE: arg >> treeDir;         break;
-        case OPT_TREEPRUNE: arg >> opt::treePruneHit; break;
+        case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -293,12 +301,14 @@ int main(int argc, char* const argv[]) {
             exit(EXIT_FAILURE);
         }
     }
+    cfg.sketchHit = g_sketchHit;
+    cfg.solid = g_solid;
 
-    if (opt::r1.empty()) {
+    if (cfg.r1.empty()) {
         std::cerr << "Error: no input file r1 provided.\n";
         die = true;
     }
-    if (opt::ref.empty()) {
+    if (cfg.ref.empty()) {
         std::cerr << "Error: no sketch file provided.\n";
         die = true;
     }
@@ -308,63 +318,63 @@ int main(int argc, char* const argv[]) {
     }
 
     // Validate input files exist
-    if (!validateFile(opt::r1, "read file r1")) die = true;
-    if (!opt::r2.empty() && !validateFile(opt::r2, "read file r2")) die = true;
-    if (!validateFile(opt::ref, "sketch reference file")) die = true;
+    if (!validateFile(cfg.r1, "read file r1")) die = true;
+    if (!cfg.r2.empty() && !validateFile(cfg.r2, "read file r2")) die = true;
+    if (!validateFile(cfg.ref, "sketch reference file")) die = true;
     if (die) {
         exit(EXIT_FAILURE);
     }
 
 #ifdef _OPENMP
-    omp_set_num_threads(opt::threads);
+    omp_set_num_threads(cfg.threads);
 #endif
 
     std::vector<std::string> sampleFiles;
-    sampleFiles.push_back(opt::r1);
-    if (!opt::r2.empty()) {
-        sampleFiles.push_back(opt::r2);
+    sampleFiles.push_back(cfg.r1);
+    if (!cfg.r2.empty()) {
+        sampleFiles.push_back(cfg.r2);
     }
 
     if (!treeDir.empty()) {
         // Hierarchical query: narrow candidates coarse -> fine down the tree.
-        runTreeQuery(treeDir, sampleFiles);
+        runTreeQuery(cfg, treeDir, sampleFiles);
     } else {
         // Flat query against a single sketch.
         SketchHash sketchHash;
         std::vector<std::string> sketchRef;
         std::vector<SketchHash> refSigCount;
 
-        loadSketch(opt::ref, sketchHash, sketchRef, refSigCount);
+        loadSketch(cfg, cfg.ref, sketchHash, sketchRef, refSigCount);
 
-        std::cout << "k: " << opt::kmerLen << "\n";
+        std::cout << "k: " << cfg.kmerLen << "\n";
         std::cout << "Number of references: " << sketchRef.size() << "\n";
         std::cout << "Size of sketch: " << sketchHash.size() << "\n";
 
         // Get cardinality of input raw read data to set Bloom filter parameter
         size_t totalKmers = 0;
-        getCardinality(totalKmers, opt::dbfSize, opt::sbfSize, opt::kmerLen, opt::threads, sampleFiles);
+        getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
 
-        if (!resolveBloomSizes(totalKmers, opt::dbfSize, opt::sbfSize)) {
+        if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
             std::cerr << "Error: insufficient k-mer content for Bloom filter construction.\n"
                       << "  Total k-mers found: " << totalKmers << "\n"
-                      << "  Distinct k-mers (F0): " << opt::dbfSize << "\n"
-                      << "  Solid k-mers: " << opt::sbfSize << "\n"
-                      << "  k-mer length: " << opt::kmerLen << "\n"
+                      << "  Distinct k-mers (F0): " << cfg.dbfSize << "\n"
+                      << "  Solid k-mers: " << cfg.sbfSize << "\n"
+                      << "  k-mer length: " << cfg.kmerLen << "\n"
                       << "Possible causes:\n"
-                      << "  - Input reads are shorter than k (" << opt::kmerLen << ")\n"
+                      << "  - Input reads are shorter than k (" << cfg.kmerLen << ")\n"
                       << "  - Input files are empty or contain too few reads\n"
                       << "  - Try a smaller k value in the sketch\n";
             exit(EXIT_FAILURE);
         }
 
-        std::cout << "Number of weak k-mers: " << opt::dbfSize - opt::sbfSize << "\n";
-        std::cout << "Number of solid k-mers: " << opt::sbfSize << "\n";
+        std::cout << "Number of weak k-mers: " << cfg.dbfSize - cfg.sbfSize << "\n";
+        std::cout << "Number of solid k-mers: " << cfg.sbfSize << "\n";
 
         std::vector<unsigned> sketchCount(sketchRef.size());
         std::vector<std::unordered_set<std::string>> refRead(sketchRef.size());
 
-        querySampleBatch(sampleFiles, sketchHash, sketchCount, refSigCount, refRead);
-        generateQueryResult(sketchCount, sketchRef, refSigCount, refRead, opt::out);
+        querySampleBatch(cfg, sampleFiles, sketchHash, sketchCount, refSigCount, refRead);
+        generateQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, cfg.out);
     }
 
 #ifdef _OPENMP

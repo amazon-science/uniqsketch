@@ -21,23 +21,40 @@
 
 #include "kseq_gz.h"
 
-namespace opt {
-unsigned kmerLen;                                       // k-mer length
-unsigned threads(1);                                    // number of threads
-std::string out("out_sketch.tsv");                      // output file name
-std::string r1;                                         // read 1 input
-std::string r2;                                         // read 2 input
-std::string ref;                                        // input uniqsketch reference
-unsigned nhash(3);                                      // number of hashes for Bloom filter
-size_t dbfSize;                                         // distinct Bloom filter size
-size_t sbfSize;                                         // solid Bloom filter size
-unsigned bits(64);                                      // bits per element in Bloom filter
-int sketchHit(10);                                      // unique k-mer hits to call a reference
-int solid(0);                                           // flag: only use solid k-mers from reads
-double abundanceCutoff(0.0);                            // abundance cutoff to report
-int readCutoff(2);                                      // read number cutoff to report
-int treePruneHit(1);                                    // min coarse-level hits to keep a subtree in play
-}
+/**
+ * Settings for one query run. Passed explicitly; see UniqSketchConfig for why
+ * these are no longer file-scope globals.
+ *
+ * kmerLen is not a user option: loadSketch sets it from the signature length in
+ * the index, which is why loadSketch takes the config by non-const reference and
+ * every other function takes it by const reference.
+ */
+struct QuerySketchConfig {
+    // Inputs and outputs
+    std::string out = "out_sketch.tsv";                 // output filename
+    std::string r1;                                     // read 1 input
+    std::string r2;                                     // read 2 input
+    std::string ref;                                    // uniqsketch index (leaf sketch in tree mode)
+
+    // Core parameters
+    unsigned kmerLen = 0;                               // k-mer length, read from the index by loadSketch
+    unsigned threads = 1;                               // number of threads
+
+    // Read Bloom filters (sized per sample by ntCard)
+    unsigned bits = 64;                                 // bits per element
+    unsigned nhash = 3;                                 // hash functions
+    size_t dbfSize = 0;                                 // distinct BF element count
+    size_t sbfSize = 0;                                 // solid BF element count
+    int solid = 0;                                      // --solid: query only k-mers seen at least twice
+
+    // Reporting thresholds
+    int sketchHit = 10;                                 // min signature hits to call a reference (-h)
+    int readCutoff = 2;                                 // min distinct supporting reads, exclusive (-s)
+    double abundanceCutoff = 0.0;                       // min abundance to report, exclusive (-a)
+
+    // Tree query
+    int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
+};
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
 
@@ -49,7 +66,7 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  * @param sketchRef  Vector mapping refId to refName.
  * @param refSigCount  Per-reference signature count map.
  */
-void loadSketch(const std::string& fPath, SketchHash& sketchHash,
+void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sketchHash,
                 std::vector<std::string>& sketchRef,
                 std::vector<SketchHash>& refSigCount) {
     std::ifstream sketchFile(fPath);
@@ -66,7 +83,7 @@ void loadSketch(const std::string& fPath, SketchHash& sketchHash,
         }
         sketchHash.emplace(uniqSeq, refId);
         if (init) {
-            opt::kmerLen = uniqSeq.length();
+            cfg.kmerLen = uniqSeq.length();
             sketchRef.resize(refNum);
             refSigCount.resize(refNum);
             init = false;
@@ -185,7 +202,7 @@ inline SketchIndex buildSketchIndex(const SketchHash& sketchHash,
  * @param refSigCount  Per-reference per-signature counts.
  * @param refRead  Per-reference distinct read id sets.
  */
-void querySample(const std::string& in, const SketchIndex& index,
+void querySample(const QuerySketchConfig& cfg, const std::string& in, const SketchIndex& index,
                  const std::vector<std::vector<std::string>>& sigNames,
                  BloomFilter& dbFilter, BloomFilter& sbFilter,
                  std::vector<unsigned>& sketchCount,
@@ -244,11 +261,11 @@ void querySample(const std::string& in, const SketchIndex& index,
             #pragma omp for schedule(dynamic, 64)
             for (size_t r = 0; r < seqBatch.size(); ++r) {
                 const std::string& seq = seqBatch[r];
-                if (seq.length() < opt::kmerLen) continue;
+                if (seq.length() < cfg.kmerLen) continue;
 
-                ntHashIterator itr(seq, opt::nhash, opt::kmerLen);
+                ntHashIterator itr(seq, cfg.nhash, cfg.kmerLen);
                 while (itr != itr.end()) {
-                    if (opt::solid) {
+                    if (cfg.solid) {
                         if (dbFilter.insert_make_change(*itr)) {
                             ++itr;
                             continue;
@@ -304,25 +321,25 @@ void querySample(const std::string& in, const SketchIndex& index,
  * @param refSigCount  Per-reference per-signature counts.
  * @param refRead  Per-reference distinct read id sets.
  */
-void querySampleBatch(const std::vector<std::string>& sampleFiles,
+void querySampleBatch(const QuerySketchConfig& cfg, const std::vector<std::string>& sampleFiles,
                       const SketchHash& sketchHash,
                       std::vector<unsigned>& sketchCount,
                       std::vector<SketchHash>& refSigCount,
                       std::vector<std::unordered_set<std::string>>& refRead) {
-    BloomFilter dbFilter(opt::dbfSize * opt::bits, opt::nhash, opt::kmerLen);
-    BloomFilter sbFilter(opt::sbfSize * opt::bits, opt::nhash, opt::kmerLen);
+    BloomFilter dbFilter(cfg.dbfSize * cfg.bits, cfg.nhash, cfg.kmerLen);
+    BloomFilter sbFilter(cfg.sbfSize * cfg.bits, cfg.nhash, cfg.kmerLen);
 
     // Build the hash-keyed view once; it is shared read-only across all files.
     std::vector<std::vector<std::string>> sigNames;
     SketchIndex index = buildSketchIndex(sketchHash, refSigCount, sigNames);
 
     for (unsigned i = 0; i < sampleFiles.size(); i++) {
-        querySample(sampleFiles[i], index, sigNames, dbFilter, sbFilter,
+        querySample(cfg, sampleFiles[i], index, sigNames, dbFilter, sbFilter,
                     sketchCount, refSigCount, refRead);
     }
 
     // Adjust for distinct/solid BF masking
-    if (opt::solid) {
+    if (cfg.solid) {
         for (auto& count : sketchCount) {
             if (count) {
                 ++count;
@@ -394,7 +411,7 @@ inline size_t countSigsHit(const SketchHash& sigCount) {
  * @param families  Coarse-level detections, ordered coarsest first.
  * @param fPath  Unused; retained to mirror generateQueryResult's signature.
  */
-void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
+void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sketchCount,
                              const std::vector<std::string>& sketchRef,
                              const std::vector<SketchHash>& refSigCount,
                              const std::vector<std::unordered_set<std::string>>& refRead,
@@ -403,8 +420,8 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     (void) fPath;
 
     auto leafReported = [&](unsigned i) {
-        return refRead[i].size() > static_cast<size_t>(opt::readCutoff) &&
-               sketchCount[i] >= static_cast<unsigned>(opt::sketchHit);
+        return refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
+               sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit);
     };
 
     // Which leaves clear the reporting thresholds.
@@ -417,8 +434,8 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     // leaves it covers was resolved; otherwise the leaf rows already say more.
     std::vector<const FamilyCall*> reportedFamilies;
     for (const FamilyCall& f : families) {
-        if (f.count < static_cast<unsigned>(opt::sketchHit) ||
-            f.reads <= static_cast<size_t>(opt::readCutoff)) {
+        if (f.count < static_cast<unsigned>(cfg.sketchHit) ||
+            f.reads <= static_cast<size_t>(cfg.readCutoff)) {
             continue;
         }
         bool anyLeafResolved = false;
@@ -461,12 +478,12 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     // Same schema as the flat writer; `resolution` distinguishes individually
     // resolved references (`strain`) from group calls (`family`), so a family
     // row can never be mistaken for a strain call downstream.
-    std::ofstream outFile(opt::out);
+    std::ofstream outFile(cfg.out);
     outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
     if (sketchSum != 0) {
         for (const Row& r : rows) {
             double abundance = static_cast<double>(r.count) / sketchSum;
-            if (abundance > opt::abundanceCutoff) {
+            if (abundance > cfg.abundanceCutoff) {
                 outFile << r.name << "\t" << abundance << "\t" << r.count
                         << "\t" << r.reads << "\t" << r.sigsHit
                         << "\t" << r.sigsTotal
@@ -486,7 +503,7 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     }
 
     // Detailed signature log, over leaves as before.
-    std::ofstream logSig(prefixBasename(opt::out, "log_"));
+    std::ofstream logSig(prefixBasename(cfg.out, "log_"));
     logSig << "ref\ttotal_reads\tsignature\tcount\n";
     for (unsigned i = 0; i < refSigCount.size(); i++) {
         for (const auto& [sig, count] : refSigCount[i]) {
@@ -499,7 +516,7 @@ void generateTreeQueryResult(std::vector<unsigned>& sketchCount,
     logSig.close();
 }
 
-void generateQueryResult(std::vector<unsigned>& sketchCount,
+void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sketchCount,
                          const std::vector<std::string>& sketchRef,
                          const std::vector<SketchHash>& refSigCount,
                          const std::vector<std::unordered_set<std::string>>& refRead,
@@ -512,8 +529,8 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
 
     size_t sketchSum = 0;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (refRead[i].size() > static_cast<size_t>(opt::readCutoff) &&
-            sketchCount[i] >= static_cast<unsigned>(opt::sketchHit)) {
+        if (refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
+            sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit)) {
             sketchSum += sketchCount[i];
         }
     }
@@ -528,15 +545,15 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
     // `strain` for individually resolved references; the tree query may also
     // emit `family` rows (see generateTreeQueryResult). Columns are appended so
     // parsers of the original three are unaffected.
-    std::ofstream outFile(opt::out);
+    std::ofstream outFile(cfg.out);
     outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
     if (sketchSum != 0) {
         for (unsigned i = 0; i < sketchCount.size(); i++) {
             unsigned idx = sketchIndex[i];
-            if (refRead[idx].size() > static_cast<size_t>(opt::readCutoff) &&
-                sketchCount[idx] >= static_cast<unsigned>(opt::sketchHit)) {
+            if (refRead[idx].size() > static_cast<size_t>(cfg.readCutoff) &&
+                sketchCount[idx] >= static_cast<unsigned>(cfg.sketchHit)) {
                 double abundance = static_cast<double>(sketchCount[idx]) / sketchSum;
-                if (abundance > opt::abundanceCutoff) {
+                if (abundance > cfg.abundanceCutoff) {
                     outFile << sketchRef[idx] << "\t" << abundance
                             << "\t" << sketchCount[idx]
                             << "\t" << refRead[idx].size()
@@ -550,7 +567,7 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
     outFile.close();
 
     // Detailed signature log
-    std::ofstream logSig(prefixBasename(opt::out, "log_"));
+    std::ofstream logSig(prefixBasename(cfg.out, "log_"));
     logSig << "ref\ttotal_reads\tsignature\tcount\n";
     for (unsigned i = 0; i < refSigCount.size(); i++) {
         for (const auto& [sig, count] : refSigCount[i]) {
@@ -562,7 +579,7 @@ void generateQueryResult(std::vector<unsigned>& sketchCount,
     }
 
     // Read-level log: matched read ids per reference
-    std::ofstream logRead(prefixBasename(opt::out, "logread_"));
+    std::ofstream logRead(prefixBasename(cfg.out, "logread_"));
     logRead << "ref\tnum_reads\treads\n";
     for (unsigned i = 0; i < refRead.size(); i++) {
         if (refRead[i].size() > 1) {
