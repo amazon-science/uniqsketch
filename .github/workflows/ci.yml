@@ -1,0 +1,70 @@
+name: CI
+
+# Build the three tools and run the full test suite on every push and pull
+# request. Until this workflow existed the only automated check was GitHub's
+# default CodeQL setup, so `make test` never ran on a PR and releases were
+# merged on local verification alone.
+#
+# The matrix covers both build systems the README documents (Make and CMake)
+# and both compiler families it claims to support (GCC and Clang), because only
+# GCC via Make had ever been exercised.
+
+on:
+  push:
+    branches: [main, "v*-dev"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.build }} / ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [make, cmake]
+        compiler: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake zlib1g-dev clang libomp-dev
+
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"    >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc"      >> "$GITHUB_ENV"
+            echo "CXX=g++"     >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and test (Make)
+        if: matrix.build == 'make'
+        # The Makefile bakes the standard into CXX ("g++ -std=c++17"), so an
+        # override must carry the flag or the standard is silently dropped.
+        run: |
+          make CXX="$CXX -std=c++17"
+          make test CXX="$CXX -std=c++17"
+
+      - name: Build and test (CMake)
+        if: matrix.build == 'cmake'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+      - name: Smoke-test the binaries
+        run: |
+          if [ "${{ matrix.build }}" = "make" ]; then BIN=bin; else BIN=build/bin; fi
+          "$BIN/uniqsketch"    --version
+          "$BIN/querysketch"   --version
+          "$BIN/comparesketch" --version
