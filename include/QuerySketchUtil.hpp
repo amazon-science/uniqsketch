@@ -2,12 +2,17 @@
 #define QUERYSKETCHUTIL_HPP_
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "SequenceUtil.hpp"
 #include "BloomFilter.hpp"
@@ -83,19 +88,137 @@ void loadSketch(const std::string& fPath, SketchHash& sketchHash,
  * @param refSigCount  Per-reference per-signature counts.
  * @param refRead  Per-reference distinct read id sets.
  */
-void querySample(const std::string& in, const SketchHash& sketchHash,
+/**
+ * Does the k-mer at `kp` equal the canonical signature `sig`, in either
+ * orientation? Compares in place -- no substring or reverse-complement
+ * allocation -- which matters because this runs on every hash-probe hit.
+ *
+ * @param kp  Pointer to the first base of the read k-mer (sig.size() bases).
+ * @param sig  Canonical signature sequence.
+ * @return True if the read k-mer matches sig forward or as its reverse complement.
+ */
+inline bool kmerMatches(const char* kp, const std::string& sig) {
+    const size_t k = sig.size();
+    if (std::memcmp(kp, sig.data(), k) == 0) return true;
+    for (size_t i = 0; i < k; i++) {
+        char c;
+        switch (kp[k - 1 - i]) {
+            case 'A': case 'a': c = 'T'; break;
+            case 'C': case 'c': c = 'G'; break;
+            case 'G': case 'g': c = 'C'; break;
+            case 'T': case 't': c = 'A'; break;
+            default: return false;
+        }
+        if (c != sig[i]) return false;
+    }
+    return true;
+}
+
+/**
+ * Hash-keyed view of a sketch for the query hot loop.
+ *
+ * Each signature is stored under its canonical ntHash value, the same value the
+ * read iterator produces for every k-mer position, so a position can be tested
+ * against the whole sketch with one 64-bit probe and no string work. On a probe
+ * hit the stored sequence is compared to the read's k-mer before it counts, so a
+ * hash collision can never produce a false hit: results are identical to a
+ * string-keyed lookup, only the misses got cheap -- and in a typical query more
+ * than 99.99% of positions are misses.
+ */
+struct SketchEntry {
+    std::string seq;        // canonical signature sequence, for collision verification
+    unsigned refId;         // reference the signature belongs to
+    unsigned sigIdx;        // dense index of this signature within its reference
+};
+using SketchIndex = std::unordered_map<uint64_t, std::vector<SketchEntry>>;
+
+/**
+ * Build the hash-keyed view of a sketch and a dense per-reference signature
+ * ordering, so per-thread hit tallies can be plain integer arrays rather than
+ * string-keyed maps.
+ *
+ * @param sketchHash  Signature -> refId map, as loaded by loadSketch.
+ * @param refSigCount  Per-reference signature -> count maps (defines the order).
+ * @param sigNames  Output: for each reference, the signature at each dense index.
+ * @return The hash-keyed index.
+ */
+inline SketchIndex buildSketchIndex(const SketchHash& sketchHash,
+                                    const std::vector<SketchHash>& refSigCount,
+                                    std::vector<std::vector<std::string>>& sigNames) {
+    std::vector<std::unordered_map<std::string, unsigned>> sigIndexOf(refSigCount.size());
+    sigNames.assign(refSigCount.size(), {});
+    for (size_t ref = 0; ref < refSigCount.size(); ref++) {
+        for (const auto& [sig, c] : refSigCount[ref]) {
+            sigIndexOf[ref].emplace(sig, static_cast<unsigned>(sigNames[ref].size()));
+            sigNames[ref].push_back(sig);
+        }
+    }
+
+    SketchIndex index;
+    index.reserve(sketchHash.size());
+    for (const auto& [sig, refId] : sketchHash) {
+        uint64_t h = NTC64(sig.c_str(), static_cast<unsigned>(sig.size()));
+        auto it = sigIndexOf[refId].find(sig);
+        // A signature present in the sketch but absent from refSigCount (e.g. a
+        // filtered tree-level view) is still counted against its reference.
+        unsigned sigIdx = (it != sigIndexOf[refId].end()) ? it->second : UINT32_MAX;
+        index[h].push_back({sig, refId, sigIdx});
+    }
+    return index;
+}
+
+/**
+ * Query an input read file against the uniqsketch index.
+ *
+ * Threads accumulate hits into private tallies and merge them once per batch,
+ * so the hot loop takes no locks and performs no atomics. The previous version
+ * took a global critical section on every hit, and applied `omp atomic` to a
+ * map subscript -- which only covers the final increment, leaving the map
+ * lookup itself unsynchronised.
+ *
+ * @param in  Path to the input read file.
+ * @param index  Hash-keyed sketch view from buildSketchIndex.
+ * @param sigNames  Dense signature ordering from buildSketchIndex.
+ * @param dbFilter  Bloom filter for tracking distinct k-mers.
+ * @param sbFilter  Bloom filter for tracking solid k-mers.
+ * @param sketchCount  Per-reference unique k-mer hit counts.
+ * @param refSigCount  Per-reference per-signature counts.
+ * @param refRead  Per-reference distinct read id sets.
+ */
+void querySample(const std::string& in, const SketchIndex& index,
+                 const std::vector<std::vector<std::string>>& sigNames,
                  BloomFilter& dbFilter, BloomFilter& sbFilter,
                  std::vector<unsigned>& sketchCount,
                  std::vector<SketchHash>& refSigCount,
                  std::vector<std::unordered_set<std::string>>& refRead) {
+    (void) sbFilter;
     static const size_t BATCH_SIZE = 4096;
     gzFile fp = gzopen(in.c_str(), "r");
     kseq_t* ks = kseq_init(fp);
 
+    const size_t numRef = sketchCount.size();
     std::vector<std::string> seqBatch;
     std::vector<std::string> nameBatch;
     seqBatch.reserve(BATCH_SIZE);
     nameBatch.reserve(BATCH_SIZE);
+
+    // Per-thread tallies, allocated once and reused across batches.
+    struct Tally {
+        std::vector<unsigned> count;                          // per reference
+        std::vector<std::vector<unsigned>> sig;               // per reference, per dense sig index
+        std::vector<std::vector<unsigned>> readIdx;           // per reference, batch-local read indices
+    };
+    int maxThreads = 1;
+#ifdef _OPENMP
+    maxThreads = omp_get_max_threads();
+#endif
+    std::vector<Tally> tallies(maxThreads);
+    for (Tally& t : tallies) {
+        t.count.assign(numRef, 0);
+        t.sig.resize(numRef);
+        for (size_t ref = 0; ref < numRef; ref++) t.sig[ref].assign(sigNames[ref].size(), 0);
+        t.readIdx.resize(numRef);
+    }
 
     bool eof = false;
     while (!eof) {
@@ -110,35 +233,61 @@ void querySample(const std::string& in, const SketchHash& sketchHash,
             nameBatch.emplace_back(ks->name.s, ks->name.l);
         }
 
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (size_t r = 0; r < seqBatch.size(); ++r) {
-            const std::string& seq = seqBatch[r];
-            if (seq.length() < opt::kmerLen) continue;
+        #pragma omp parallel
+        {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            Tally& t = tallies[tid];
 
-            ntHashIterator itr(seq, opt::nhash, opt::kmerLen);
-            while (itr != itr.end()) {
-                if (opt::solid) {
-                    if (dbFilter.insert_make_change(*itr)) {
-                        ++itr;
-                        continue;
+            #pragma omp for schedule(dynamic, 64)
+            for (size_t r = 0; r < seqBatch.size(); ++r) {
+                const std::string& seq = seqBatch[r];
+                if (seq.length() < opt::kmerLen) continue;
+
+                ntHashIterator itr(seq, opt::nhash, opt::kmerLen);
+                while (itr != itr.end()) {
+                    if (opt::solid) {
+                        if (dbFilter.insert_make_change(*itr)) {
+                            ++itr;
+                            continue;
+                        }
+                    }
+
+                    // One 64-bit probe decides the (overwhelmingly common) miss.
+                    auto bucket = index.find((*itr)[0]);
+                    if (bucket != index.end()) {
+                        // Probe hit: confirm the sequence before counting.
+                        const char* kp = seq.c_str() + itr.get_pos();
+                        for (const SketchEntry& e : bucket->second) {
+                            if (kmerMatches(kp, e.seq)) {
+                                ++t.count[e.refId];
+                                if (e.sigIdx != UINT32_MAX) ++t.sig[e.refId][e.sigIdx];
+                                t.readIdx[e.refId].push_back(static_cast<unsigned>(r));
+                                break;
+                            }
+                        }
+                    }
+                    ++itr;
+                }
+            }
+        }
+
+        // Merge this batch's per-thread tallies into the shared results.
+        for (Tally& t : tallies) {
+            for (size_t ref = 0; ref < numRef; ref++) {
+                if (t.count[ref] == 0) continue;
+                sketchCount[ref] += t.count[ref];
+                t.count[ref] = 0;
+                for (size_t s = 0; s < t.sig[ref].size(); s++) {
+                    if (t.sig[ref][s]) {
+                        refSigCount[ref][sigNames[ref][s]] += t.sig[ref][s];
+                        t.sig[ref][s] = 0;
                     }
                 }
-
-                std::string kmer = get_canonical(seq.substr(itr.get_pos(), opt::kmerLen));
-                auto query = sketchHash.find(kmer);
-                if (query != sketchHash.end()) {
-                    unsigned refId = query->second;
-
-                    #pragma omp atomic
-                    ++sketchCount[refId];
-
-                    #pragma omp critical(refout)
-                    refRead[refId].insert(nameBatch[r]);
-
-                    #pragma omp atomic
-                    refSigCount[refId][kmer]++;
-                }
-                ++itr;
+                for (unsigned r : t.readIdx[ref]) refRead[ref].insert(nameBatch[r]);
+                t.readIdx[ref].clear();
             }
         }
     }
@@ -163,8 +312,12 @@ void querySampleBatch(const std::vector<std::string>& sampleFiles,
     BloomFilter dbFilter(opt::dbfSize * opt::bits, opt::nhash, opt::kmerLen);
     BloomFilter sbFilter(opt::sbfSize * opt::bits, opt::nhash, opt::kmerLen);
 
+    // Build the hash-keyed view once; it is shared read-only across all files.
+    std::vector<std::vector<std::string>> sigNames;
+    SketchIndex index = buildSketchIndex(sketchHash, refSigCount, sigNames);
+
     for (unsigned i = 0; i < sampleFiles.size(); i++) {
-        querySample(sampleFiles[i], sketchHash, dbFilter, sbFilter,
+        querySample(sampleFiles[i], index, sigNames, dbFilter, sbFilter,
                     sketchCount, refSigCount, refRead);
     }
 
@@ -198,8 +351,25 @@ struct FamilyCall {
     unsigned level;                                     // tree level the detection was made at
     unsigned count;                                     // signature hits at that level
     size_t reads;                                       // distinct reads carrying those hits
+    size_t sigsHit;                                     // distinct signatures observed at least once
+    size_t sigsTotal;                                   // signatures the representative carries at that level
     std::unordered_set<std::string> coveredLeaves;      // leaves descended from this node
 };
+
+/**
+ * Count how many of a reference's signatures were observed at least once.
+ *
+ * @param sigCount  Signature -> hit count map for one reference (all signatures
+ *                  present, unobserved ones at zero).
+ * @return Number of entries with a non-zero count.
+ */
+inline size_t countSigsHit(const SketchHash& sigCount) {
+    size_t n = 0;
+    for (const auto& [sig, c] : sigCount) {
+        if (c) ++n;
+    }
+    return n;
+}
 
 /**
  * Write the query result for a tree index.
