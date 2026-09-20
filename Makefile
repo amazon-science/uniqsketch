@@ -47,8 +47,10 @@ headerstest: test/headerstest.cpp
 e2etest: test/e2etest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
 
+# Suites are chained with && so the first failing one fails the target; joined
+# with ';' (as before) a failed assertion left `make test` exiting 0.
 test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest e2etest
-	cd test; ./uniqsketchtest > /dev/null; ./querysketchtest > /dev/null; ./bloomfiltertest > /dev/null; ./comparesketchtest > /dev/null; ./treesketchtest > /dev/null; ./headerstest > /dev/null; ./e2etest > /dev/null
+	cd test && ./uniqsketchtest > /dev/null && ./querysketchtest > /dev/null && ./bloomfiltertest > /dev/null && ./comparesketchtest > /dev/null && ./treesketchtest > /dev/null && ./headerstest > /dev/null && ./e2etest > /dev/null
 
 clean:
 	rm bin/uniqsketch bin/querysketch bin/comparesketch 
