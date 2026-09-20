@@ -389,6 +389,26 @@ inline size_t countSigsHit(const SketchHash& sigCount) {
 }
 
 /**
+ * Signature hits per signature: the quantity abundance is computed from.
+ *
+ * A reference's total hit count grows with the number of signatures it carries
+ * as well as with its coverage. When every reference has the same number of
+ * signatures the two are interchangeable and a share of raw counts is a share of
+ * coverage. They stop being interchangeable as soon as the counts differ: a
+ * close relative whose whole candidate pool is smaller than -c gets fewer
+ * signatures than a distant reference, and a tree index built with a large -c
+ * makes that the normal case. On the 8-phage benchmark with -c500 (119-500
+ * signatures per reference) a 10% contaminant was reported anywhere between
+ * 2.6% and 32% from raw counts, and between 9.3% and 11.3% from hits per
+ * signature.
+ * Dividing by the signature count removes the dependence; with equal counts it
+ * cancels out and the result is unchanged.
+ */
+inline double hitsPerSignature(size_t count, size_t sigsTotal) {
+    return sigsTotal ? static_cast<double>(count) / static_cast<double>(sigsTotal) : 0.0;
+}
+
+/**
  * Write the per-signature hit log (`log_<out>`): one row per signature that was
  * seen at least once, with the number of distinct reads supporting its reference.
  * Shared by the flat and tree writers so both produce the same evidence trail.
@@ -489,14 +509,6 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         if (!anyLeafResolved) reportedFamilies.push_back(&f);
     }
 
-    // Abundance is relative to everything reported, families included, so the
-    // column still sums to 1 over the rows in the file.
-    size_t sketchSum = 0;
-    for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (leafReported(i)) sketchSum += sketchCount[i];
-    }
-    for (const FamilyCall* f : reportedFamilies) sketchSum += f->count;
-
     // Merge leaf and family rows, then order by descending count.
     struct Row {
         std::string name;
@@ -519,14 +531,20 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.count > b.count; });
 
+    // Abundance is each row's hits per signature, relative to everything reported,
+    // families included, so the column still sums to 1 over the rows in the file.
+    // See hitsPerSignature for why the count is normalised.
+    double densitySum = 0.0;
+    for (const Row& r : rows) densitySum += hitsPerSignature(r.count, r.sigsTotal);
+
     // Same schema as the flat writer; `resolution` distinguishes individually
     // resolved references (`strain`) from group calls (`family`), so a family
     // row can never be mistaken for a strain call downstream.
     std::ofstream outFile(cfg.out);
     outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
-    if (sketchSum != 0) {
+    if (densitySum > 0.0) {
         for (const Row& r : rows) {
-            double abundance = static_cast<double>(r.count) / sketchSum;
+            double abundance = hitsPerSignature(r.count, r.sigsTotal) / densitySum;
             if (abundance > cfg.abundanceCutoff) {
                 outFile << r.name << "\t" << abundance << "\t" << r.count
                         << "\t" << r.reads << "\t" << r.sigsHit
@@ -562,12 +580,16 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     std::sort(sketchIndex.begin(), sketchIndex.end(),
               [&](unsigned i, unsigned j) { return sketchCount[i] > sketchCount[j]; });
 
-    size_t sketchSum = 0;
+    auto reported = [&](unsigned i) {
+        return refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
+               sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit);
+    };
+
+    // Abundance is each reference's hits per signature relative to all reported
+    // references; see hitsPerSignature.
+    double densitySum = 0.0;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
-            sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit)) {
-            sketchSum += sketchCount[i];
-        }
+        if (reported(i)) densitySum += hitsPerSignature(sketchCount[i], refSigCount[i].size());
     }
 
     // Primary output: reference abundance table. Columns beyond the third expose
@@ -582,12 +604,12 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     // parsers of the original three are unaffected.
     std::ofstream outFile(cfg.out);
     outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
-    if (sketchSum != 0) {
+    if (densitySum > 0.0) {
         for (unsigned i = 0; i < sketchCount.size(); i++) {
             unsigned idx = sketchIndex[i];
-            if (refRead[idx].size() > static_cast<size_t>(cfg.readCutoff) &&
-                sketchCount[idx] >= static_cast<unsigned>(cfg.sketchHit)) {
-                double abundance = static_cast<double>(sketchCount[idx]) / sketchSum;
+            if (reported(idx)) {
+                double abundance =
+                    hitsPerSignature(sketchCount[idx], refSigCount[idx].size()) / densitySum;
                 if (abundance > cfg.abundanceCutoff) {
                     outFile << sketchRef[idx] << "\t" << abundance
                             << "\t" << sketchCount[idx]

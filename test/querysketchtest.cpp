@@ -1,7 +1,10 @@
 #include <fstream>
 #include <iterator>
 #include <algorithm>
+#include <cmath>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cassert>
 
@@ -69,6 +72,64 @@ void testGenerateQueryResult(const QuerySketchConfig& cfg) {
     std::cerr << "PASSED: Test generateQueryResult\n";
 }
 
+// Parse the primary output into ref -> abundance.
+static std::unordered_map<std::string, double> readAbundances(const std::string& path) {
+    std::unordered_map<std::string, double> ab;
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);  // header
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string ref;
+        double abundance;
+        ls >> ref >> abundance;
+        ab[ref] = abundance;
+    }
+    return ab;
+}
+
+void testAbundanceIsHitsPerSignature(QuerySketchConfig cfg) {
+    std::cerr << "START: Test abundance is hits per signature... \t";
+
+    /*
+    Two references at equal coverage, one carrying 4 signatures and the other 1
+    (its whole candidate pool was smaller than -c). Equal coverage means equal hits
+    per signature: 2 each. Raw counts (8 vs 2) would report an 80/20 split; hits
+    per signature must report 50/50.
+    */
+    cfg.out = "out_querysketch_norm.tsv";
+    std::vector<unsigned> sketchCount = {8, 2};
+    std::vector<std::string> sketchRef = {"big_pool", "small_pool"};
+    std::vector<SketchHash> refSigCount{
+        {{"A", 2}, {"B", 2}, {"C", 2}, {"D", 2}},
+        {{"E", 2}}
+    };
+    std::vector<std::unordered_set<std::string>> refRead{{"r1", "r2", "r3"}, {"r4", "r5", "r6"}};
+
+    generateQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, cfg.out);
+    auto ab = readAbundances(cfg.out);
+    assert(ab.size() == 2);
+    assert(std::abs(ab["big_pool"] - 0.5) < 1e-9);
+    assert(std::abs(ab["small_pool"] - 0.5) < 1e-9);
+
+    // The tree writer applies the same normalisation, families included: a family
+    // row with 10 signatures and 20 hits sits at the same coverage as the leaves.
+    cfg.out = "out_querysketch_norm_tree.tsv";
+    FamilyCall fam;
+    fam.name = "family_x"; fam.level = 1; fam.count = 20; fam.reads = 20;
+    fam.sigsHit = 10; fam.sigsTotal = 10; fam.coveredLeaves = {"absent_leaf"};
+    std::vector<FamilyCall> families{fam};
+    generateTreeQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, families, cfg.out);
+    ab = readAbundances(cfg.out);
+    assert(ab.size() == 3);
+    // The file carries six significant digits, hence the tolerance.
+    assert(std::abs(ab["big_pool"] - 1.0 / 3) < 1e-5);
+    assert(std::abs(ab["small_pool"] - 1.0 / 3) < 1e-5);
+    assert(std::abs(ab["family_x"] - 1.0 / 3) < 1e-5);
+
+    std::cerr << "PASSED: Test abundance is hits per signature\n";
+}
+
 int main() {
     QuerySketchConfig cfg;
     cfg.ref = "expected_out_uniqsketch.txt";
@@ -87,6 +148,7 @@ int main() {
     // index, and that must not leak into the second test.
     testQuerySampleBatch(cfg, sampleFiles);
     testGenerateQueryResult(cfg);
+    testAbundanceIsHitsPerSignature(cfg);
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;
