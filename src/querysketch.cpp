@@ -34,7 +34,7 @@ static const char USAGE_MESSAGE[] =
     "  -g, --ref=STRING\tinput uniqsketch reference\n"
     "  -h, --hit=N\t\tnumber of uniqsketch hits to call a reference [10]\n"
     "  -a, --acutoff=N\tabundance cutoff to report [0.0]\n"
-    "  -s, --rcutoff=N\tread cutoff to report [2]\n"
+    "  -s, --rcutoff=N\tread cutoff to report [2; 0 with --tree on a strict-margin index]\n"
     "      --sensitive\tsets sensitivity parameter h=10\n"
     "      --very-sensitive\tsets sensitivity parameter h=5\n"
     "      --solid\t\tonly use solid k-mers in reads\n"
@@ -87,10 +87,31 @@ static const struct option longopts[] = {
  * used, so the tree actually focuses the query on promising sub-trees.
  */
 static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
-                         const std::vector<std::string>& sampleFiles) {
+                         const std::vector<std::string>& sampleFiles, bool readCutoffGiven) {
     std::string treeFile = treeDir + "/tree_index.tsv";
     if (!validateFile(treeFile, "tree index file")) exit(EXIT_FAILURE);
     if (!validateFile(cfg.ref, "leaf sketch (--ref)")) exit(EXIT_FAILURE);
+
+    // The read cutoff exists to keep single-read noise out of the report. Whether a
+    // single read is noise depends on how the index was built: margin-2 strict
+    // signatures need two coincident sequencing errors to be hit by a read from
+    // another reference, so one supporting read is real evidence and, at 0.01%
+    // abundance, often all the evidence a sample holds. Margin-1 signatures are
+    // hit by single-error reads of any abundant relative, and there the cutoff
+    // must stay. The index records which case applies; an explicit --rcutoff wins.
+    if (!readCutoffGiven) {
+        TreeBuildParams bp = loadTreeBuildParams(treeBuildParamsPath(treeDir));
+        if (bp.loaded && bp.minMargin >= 2 && bp.strictMargin) {
+            cfg.readCutoff = 0;
+            std::cerr << "Tree query: index built with --min-margin=2 --strict-margin; "
+                         "single-read calls are reported (--rcutoff=0)\n";
+        } else {
+            std::cerr << "Tree query: index "
+                      << (bp.loaded ? "was built without a strict margin" : "predates build_params.tsv")
+                      << "; keeping --rcutoff=" << cfg.readCutoff
+                      << " (rebuild with the current uniqsketch to enable single-read calls)\n";
+        }
+    }
 
     std::vector<TreeNode> tree = loadTree(treeFile);
 
@@ -269,6 +290,7 @@ int main(int argc, char* const argv[]) {
 
     QuerySketchConfig cfg;
     std::string treeDir;  // --tree: hierarchical query index directory (empty = flat)
+    bool readCutoffGiven = false;  // --rcutoff passed explicitly (tree mode picks a default otherwise)
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -284,7 +306,7 @@ int main(int argc, char* const argv[]) {
         case 'g': arg >> cfg.ref;             break;
         case 'h': arg >> g_sketchHit;          break;
         case 'a': arg >> cfg.abundanceCutoff; break;
-        case 's': arg >> cfg.readCutoff;      break;
+        case 's': arg >> cfg.readCutoff; readCutoffGiven = true; break;
         case 'b': arg >> cfg.bits;            break;
         case OPT_TREE: arg >> treeDir;         break;
         case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
@@ -337,7 +359,7 @@ int main(int argc, char* const argv[]) {
 
     if (!treeDir.empty()) {
         // Hierarchical query: narrow candidates coarse -> fine down the tree.
-        runTreeQuery(cfg, treeDir, sampleFiles);
+        runTreeQuery(cfg, treeDir, sampleFiles, readCutoffGiven);
     } else {
         // Flat query against a single sketch.
         SketchHash sketchHash;
