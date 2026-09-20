@@ -254,6 +254,69 @@ getTreeLevelRefs(const std::vector<TreeNode>& tree) {
 }
 
 /**
+ * Signature-selection parameters recorded next to a tree index
+ * (<outdir>/build_params.tsv, one `key<TAB>value` per line).
+ *
+ * The query tool reads these to choose reporting defaults that match how the
+ * signatures were selected. The one that matters today is the margin: with
+ * --min-margin=2 --strict-margin every signature is at Hamming distance >= 2 from
+ * every k-mer of every other reference, so a read from an abundant relative needs
+ * two coincident sequencing errors to hit it and a single supporting read is
+ * credible evidence. With margin-1 signatures one error suffices, and at high
+ * coverage of a relative such reads outnumber the true ones, so the read cutoff
+ * has to stay up. querysketch cannot tell the two indexes apart from the sketch
+ * file alone; this record is how it knows.
+ */
+struct TreeBuildParams {
+    unsigned kmerLen = 0;
+    int sketchnum = 0;
+    unsigned minMargin = 1;
+    bool strictMargin = false;
+    unsigned maxHomopolymer = 0;
+    std::string thresholds;      // comma-separated, coarsest first
+    bool loaded = false;         // false when the file is absent (pre-2.0 index)
+};
+
+inline std::string treeBuildParamsPath(const std::string& treeDir) {
+    return treeDir + "/build_params.tsv";
+}
+
+inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams& p) {
+    std::ofstream out(path);
+    out << "kmer\t" << p.kmerLen << "\n"
+        << "cov\t" << p.sketchnum << "\n"
+        << "min_margin\t" << p.minMargin << "\n"
+        << "strict_margin\t" << (p.strictMargin ? 1 : 0) << "\n"
+        << "max_homopolymer\t" << p.maxHomopolymer << "\n"
+        << "tree\t" << p.thresholds << "\n";
+}
+
+inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
+    TreeBuildParams p;
+    std::ifstream in(path);
+    if (!in) return p;
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        std::string key = line.substr(0, tab), val = line.substr(tab + 1);
+        try {
+            if (key == "kmer") p.kmerLen = static_cast<unsigned>(std::stoul(val));
+            else if (key == "cov") p.sketchnum = std::stoi(val);
+            else if (key == "min_margin") p.minMargin = static_cast<unsigned>(std::stoul(val));
+            else if (key == "strict_margin") p.strictMargin = (val == "1");
+            else if (key == "max_homopolymer") p.maxHomopolymer = static_cast<unsigned>(std::stoul(val));
+            else if (key == "tree") p.thresholds = val;
+        } catch (const std::exception&) {
+            // A malformed value leaves that field at its default; the record is
+            // advisory, so this must never take the query down.
+        }
+    }
+    p.loaded = true;
+    return p;
+}
+
+/**
  * Load a hierarchical tree from a tree TSV file.
  *
  * @param treeFile  Path to the tree TSV file.

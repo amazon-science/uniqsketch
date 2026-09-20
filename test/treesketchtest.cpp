@@ -50,6 +50,29 @@ void testLoadTree() {
     std::cerr << "PASSED: Test loadTree\n";
 }
 
+// build_params.tsv round-trips, and its absence is reported rather than guessed:
+// querysketch lowers the read cutoff only for a record that says strict margin 2.
+void testBuildParamsRoundTrip() {
+    std::cerr << "START: Test build params round trip... \t";
+    const char* dir = ".";
+    std::string path = treeBuildParamsPath(dir);
+    TreeBuildParams p;
+    p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true;
+    p.maxHomopolymer = 6; p.thresholds = "10000,1000,100";
+    writeTreeBuildParams(path, p);
+    TreeBuildParams q = loadTreeBuildParams(path);
+    assert(q.loaded);
+    assert(q.kmerLen == 81 && q.sketchnum == 500);
+    assert(q.minMargin == 2 && q.strictMargin);
+    assert(q.maxHomopolymer == 6 && q.thresholds == "10000,1000,100");
+    std::remove(path.c_str());
+
+    TreeBuildParams missing = loadTreeBuildParams(path);
+    assert(!missing.loaded);
+    assert(missing.minMargin == 1 && !missing.strictMargin);  // pre-2.0 index: no margin assumed
+    std::cerr << "PASSED: Test build params round trip\n";
+}
+
 // getTreeLevelRefs must group internal-node representatives by their level.
 void testGetTreeLevelRefs() {
     std::cerr << "START: Test getTreeLevelRefs... \t";
@@ -107,6 +130,7 @@ void testBuildHierarchicalTree() {
 
 int main() {
     testLoadTree();
+    testBuildParamsRoundTrip();
     testGetTreeLevelRefs();
     testBuildHierarchicalTree();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";

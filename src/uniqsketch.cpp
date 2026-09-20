@@ -42,9 +42,9 @@ static const char USAGE_MESSAGE[] =
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
     "      --tree=T1,T2,..\tbuild hierarchical tree index with comma-separated thresholds\n"
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
-    "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1]\n"
+    "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
-    "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures)\n"
+    "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
     unsigned clusterThreshold = 0;  // 0 = clustering disabled
     bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
     std::vector<unsigned> treeThresholds;  // empty = tree disabled
+    bool marginGiven = false;       // --min-margin passed explicitly (tree default otherwise)
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -113,7 +114,7 @@ int main(int argc, char** argv) {
         case 'r': arg >> cfg.refstat;          break;
         case 'e': arg >> cfg.entropyThreshold; break;
         case OPT_CLUSTER: arg >> clusterThreshold; break;
-        case OPT_MINMARGIN: arg >> cfg.minMargin; break;
+        case OPT_MINMARGIN: arg >> cfg.minMargin; marginGiven = true; break;
         case OPT_EXACT: useExactCluster = true; break;
         case OPT_TREE: {
             std::string treeArg;
@@ -144,6 +145,24 @@ int main(int argc, char** argv) {
     }
 
     cfg.sketchnum = g_sketchnum;
+
+    // A tree index exists to separate close relatives, and that is exactly where
+    // margin-1 signatures fail: a signature one substitution away from a k-mer of
+    // an abundant relative is hit by every read of that relative carrying a
+    // sequencing error at that base. At a few thousand-fold coverage those reads
+    // outnumber the reads of a 0.01% member, so its calls rest on noise and
+    // absent members get called too. Requiring Hamming distance >= 2 makes a
+    // false hit need two coincident errors, which removes the noise (on the
+    // 8-phage benchmark, reads landing on absent references fell from 2093 to 2
+    // over 28 samples) while keeping most of the candidate pool. Strict mode is
+    // needed for that guarantee; the soft fallback would refill empty slots with
+    // the very signatures being excluded. An explicit --min-margin wins.
+    if (!treeThresholds.empty() && !marginGiven) {
+        cfg.minMargin = 2;
+        cfg.strictMargin = true;
+        std::cerr << PROGRAM ": --tree defaults to --min-margin=2 --strict-margin "
+                     "(pass --min-margin=1 to select signatures without a margin)\n";
+    }
 
     if (cfg.minMargin < 1) cfg.minMargin = 1;
     if (cfg.minMargin > 2) {
@@ -207,6 +226,20 @@ int main(int argc, char** argv) {
         for (const auto& [level, refs] : levelRefs) {
             std::cerr << "Tree level " << level << ": " << refs.size() << " references\n";
         }
+
+        // Record how signatures were selected so querysketch can pick matching
+        // reporting defaults (see TreeBuildParams).
+        TreeBuildParams bp;
+        bp.kmerLen = cfg.kmerLen;
+        bp.sketchnum = cfg.sketchnum;
+        bp.minMargin = cfg.minMargin;
+        bp.strictMargin = cfg.strictMargin;
+        bp.maxHomopolymer = cfg.maxHomopolymer;
+        for (size_t i = 0; i < treeThresholds.size(); i++) {
+            if (i) bp.thresholds += ",";
+            bp.thresholds += std::to_string(treeThresholds[i]);
+        }
+        writeTreeBuildParams(treeBuildParamsPath(cfg.outdir), bp);
 
         // The main sketch is built from the leaf references (full-resolution level)
         std::unordered_set<std::string> uniqueRefs;
