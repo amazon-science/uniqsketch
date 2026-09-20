@@ -107,7 +107,7 @@ References with fewer than 2000 unique k-mers between them are merged into clust
 uniqsketch --tree=5000,1000 --sensitive -k81 -o sketch_index.tsv -f tree_out @refs.txt
 querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --tree tree_out --out out_sample.tsv
 ```
-The query narrows candidates from the coarsest level down to individual references.
+The query narrows candidates from the coarsest level down to individual references. Tree builds select signatures with `--min-margin=2 --strict-margin` by default, and the query then reports single-read calls (`--rcutoff=0`); see [querysketch](#querysketch-1) for why. For trace-level (0.01%) detection use `-c500` or `--very-sensitive` instead of `--sensitive`.
 
 4. Query a metagenomics sample against a flat index with read files `r1.fq.gz` and `r2.fq.gz`:
 ```bash
@@ -135,8 +135,14 @@ ref_3       0.01426     55      7       27         100          strain
 Reading this table:
 
 * `count` is the number of signature k-mer hits observed for that reference.
-* `abundance` is `count` divided by the summed `count` of all **reported** references.
-  Rows are sorted by descending `count`.
+* `abundance` is the reference's hits per signature (`count / sigs_total`) divided by
+  the sum of that quantity over all **reported** references. Hits per signature is
+  proportional to coverage; the raw `count` is not once references carry different
+  numbers of signatures, which happens whenever a reference's whole candidate pool
+  is smaller than `-c` (near-identical strains routinely have only a few hundred
+  unique k-mers). When every reference has the same number of signatures the two
+  definitions agree exactly, so results on such indexes are unchanged. Rows are
+  sorted by descending `count`.
 * `reads` is the number of distinct reads that contributed at least one hit.
 * `sigs_hit` / `sigs_total` is how many of the reference's signatures were observed
   at least once, out of how many it has.
@@ -170,17 +176,22 @@ together:
   because this packing effect cancels in expectation; `reads` does not, which is why
   it is reported as evidence rather than used for abundance.
 * **`count / reads` is the per-read multiplicity.** A high ratio means a clustered
-  signature region, and it also means a spurious read there is amplified: one
-  chimeric read on such a region contributes many hits. `count=60, reads=3` is three
-  reads sitting on a signature cluster and deserves suspicion; `count=60, reads=55`
-  is independent evidence.
+  signature region, so one read there contributes many hits. That is what a genuine
+  read from a near-identical strain looks like, and also what an error-carrying read
+  from an abundant relative looks like; which one you are seeing depends on the
+  index. On a strict-margin index (the `--tree` default) a foreign read needs two
+  coincident errors to hit a signature, so `count=60, reads=1` is ordinarily a real
+  read on a divergent locus. On a margin-1 index a single error suffices, and at
+  high coverage of a relative such reads are common, so the same row deserves
+  suspicion. `count=60, reads=55` is independent evidence either way.
 * **`sigs_hit` low relative to `sigs_total`, with a high `count`,** means many hits on
   few signatures — the pattern of a repeat or a cross-mapping rather than genuine
   presence. Support spread across most of a reference's signatures is what a real
   detection looks like.
 * Every call has already cleared `--hit` (on `count`) and `--rcutoff` (on `reads`).
   These columns let you see how far above those floors a call sits: `reads=3` is one
-  read above the default cutoff; `reads=30000` is unimpeachable.
+  read above the flat-index cutoff; `reads=1` is the floor on a strict-margin tree
+  index; `reads=30000` is unimpeachable.
 
 * `log_out_sample.tsv`: detailed log showing for each reference the total number of assigned reads and all `signature:count` pairs.
 * `logread_out_sample.tsv`: read-level log listing all matched read IDs per reference.
@@ -208,9 +219,9 @@ A list of files containing file names in each row can be passed with @ prefix.
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
       --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
-      --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1]
+      --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
-      --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback)
+      --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree]
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
@@ -226,6 +237,24 @@ so per-reference signature counts are preserved. The default `--min-margin=1`
 leaves selection unchanged. Pass `--strict-margin` to remove that fallback: slots
 with no 2-safe candidate are left empty, so every signature meets the requested
 margin, at the cost of a smaller sketch.
+
+`--tree` builds default to `--min-margin=2 --strict-margin` (pass `--min-margin=1`
+to opt out); flat builds keep `--min-margin=1`. The reason is measured rather than
+theoretical. A tree index exists to separate close relatives, and a margin-1
+signature of one relative is hit by every read of an abundant sibling that carries a
+sequencing error at the distinguishing base. With the sibling at ~2700× coverage and
+a 0.3% per-base error rate, each such site yields a few error reads, which is more
+than the entire contribution of a member present at 0.01%: its ~300 reads leave at
+most a handful on its distinguishing loci. Across 28 such mixtures on the 8-genome
+test set, margin-1 signatures collected 60 error reads on the true low-abundance
+member against 31 genuine ones, and 2093 reads on members that were not in the
+sample at all, producing 42 false strain calls. Requiring two substitutions cut the
+reads on absent members from 2093 to 2 and kept 25 of the 31 genuine reads, while
+the close members retained 62–99% of their candidate pools; the tree's coarse
+levels, whose representatives compete only with distant genomes, lose almost
+nothing. The selection parameters are recorded in `<outdir>/build_params.tsv`, which
+`querysketch --tree` reads to choose its read cutoff (see
+[querysketch](#querysketch-1)).
 
 `--max-homopolymer=N` drops signature candidates containing a single-base run
 longer than N bp — a run of exactly N is kept, N+1 is rejected.
@@ -274,10 +303,11 @@ With `--tree=T1,T2,...`, `uniqsketch` builds a hierarchical index instead of a f
 sketch: references are clustered at each threshold (sorted descending, so the first
 is the coarsest level) into a nested tree. The tree is written to
 `<outdir>/tree_index.tsv`, a coarse sketch per level to
-`<outdir>/sketch_level_<L>.tsv`, and the full-resolution leaf sketch to `-o`. Query
-it with `querysketch --tree=DIR` (pointing at that output directory) together with
-`--ref` set to the leaf sketch; the query narrows candidates from the coarsest level
-down to individual references.
+`<outdir>/sketch_level_<L>.tsv`, the selection parameters (`k`, `-c`, margin,
+homopolymer filter, thresholds) to `<outdir>/build_params.tsv`, and the
+full-resolution leaf sketch to `-o`. Query it with `querysketch --tree=DIR`
+(pointing at that output directory) together with `--ref` set to the leaf sketch;
+the query narrows candidates from the coarsest level down to individual references.
 
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output
@@ -307,7 +337,7 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
   -g, --ref=STRING      input uniqsketch reference
   -h, --hit=N           number of uniqsketch hits to call a reference [10]
   -a, --acutoff=N       abundance cutoff to report [0.0]
-  -s, --rcutoff=N       read cutoff to report [2]
+  -s, --rcutoff=N       read cutoff to report [2; 0 with --tree on a strict-margin index]
       --sensitive       sets sensitivity parameter h=10
       --very-sensitive  sets sensitivity parameter h=5
       --solid           only use solid k-mers in reads
@@ -327,7 +357,7 @@ thresholds:
 | flag | default | meaning |
 |---|---|---|
 | `-h, --hit=N` | 10 | needs **at least** N signature k-mer hits |
-| `-s, --rcutoff=N` | 2 | needs **more than** N distinct matching reads |
+| `-s, --rcutoff=N` | 2 (0 with `--tree` on a strict-margin index) | needs **more than** N distinct matching reads |
 | `-a, --acutoff=F` | 0.0 | needs relative abundance **greater than** F |
 
 The first two are the ones that matter in practice. `--hit` guards against a
@@ -337,6 +367,26 @@ low-quality read looks like. Lower values make detection more sensitive at low
 abundance and raise the false-positive rate; higher values do the reverse.
 `--sensitive` sets `h=10` (the same as the default) and `--very-sensitive` sets
 `h=5`, so reach for `--very-sensitive` when hunting trace-level organisms.
+
+**Why the read cutoff depends on the index.** Whether one read is trustworthy
+depends on how the signatures were selected. On a strict-margin index every
+signature is two or more substitutions from every k-mer of every other reference,
+so a read from another organism needs two coincident sequencing errors to hit one.
+A single read that does hit is then ordinarily a real read, and at the detection
+floor it is often all the evidence a sample holds: a member at 0.01% in 3 million
+read pairs contributes ~300 reads, of which 0–4 land on its distinguishing loci.
+`querysketch --tree` therefore reads the index's `build_params.tsv` and, when the
+index was built with `--min-margin=2 --strict-margin` (the `--tree` default),
+lowers the read cutoff to 0 so single-read calls are reported. An explicit
+`--rcutoff` always wins, and indexes built without a strict margin or by an earlier
+version keep the cutoff at 2, with a note on stderr saying so. On the 8-genome test
+set this took strain-level detection of close members at 0.01% from 3 of 28
+mixtures to 16 of 28, which is every mixture whose reads carried any evidence at
+all, at the price of 2 single-read false calls in 280 mixtures (both below 0.1%
+abundance, both with `count` ≤ 20 where genuine single-read calls carried 24–71).
+Flat indexes keep `--rcutoff=2`: they are usually built without a margin, and at a
+sibling's coverage of thousands, single-error reads on margin-1 signatures are
+routine.
 
 **`--solid`** discards the first occurrence of every k-mer in the sample and queries
 only k-mers seen at least twice. A sequencing error creates a k-mer that almost
@@ -364,10 +414,12 @@ distant genomes, so its signatures are drawn from a pool orders of magnitude lar
 than any member's (94,406 vs 151 candidates in the 8-genome test set), and it stays
 detectable at abundances where no individual member has enough unique sequence to
 be separated. Rather than report nothing, the query reports the family. A family
-row is a reliable presence flag; its abundance reads high, because the
-representative's signatures collect reads from every member, so treat it as "one of
-these is here" rather than a precise quantity. A family row is never emitted when
-any of its members is reported as a strain.
+row is a reliable presence flag, and its abundance is that of the group as a whole,
+since the representative's signatures are shared by every member; read it as "one
+or more of these is here, at about this level". On the 8-genome test set a close
+member at 0.01% that could not be resolved was reported as its family at
+0.009–0.012%. A family row is never emitted when any of its members is reported as
+a strain.
 
 `--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
 sub-tree stays in play if its representative gathers at least N hits and one read
@@ -428,6 +480,19 @@ default — and `--very-sensitive` selects 1000, which is the setting to use whe
 care about trace-level detection. Signatures are spread across the genome rather
 than clustered, so a higher count also buys robustness against uneven coverage.
 
+The detection floor this sets is easy to estimate. A reference at abundance *a* in
+*N* reads of length *L* has coverage *a·N·L/G* for genome size *G*, and each
+signature is hit by roughly coverage × (L−k+1)/L × P(error-free k-mer) reads: about
+0.1 hits per signature for a 170 kb genome at 0.01% in 3 million read pairs of
+151 bp with k=81. With `-h 10` that needs ~100 signatures to reach the threshold on
+average and ~500 to reach it reliably. On the 8-genome test set at 0.01%, `-c50`
+detected 7 of 28 distant contaminants, the default 100 detected 20 (measured on a
+flat index; for distant references the layout makes no difference), and `-c500` all
+28. Raising `-c` past a near-identical strain's candidate pool (typically a few
+hundred k-mers) cannot add signatures, but it does take the whole pool, and the
+strain's detection is then bounded by how many reads land on those loci rather than
+by the index. Index size and query memory grow linearly with `-c`.
+
 **Index layout: flat, `--cluster=N`, or `--tree`.** This is the choice that most
 affects what your results mean, so it is worth understanding before picking one.
 
@@ -465,8 +530,10 @@ only when you accept representative-level answers.
 
 **`--max-homopolymer` and `--min-margin`.** Both harden signatures against read
 errors and are described in detail above. `--max-homopolymer=6` is a reasonable
-default to adopt; `--min-margin=2` is worth it when your references include close
-relatives and you are seeing cross-assignment.
+default to adopt. `--min-margin=2 --strict-margin` is the default for `--tree`
+builds; add it to flat builds too when your references include close relatives,
+since it removes the error-driven cross-hits that otherwise appear at the 0.01–0.1%
+level whenever one relative is abundant.
 
 **`-t, --threads`.** Set this to your core count for both indexing and querying;
 both stages parallelize well.
