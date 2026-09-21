@@ -115,46 +115,28 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
 
     std::vector<TreeNode> tree = loadTree(treeFile);
 
-    // Descendant leaf-name set for every node. Children always have smaller ids than
-    // their parent (nodes are created bottom-up), so a single ascending pass suffices.
-    std::vector<std::unordered_set<std::string>> descLeaves(tree.size());
-    unsigned maxInternalLevel = 0;
-    bool anyInternal = false;
-    for (size_t idx = 0; idx < tree.size(); idx++) {
-        const TreeNode& node = tree[idx];
-        if (node.isLeaf) {
-            descLeaves[idx].insert(getBaseId(node.filePath));
-        } else {
-            for (unsigned c : node.children)
-                if (c < tree.size())
-                    descLeaves[idx].insert(descLeaves[c].begin(), descLeaves[c].end());
-            maxInternalLevel = std::max(maxInternalLevel, node.level);
-            anyInternal = true;
-        }
-    }
-
-    // level -> (representative basename -> covered leaf names). Mirrors how uniqsketch
-    // emits level sketches: internal-node representatives at their level, plus any
-    // never-clustered leaves placed at the deepest internal level.
+    // level -> (representative basename -> covered leaf names), from the same
+    // partition the index was built with (treeLevelPartition), so every leaf is
+    // covered by exactly one representative at every level. The earlier version
+    // derived this from node levels alone and lost every leaf that first appears
+    // at a finer level (a never-clustered leaf, or a node whose parent is more
+    // than one level up): such a leaf was never scored at the coarser level, so it
+    // was absent from the candidate set and filtered out before it could be seen.
+    // On a 120-genome E. coli tree that pruned every leaf before the leaf level.
     std::unordered_map<unsigned,
         std::unordered_map<std::string, std::unordered_set<std::string>>> levelMap;
-    // Internal node name per (level, representative), so a family-level call can be
-    // reported under the same name the index's tree_index.tsv uses for that group.
+    // Node name per (level, representative) for family rows, only for entries that
+    // stand for two or more leaves: a leaf standing for itself at a coarse level is
+    // the same genome the leaf level scores, not a family.
     std::unordered_map<unsigned,
         std::unordered_map<std::string, std::string>> levelNodeName;
-    for (size_t idx = 0; idx < tree.size(); idx++) {
-        const TreeNode& node = tree[idx];
-        if (!node.isLeaf) {
-            levelMap[node.level][getBaseId(node.filePath)] = descLeaves[idx];
-            levelNodeName[node.level][getBaseId(node.filePath)] = node.name;
-        }
-    }
-    if (anyInternal) {
-        for (size_t idx = 0; idx < tree.size(); idx++) {
-            const TreeNode& node = tree[idx];
-            if (node.isLeaf && node.parentId == -1)
-                levelMap[maxInternalLevel][getBaseId(node.filePath)] =
-                    std::unordered_set<std::string>{ getBaseId(node.filePath) };
+    for (const auto& [level, entries] : treeLevelPartition(tree)) {
+        for (const LevelEntry& e : entries) {
+            std::unordered_set<std::string> leaves;
+            for (const std::string& p : e.leafPaths) leaves.insert(getBaseId(p));
+            levelMap[level][getBaseId(e.repPath)] = std::move(leaves);
+            if (e.isNode && e.leafPaths.size() >= 2)
+                levelNodeName[level][getBaseId(e.repPath)] = e.name;
         }
     }
 
@@ -182,8 +164,15 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         exit(EXIT_FAILURE);
     }
 
-    std::unordered_set<std::string> candidates;  // surviving candidate leaf names
-    bool firstLevel = true;
+    // Candidate leaves. Every leaf starts in play; a leaf drops out only when a
+    // representative covering it was scored at some level and fell below the
+    // pruning floor. A leaf that no scored representative covers at a level (a
+    // level file from an older index that omits self-represented leaves, say) is
+    // simply carried forward, so a gap in the index can cost sensitivity in the
+    // narrowing but can never delete a reference from the result.
+    std::unordered_set<std::string> candidates;
+    for (const TreeNode& node : tree)
+        if (node.isLeaf) candidates.insert(getBaseId(node.filePath));
     std::vector<FamilyCall> familyCalls;         // coarse detections, for level-appropriate reporting
 
     for (size_t li = 0; li < levelSketches.size(); li++) {
@@ -196,8 +185,9 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         std::vector<SketchHash> levelSig;
         loadSketch(cfg, sketchPath, levelHash, levelRef, levelSig);
 
-        // Restrict to candidate references (all are in play on the coarsest level).
-        if (!firstLevel) {
+        // Restrict scoring to references that still cover a candidate leaf.
+        std::vector<bool> scored(levelRef.size(), false);
+        {
             std::unordered_set<unsigned> keep;
             const auto& lm = levelMap[level];
             for (unsigned i = 0; i < levelRef.size(); i++) {
@@ -210,7 +200,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                         for (const auto& leaf : it->second)
                             if (candidates.count(leaf)) { inPlay = true; break; }
                 }
-                if (inPlay) keep.insert(i);
+                if (inPlay) { keep.insert(i); scored[i] = true; }
             }
             SketchHash filtered;
             for (const auto& kv : levelHash)
@@ -245,28 +235,33 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // on its own as a family-level call, and uses the ordinary thresholds. Both
         // levels emit the same number of signatures per reference, so the counts are
         // on a comparable scale and no separate reporting threshold is needed.
-        std::unordered_set<std::string> nextCandidates;
+        const auto& nameMap = levelNodeName[level];
         for (unsigned i = 0; i < levelRef.size(); i++) {
+            if (!scored[i]) continue;
             auto it = lm.find(levelRef[i]);
             if (it == lm.end()) continue;
 
             bool survivesPruning =
                 levelCount[i] >= static_cast<unsigned>(cfg.treePruneHit) &&
                 !levelRead[i].empty();
-            if (survivesPruning) {
-                nextCandidates.insert(it->second.begin(), it->second.end());
+            if (!survivesPruning) {
+                for (const auto& leaf : it->second) candidates.erase(leaf);
+                continue;
             }
 
+            // A family call needs a real group behind it (levelNodeName holds only
+            // nodes standing for two or more leaves); a leaf representing itself at a
+            // coarse level is scored again, as a strain, at the leaf level.
+            auto nit = nameMap.find(levelRef[i]);
             bool worthReporting =
+                nit != nameMap.end() &&
                 levelCount[i] >= static_cast<unsigned>(cfg.sketchHit) &&
                 levelRead[i].size() > static_cast<size_t>(cfg.readCutoff);
             if (worthReporting) {
                 // Held as a candidate family call; only emitted if the leaf level
                 // fails to resolve any member of this group.
-                const auto& nameMap = levelNodeName[level];
-                auto nit = nameMap.find(levelRef[i]);
                 FamilyCall fc;
-                fc.name = (nit != nameMap.end()) ? nit->second : levelRef[i];
+                fc.name = nit->second;
                 fc.level = level;
                 fc.count = levelCount[i];
                 fc.reads = levelRead[i].size();
@@ -276,8 +271,6 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 familyCalls.push_back(std::move(fc));
             }
         }
-        candidates.swap(nextCandidates);
-        firstLevel = false;
         std::cerr << "Tree query: level " << level << " -> "
                   << candidates.size() << " candidate leaves\n";
     }

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -215,41 +216,115 @@ inline std::vector<TreeNode> buildHierarchicalTree(
 }
 
 /**
- * Get the set of references at each level of the tree for hierarchical sketch building.
- * Returns a vector of (level, refFiles) pairs, ordered from coarsest to finest.
+ * One entry of a level's partition: the reference whose genome stands for a set
+ * of leaves at that level.
+ */
+struct LevelEntry {
+    std::string repPath;                 // genome file used as the representative
+    std::string name;                    // node name (cluster_L..) or the leaf's name
+    std::vector<std::string> leafPaths;  // leaves represented (one path for a leaf standing for itself)
+    bool isNode;                         // true for an internal node, false for a self-represented leaf
+};
+
+/**
+ * Partition of the leaves at every internal level of the tree.
  *
- * @param tree  The hierarchical tree.
- * @return Vector of pairs: (level, vector of file paths for that level's representatives).
+ * buildHierarchicalTree creates a node only at the level where a merge happens,
+ * so a node whose parent sits two levels up is implicitly present at the level in
+ * between, an orphan node (no parent) is present at every coarser level, and a
+ * leaf that never merged is present, as itself, at every level. A node therefore
+ * spans the levels from just below its parent down to its own; a leaf is
+ * represented at level L by the ancestor spanning L, or by itself if none does.
+ *
+ * Every leaf appears in exactly one entry at every level. That is what both the
+ * index build and the query need: the build makes each level's signatures unique
+ * against the complete set of genomes present at that level rather than against
+ * whichever nodes happen to be numbered with it, and the query can narrow
+ * candidates level by level knowing that a leaf absent from a level's entries
+ * cannot exist. Both sides call this function so they cannot disagree.
+ *
+ * @return (level, entries) pairs, coarsest first, for levels 0..leafLevel-1.
+ */
+inline std::vector<std::pair<unsigned, std::vector<LevelEntry>>>
+treeLevelPartition(const std::vector<TreeNode>& tree) {
+    std::unordered_map<unsigned, size_t> byId;
+    unsigned leafLevel = 0;
+    for (size_t i = 0; i < tree.size(); i++) {
+        byId[tree[i].id] = i;
+        if (tree[i].isLeaf) leafLevel = std::max(leafLevel, tree[i].level);
+    }
+
+    std::vector<std::pair<unsigned, std::vector<LevelEntry>>> result;
+    for (unsigned L = 0; L < leafLevel; L++) {
+        // representative node id (or leaf id) -> entry
+        std::map<unsigned, LevelEntry> entries;
+        for (const TreeNode& leaf : tree) {
+            if (!leaf.isLeaf) continue;
+            // Walk up: the ancestor spanning L has level >= L and a parent with
+            // level < L (or no parent). Ancestors are visited finest-first, so the
+            // first one with level >= L whose parent is above L is the answer.
+            const TreeNode* rep = nullptr;
+            int pid = leaf.parentId;
+            while (pid != -1) {
+                const TreeNode& anc = tree[byId.at(static_cast<unsigned>(pid))];
+                if (anc.level >= L) {
+                    bool parentAbove = (anc.parentId == -1) ||
+                                       tree[byId.at(static_cast<unsigned>(anc.parentId))].level < L;
+                    if (parentAbove) { rep = &anc; break; }
+                }
+                pid = anc.parentId;
+            }
+            unsigned key = rep ? rep->id : leaf.id;
+            auto it = entries.find(key);
+            if (it == entries.end()) {
+                LevelEntry e;
+                e.repPath = rep ? rep->filePath : leaf.filePath;
+                e.name = rep ? rep->name : leaf.name;
+                e.isNode = (rep != nullptr);
+                it = entries.emplace(key, std::move(e)).first;
+            }
+            it->second.leafPaths.push_back(leaf.filePath);
+        }
+        std::vector<LevelEntry> list;
+        for (auto& kv : entries) list.push_back(std::move(kv.second));
+        result.emplace_back(L, std::move(list));
+    }
+    return result;
+}
+
+/**
+ * True when two levels partition the leaves identically (same representatives
+ * standing for the same leaves). Such levels would produce the same sketch, so
+ * the build writes only one and the query scores it once.
+ */
+inline bool samePartition(const std::vector<LevelEntry>& a, const std::vector<LevelEntry>& b) {
+    if (a.size() != b.size()) return false;
+    auto key = [](const std::vector<LevelEntry>& v) {
+        std::vector<std::pair<std::string, std::vector<std::string>>> k;
+        for (const auto& e : v) {
+            std::vector<std::string> leaves = e.leafPaths;
+            std::sort(leaves.begin(), leaves.end());
+            k.emplace_back(e.repPath, std::move(leaves));
+        }
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+    return key(a) == key(b);
+}
+
+/**
+ * Representative genome files per level, coarsest first, for hierarchical sketch
+ * building. Thin wrapper over treeLevelPartition kept for callers that only need
+ * the file lists.
  */
 inline std::vector<std::pair<unsigned, std::vector<std::string>>>
 getTreeLevelRefs(const std::vector<TreeNode>& tree) {
-    std::unordered_map<unsigned, std::vector<std::string>> levelRefs;
-
-    for (const auto& node : tree) {
-        // Internal nodes at each level serve as representatives for that level
-        if (!node.isLeaf && !node.filePath.empty()) {
-            levelRefs[node.level].push_back(node.filePath);
-        }
-    }
-
-    // Also add leaf-only references (those not part of any cluster)
-    for (const auto& node : tree) {
-        if (node.isLeaf && node.parentId == -1) {
-            // Find the deepest level
-            unsigned maxLevel = 0;
-            for (const auto& [lvl, refs] : levelRefs) {
-                maxLevel = std::max(maxLevel, lvl);
-            }
-            levelRefs[maxLevel].push_back(node.filePath);
-        }
-    }
-
-    // Sort by level
     std::vector<std::pair<unsigned, std::vector<std::string>>> result;
-    for (auto& [lvl, refs] : levelRefs) {
+    for (const auto& [lvl, entries] : treeLevelPartition(tree)) {
+        std::vector<std::string> refs;
+        for (const auto& e : entries) refs.push_back(e.repPath);
         result.emplace_back(lvl, std::move(refs));
     }
-    std::sort(result.begin(), result.end());
     return result;
 }
 

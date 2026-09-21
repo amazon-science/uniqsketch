@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,59 @@ void testGetTreeLevelRefs() {
     std::cerr << "PASSED: Test getTreeLevelRefs\n";
 }
 
+// treeLevelPartition must cover every leaf exactly once at every internal level:
+// a node stands for its leaves from just below its parent down to its own level,
+// an orphan node from the top down, and a leaf that never merged stands for
+// itself everywhere. This is the shape that broke the query on the E. coli set
+// (singletons and orphans were never scored at the coarse levels and vanished).
+void testTreeLevelPartition() {
+    std::cerr << "START: Test treeLevelPartition... \t";
+    // Thresholds T0 > T1 > T2 -> internal levels 0,1,2; leaves at level 3.
+    //   node N (level 2) = {A, B}, parent P (level 0) = {A, B, C}   -> N spans 1..2
+    //   node O (level 1) = {D, E}, orphan                            -> O spans 0..1
+    //   leaf F never merges                                          -> itself at 0,1,2
+    std::vector<TreeNode> t;
+    auto leaf = [&](unsigned id, const char* n, int parent) {
+        TreeNode x; x.id = id; x.name = n; x.filePath = std::string("/d/") + n + ".fa";
+        x.level = 3; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+    };
+    leaf(0, "A", 6); leaf(1, "B", 6); leaf(2, "C", 7); leaf(3, "D", 8); leaf(4, "E", 8); leaf(5, "F", -1);
+    TreeNode N; N.id = 6; N.name = "N"; N.filePath = "/d/A.fa"; N.level = 2; N.parentId = 7; N.isLeaf = false; N.children = {0, 1}; t.push_back(N);
+    TreeNode P; P.id = 7; P.name = "P"; P.filePath = "/d/A.fa"; P.level = 0; P.parentId = -1; P.isLeaf = false; P.children = {6, 2}; t.push_back(P);
+    TreeNode O; O.id = 8; O.name = "O"; O.filePath = "/d/D.fa"; O.level = 1; O.parentId = -1; O.isLeaf = false; O.children = {3, 4}; t.push_back(O);
+
+    auto part = treeLevelPartition(t);
+    assert(part.size() == 3);
+    for (const auto& [lvl, entries] : part) {
+        std::set<std::string> covered;
+        size_t n = 0;
+        for (const auto& e : entries) for (const auto& p : e.leafPaths) { covered.insert(p); ++n; }
+        assert(n == 6 && covered.size() == 6);          // every leaf exactly once
+    }
+    auto find = [&](unsigned lvl, const std::string& rep) -> const LevelEntry* {
+        for (const auto& e : part[lvl].second) if (e.repPath == rep) return &e;
+        return nullptr;
+    };
+    // level 0: P{A,B,C}, O{D,E} (orphan reaches the top), F
+    assert(part[0].second.size() == 3);
+    assert(find(0, "/d/A.fa") && find(0, "/d/A.fa")->name == "P" && find(0, "/d/A.fa")->leafPaths.size() == 3);
+    assert(find(0, "/d/D.fa") && find(0, "/d/D.fa")->name == "O" && find(0, "/d/D.fa")->isNode);
+    assert(find(0, "/d/F.fa") && !find(0, "/d/F.fa")->isNode);
+    // level 1: N{A,B} (spans the gap below P), C itself, O{D,E}, F
+    assert(part[1].second.size() == 4);
+    assert(find(1, "/d/A.fa") && find(1, "/d/A.fa")->name == "N" && find(1, "/d/A.fa")->leafPaths.size() == 2);
+    assert(find(1, "/d/C.fa") && !find(1, "/d/C.fa")->isNode);
+    assert(find(1, "/d/D.fa") && find(1, "/d/D.fa")->name == "O");
+    // level 2: N{A,B}, C, D, E, F
+    assert(part[2].second.size() == 5);
+    assert(find(2, "/d/A.fa") && find(2, "/d/A.fa")->name == "N");
+    assert(find(2, "/d/D.fa") && !find(2, "/d/D.fa")->isNode);
+    // levels 1 and 2 differ; a level identical to the next is detectable
+    assert(!samePartition(part[1].second, part[2].second));
+    assert(samePartition(part[2].second, part[2].second));
+    std::cerr << "PASSED: Test treeLevelPartition\n";
+}
+
 // buildHierarchicalTree must group near-identical references and keep distinct ones apart.
 void testBuildHierarchicalTree() {
     std::cerr << "START: Test buildHierarchicalTree... \t";
@@ -132,6 +186,7 @@ int main() {
     testLoadTree();
     testBuildParamsRoundTrip();
     testGetTreeLevelRefs();
+    testTreeLevelPartition();
     testBuildHierarchicalTree();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;

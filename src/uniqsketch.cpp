@@ -221,10 +221,36 @@ int main(int argc, char** argv) {
                                           cfg.nhash1, cfg.bits,
                                           estimateMaxGenomeSize(refFiles), treeFile);
 
-        // Report references per tree level
-        auto levelRefs = getTreeLevelRefs(tree);
-        for (const auto& [level, refs] : levelRefs) {
-            std::cerr << "Tree level " << level << ": " << refs.size() << " references\n";
+        // Every level's sketch is built over the complete partition of the leaves
+        // at that level (see treeLevelPartition), so its signatures are unique
+        // against every genome present at the level. A level that partitions the
+        // leaves exactly like the next finer level (or like the leaf level itself,
+        // when nothing merged there) would yield the same sketch and is skipped;
+        // the query walks whatever level files exist.
+        auto partition = treeLevelPartition(tree);
+        std::vector<std::pair<unsigned, std::vector<std::string>>> levelRefs;
+        for (size_t li = 0; li < partition.size(); li++) {
+            const auto& [level, entries] = partition[li];
+            bool nodes = false;
+            for (const auto& e : entries) nodes = nodes || e.isNode;
+            if (!nodes) {
+                std::cerr << "Tree level " << level << ": no clusters (same as leaf level), skipped\n";
+                continue;
+            }
+            if (li + 1 < partition.size() && samePartition(entries, partition[li + 1].second)) {
+                std::cerr << "Tree level " << level << ": same partition as level "
+                          << partition[li + 1].first << ", skipped\n";
+                continue;
+            }
+            std::vector<std::string> refs;
+            size_t clusters = 0;
+            for (const auto& e : entries) {
+                refs.push_back(e.repPath);
+                clusters += e.isNode;
+            }
+            std::cerr << "Tree level " << level << ": " << refs.size() << " references ("
+                      << clusters << " clusters, " << refs.size() - clusters << " single)\n";
+            levelRefs.emplace_back(level, std::move(refs));
         }
 
         // Record how signatures were selected so querysketch can pick matching
