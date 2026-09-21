@@ -184,6 +184,103 @@ void identifyUniqKmers(const UniqSketchConfig& cfg, const std::vector<std::strin
 }
 
 /**
+ * Insert the k-mers of a group of genomes into the distinct/solid filters,
+ * counting each k-mer at most once for the whole group.
+ *
+ * A tree node stands for several genomes. Its signatures should be k-mers that
+ * occur in the node's members and nowhere else, and a k-mer shared by all the
+ * members is the best kind. Fed through loadBFfa one file at a time, such a
+ * k-mer is seen twice and lands in the solid filter as a repeat. Here a
+ * group-private "seen" filter admits each k-mer to the global filters once, so
+ * the solid filter ends up holding k-mers present in two or more *groups*, and
+ * "distinct but not solid" means unique to one group.
+ *
+ * The seen filter is sized generously (64 bits per base of input, five hashes:
+ * false-positive rate ~2e-6) because a false positive here is not conservative:
+ * it drops the group's only insertion of a k-mer, so a k-mer this group shares
+ * with one other group is counted once and handed to that group as a signature.
+ */
+void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& files,
+                   BloomFilter& dbFilter, BloomFilter& sbFilter) {
+    if (files.size() == 1) {
+        loadBFfa(cfg, files[0], dbFilter, sbFilter);
+        return;
+    }
+    size_t bases = 0;
+    for (const auto& f : files) {
+        std::ifstream in(f, std::ios::binary | std::ios::ate);
+        if (in) bases += static_cast<size_t>(in.tellg());
+    }
+    if (bases == 0) bases = 1;
+    BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
+    for (const auto& fPath : files) {
+        std::ifstream refFile(fPath);
+        std::string seq;
+        bool good = static_cast<bool>(std::getline(refFile, seq));
+        while (good) {
+            std::string faSeq;
+            good = static_cast<bool>(std::getline(refFile, seq));
+            while (good && seq[0] != '>') {
+                faSeq += seq;
+                good = static_cast<bool>(std::getline(refFile, seq));
+            }
+            ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
+            while (itr != itr.end()) {
+                if (seen.insert_make_change(*itr)) {
+                    if (!dbFilter.insert_make_change(*itr)) {
+                        sbFilter.insert(*itr);
+                    }
+                }
+                ++itr;
+            }
+        }
+    }
+}
+
+/**
+ * identifyUniqKmers for a universe of genome groups.
+ *
+ * Each group is a tree-level entry: its first file is the representative whose
+ * k-mers are the candidates, the rest are the other members of the node (none
+ * for a leaf standing for itself). A candidate is a k-mer of the representative
+ * that occurs in no other group, members included (see loadBFfaGroup). Built
+ * over the complete partition of the leaves at a level, this makes every
+ * coarse-level signature unique against every genome in the index, not just
+ * against the other representatives.
+ *
+ * Output layout matches identifyUniqKmers: one candidate file per group named
+ * after the representative, and a stat file buildSketch can consume.
+ */
+void identifyGroupUniqKmers(const UniqSketchConfig& cfg,
+                            const std::vector<std::vector<std::string>>& groups,
+                            BloomFilter& dbFilter) {
+    size_t members = 0;
+    for (const auto& g : groups) members += g.size();
+    std::cout << "k-mer length: " << cfg.kmerLen << "\n"
+              << "Groups: " << groups.size() << " over " << members << " genomes\n";
+
+    BloomFilter sbFilter(cfg.m2(), cfg.nhash2, cfg.kmerLen);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned i = 0; i < groups.size(); ++i) {
+        loadBFfaGroup(cfg, groups[i], dbFilter, sbFilter);
+    }
+
+    std::vector<int> refCount(groups.size());
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned i = 0; i < groups.size(); ++i) {
+        checkRef(cfg, groups[i][0], i, sbFilter, refCount);
+    }
+
+    std::ofstream tsvOut(cfg.refstat);
+    for (size_t i = 0; i < refCount.size(); i++) {
+        tsvOut << cfg.outdir << "/" << getBaseId(groups[i][0]) << ".tsv\t"
+               << refCount[i] << "\t" << i << "\n";
+    }
+    tsvOut.close();
+}
+
+/**
  * Digitize a DNA sequence into an integer representation.
  *
  * @param seq  DNA sequence to digitize.

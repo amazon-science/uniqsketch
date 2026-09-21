@@ -509,6 +509,33 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         if (!anyLeafResolved) reportedFamilies.push_back(&f);
     }
 
+    // One row per group. A node spanning several levels is scored at each of
+    // them with a different signature draw and yields one call per level; keep
+    // the finest. And when a group and one of its sub-groups are both called,
+    // the sub-group already says more, so the enclosing group is dropped.
+    {
+        std::unordered_map<std::string, const FamilyCall*> finest;
+        for (const FamilyCall* f : reportedFamilies) {
+            auto it = finest.find(f->name);
+            if (it == finest.end() || f->level > it->second->level) finest[f->name] = f;
+        }
+        std::vector<const FamilyCall*> kept;
+        for (const auto& [name, f] : finest) {
+            bool hasReportedSubgroup = false;
+            for (const auto& [otherName, g] : finest) {
+                if (g == f || g->coveredLeaves.size() >= f->coveredLeaves.size()) continue;
+                bool subset = true;
+                for (const std::string& leaf : g->coveredLeaves)
+                    if (!f->coveredLeaves.count(leaf)) { subset = false; break; }
+                if (subset) { hasReportedSubgroup = true; break; }
+            }
+            if (!hasReportedSubgroup) kept.push_back(f);
+        }
+        std::sort(kept.begin(), kept.end(),
+                  [](const FamilyCall* a, const FamilyCall* b) { return a->count > b->count; });
+        reportedFamilies.swap(kept);
+    }
+
     // Merge leaf and family rows, then order by descending count.
     struct Row {
         std::string name;

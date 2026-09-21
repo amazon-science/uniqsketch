@@ -227,8 +227,12 @@ int main(int argc, char** argv) {
         // leaves exactly like the next finer level (or like the leaf level itself,
         // when nothing merged there) would yield the same sketch and is skipped;
         // the query walks whatever level files exist.
+        // Each entry becomes a group: the representative first, then the node's
+        // other members, so identifyGroupUniqKmers can make the representative's
+        // signatures unique against every genome outside the node rather than
+        // against the other representatives only.
         auto partition = treeLevelPartition(tree);
-        std::vector<std::pair<unsigned, std::vector<std::string>>> levelRefs;
+        std::vector<std::pair<unsigned, std::vector<std::vector<std::string>>>> levelGroups;
         for (size_t li = 0; li < partition.size(); li++) {
             const auto& [level, entries] = partition[li];
             bool nodes = false;
@@ -242,15 +246,18 @@ int main(int argc, char** argv) {
                           << partition[li + 1].first << ", skipped\n";
                 continue;
             }
-            std::vector<std::string> refs;
+            std::vector<std::vector<std::string>> groups;
             size_t clusters = 0;
             for (const auto& e : entries) {
-                refs.push_back(e.repPath);
+                std::vector<std::string> g{e.repPath};
+                for (const auto& p : e.leafPaths)
+                    if (p != e.repPath) g.push_back(p);
+                groups.push_back(std::move(g));
                 clusters += e.isNode;
             }
-            std::cerr << "Tree level " << level << ": " << refs.size() << " references ("
-                      << clusters << " clusters, " << refs.size() - clusters << " single)\n";
-            levelRefs.emplace_back(level, std::move(refs));
+            std::cerr << "Tree level " << level << ": " << groups.size() << " references ("
+                      << clusters << " clusters, " << groups.size() - clusters << " single)\n";
+            levelGroups.emplace_back(level, std::move(groups));
         }
 
         // Record how signatures were selected so querysketch can pick matching
@@ -277,24 +284,28 @@ int main(int argc, char** argv) {
 
         // Build a coarse-level sketch for each internal level. Each level gets its
         // own copy of the configuration, so nothing here can leak into the
-        // leaf-level build below.
-        for (const auto& [level, refs] : levelRefs) {
-            if (refs.empty()) continue;
+        // leaf-level build below. The universe at every level is the full set of
+        // leaves (grouped differently), so its k-mer cardinality is measured once.
+        size_t universeKmers = 0, universeDistinct = 0, universeSolid = 0;
+        if (!levelGroups.empty()) {
+            getCardinality(universeKmers, universeDistinct, universeSolid,
+                           cfg.kmerLen, cfg.threads, refFiles);
+        }
+        for (const auto& [level, groups] : levelGroups) {
+            if (groups.empty()) continue;
 
             UniqSketchConfig lvl = cfg;
             lvl.outdir = cfg.outdir + "/level_" + std::to_string(level);
             lvl.outfile = cfg.outdir + "/sketch_level_" + std::to_string(level) + ".tsv";
             lvl.refstat = lvl.outdir + "/db_uniq_count.tsv";
-            lvl.numRef = refs.size();
+            lvl.numRef = groups.size();
+            lvl.dbfSize = universeDistinct;
+            lvl.sbfSize = universeSolid;
             mkdir(lvl.outdir.c_str(), 0777);
 
-            size_t levelTotalKmers = 0;
-            getCardinality(levelTotalKmers, lvl.dbfSize, lvl.sbfSize,
-                           lvl.kmerLen, lvl.threads, refs);
-
-            if (resolveBloomSizes(levelTotalKmers, lvl.dbfSize, lvl.sbfSize)) {
+            if (resolveBloomSizes(universeKmers, lvl.dbfSize, lvl.sbfSize)) {
                 BloomFilter levelDbf(lvl.m1(), lvl.nhash1, lvl.kmerLen);
-                identifyUniqKmers(lvl, refs, levelDbf);
+                identifyGroupUniqKmers(lvl, groups, levelDbf);
                 buildSketch(lvl, lvl.refstat, levelDbf);
                 std::cerr << "Built sketch for tree level " << level
                           << ": " << lvl.outfile << "\n";
