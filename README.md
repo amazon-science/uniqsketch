@@ -309,6 +309,14 @@ full-resolution leaf sketch to `-o`. Query it with `querysketch --tree=DIR`
 (pointing at that output directory) together with `--ref` set to the leaf sketch;
 the query narrows candidates from the coarsest level down to individual references.
 
+At every level, each reference is represented by the cluster that spans that level
+on its path to the root, or by itself if it never clustered, so a level's sketch
+covers every reference in the index. A cluster's signatures are k-mers of its
+representative that occur in no genome outside the cluster (members of other
+clusters included), which keeps a genome hidden inside one cluster from feeding
+another cluster's family call. Levels whose clustering is identical to the next
+finer level are not written; the query walks whatever level files exist.
+
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output
 names individual references rather than cluster representatives.** That is the
@@ -418,8 +426,11 @@ row is a reliable presence flag, and its abundance is that of the group as a who
 since the representative's signatures are shared by every member; read it as "one
 or more of these is here, at about this level". On the 8-genome test set a close
 member at 0.01% that could not be resolved was reported as its family at
-0.009–0.012%. A family row is never emitted when any of its members is reported as
-a strain.
+0.009–0.012%; on 120 *E. coli* genomes, a member of a 4-strain family at 0.01% was
+reported as that family in 13 of the 28 mixtures where it could not be resolved,
+at 0.006–0.013%. A family row is never emitted when any of its members is reported
+as a strain, a group is reported once (at the finest level that detected it), and
+a group is not reported when one of its sub-groups is.
 
 `--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
 sub-tree stays in play if its representative gathers at least N hits and one read
