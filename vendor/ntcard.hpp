@@ -82,9 +82,18 @@ inline void ntRead(const std::string& seq, const std::vector<unsigned>& kList,
 /**
  * Compute cardinality estimates from sampling counters.
  *
+ * Estimates F0 (distinct k-mers) and f1 (k-mers seen once), which is all
+ * getCardinality reports: the Bloom filters are sized from F0 and F0 - f1.
+ * Upstream ntCard continues from here to the whole frequency spectrum
+ * f2..f_covMax with an O(covMax^2) recurrence. With covMax = 65536 that took
+ * about 1.9 s per call, for output no caller read, on every index build and
+ * every query, and once per group in the within-group signature build (60 s of
+ * a 100 s phase on 120 E. coli genomes). F0 and f1 are computed exactly as
+ * before, so filter sizes, and with them every index and result, are unchanged.
+ *
  * @param t_Counter  Counter array from sampling.
  * @param F0Mean  Estimated number of distinct k-mers (output).
- * @param fMean  Estimated k-mer frequency histogram (output).
+ * @param fMean  Frequency estimates (output); only fMean[1] is filled in.
  */
 void compEst(const uint16_t* t_Counter, double& F0Mean, std::vector<double>& fMean) {
     std::vector<std::vector<unsigned>> p(opt::nSamp, std::vector<unsigned>(opt::covMax, 0));
@@ -94,30 +103,21 @@ void compEst(const uint16_t* t_Counter, double& F0Mean, std::vector<double>& fMe
         }
     }
 
-    std::vector<double> pMean(opt::covMax, 0.0);
-    for (size_t i = 0; i < opt::covMax; i++) {
-        for (size_t j = 0; j < opt::nSamp; j++) {
-            pMean[i] += p[j][i];
-        }
-        pMean[i] /= static_cast<double>(opt::nSamp);
+    // pMean[i]: mean over samples of the number of counters holding value i.
+    double pMean0 = 0.0, pMean1 = 0.0;
+    for (size_t j = 0; j < opt::nSamp; j++) {
+        pMean0 += p[j][0];
+        pMean1 += p[j][1];
     }
+    pMean0 /= static_cast<double>(opt::nSamp);
+    pMean1 /= static_cast<double>(opt::nSamp);
 
     F0Mean = static_cast<double>(
-        (opt::rBits * std::log(2) - std::log(pMean[0])) *
+        (opt::rBits * std::log(2) - std::log(pMean0)) *
         (static_cast<size_t>(1) << (opt::sBits + opt::rBits)));
 
-    fMean[1] = -1.0 * pMean[1] / (pMean[0] * (std::log(pMean[0]) - opt::rBits * std::log(2)));
-    for (size_t i = 2; i < opt::covMax; i++) {
-        double sum = 0.0;
-        for (size_t j = 1; j < i; j++) {
-            sum += j * pMean[i - j] * fMean[j];
-        }
-        fMean[i] = -1.0 * pMean[i] / (pMean[0] * (std::log(pMean[0]) - opt::rBits * std::log(2)))
-                    - sum / (i * pMean[0]);
-    }
-    for (size_t i = 1; i < opt::covMax; i++) {
-        fMean[i] = std::abs(static_cast<ssize_t>(fMean[i] * F0Mean));
-    }
+    fMean[1] = -1.0 * pMean1 / (pMean0 * (std::log(pMean0) - opt::rBits * std::log(2)));
+    fMean[1] = std::abs(static_cast<ssize_t>(fMean[1] * F0Mean));
 }
 
 /**

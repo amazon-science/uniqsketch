@@ -336,8 +336,8 @@ records for each one its *carriers*: the other genomes of the index that contain
 it. `querysketch --tree` uses a within-group signature only when none of its
 carriers is a candidate for the sample (see [querysketch](#querysketch-1)); the
 globally unique signatures stay in use throughout, so the extra set can add
-evidence but never remove any. Building it costs about 40 % more time on the
-120-genome *E. coli* index (361 s against 261 s at 32 threads; the group builds
+evidence but never remove any. Building it costs about 20 % more time on the
+120-genome *E. coli* index (306 s against 257 s at 32 threads; the group builds
 run as one parallel job list, so many small groups keep the machine busy) and
 about 15 % more disk under `<outdir>` (the per-group candidate files in
 `<outdir>/groups/`, 3.4 GB against the 22 GB of candidate files the index writes
