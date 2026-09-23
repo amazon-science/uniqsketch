@@ -11,6 +11,7 @@
 #include "UniqSketchUtil.hpp"
 #include "ClusterUtil.hpp"
 #include "TreeSketchUtil.hpp"
+#include "GroupSketchUtil.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -45,6 +46,7 @@ static const char USAGE_MESSAGE[] =
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
     "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree]\n"
+    "      --no-group-signatures\tdo not build within-group leaf signatures (with --tree; see README)\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -54,7 +56,7 @@ static const char USAGE_MESSAGE[] =
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
-       OPT_MAXHOMOP, OPT_STRICTMARGIN };
+       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -78,6 +80,7 @@ static const struct option longopts[] = {
     {"exact",          no_argument,       nullptr, OPT_EXACT},
     {"max-homopolymer",required_argument, nullptr, OPT_MAXHOMOP},
     {"strict-margin",  no_argument,       nullptr, OPT_STRICTMARGIN},
+    {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
     {"sensitive",      no_argument, &g_sketchnum, 100},
     {"very-sensitive", no_argument, &g_sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -94,7 +97,9 @@ int main(int argc, char** argv) {
     unsigned clusterThreshold = 0;  // 0 = clustering disabled
     bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
     std::vector<unsigned> treeThresholds;  // empty = tree disabled
+    std::vector<TreeNode> tree;            // the hierarchy, when --tree is used
     bool marginGiven = false;       // --min-margin passed explicitly (tree default otherwise)
+    bool groupSignatures = true;    // within-group leaf signatures for a tree index (--no-group-signatures)
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -130,6 +135,7 @@ int main(int argc, char** argv) {
         }
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
         case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
+        case OPT_NOGROUPSIGS: groupSignatures = false; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -217,7 +223,7 @@ int main(int argc, char** argv) {
     // Optional: build hierarchical tree index with per-level sketches
     if (!treeThresholds.empty()) {
         std::string treeFile = cfg.outdir + "/tree_index.tsv";
-        auto tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
+        tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
                                           cfg.nhash1, cfg.bits,
                                           estimateMaxGenomeSize(refFiles), treeFile);
 
@@ -268,6 +274,7 @@ int main(int argc, char** argv) {
         bp.minMargin = cfg.minMargin;
         bp.strictMargin = cfg.strictMargin;
         bp.maxHomopolymer = cfg.maxHomopolymer;
+        bp.groupSignatures = groupSignatures;
         for (size_t i = 0; i < treeThresholds.size(); i++) {
             if (i) bp.thresholds += ",";
             bp.thresholds += std::to_string(treeThresholds[i]);
@@ -351,6 +358,17 @@ int main(int argc, char** argv) {
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     identifyUniqKmers(cfg, refFiles, dbFilter);
     buildSketch(cfg, cfg.refstat, dbFilter);
+
+    // Within-group leaf signatures (see GroupSketchUtil.hpp). Built after the
+    // leaf sketch so that refIds match it and its signatures are not repeated,
+    // with the universe filter for the margin check.
+    if (!tree.empty()) {
+        if (groupSignatures) {
+            buildGroupSketch(cfg, tree, refFiles, dbFilter);
+        } else {
+            std::cerr << "Within-group signatures: skipped (--no-group-signatures)\n";
+        }
+    }
 
 #ifdef _OPENMP
     std::cerr << "Runtime(sec): " << std::setprecision(4) << std::fixed

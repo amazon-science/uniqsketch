@@ -121,6 +121,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `outdir_uniqsketch/`: folder containing a file per reference with all signature candidates.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
+* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level), `build_params.tsv` (how signatures were selected; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), and `groups/g<i>/` with each group's candidate files.
 
 ### querysketch
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
@@ -222,6 +223,7 @@ A list of files containing file names in each row can be passed with @ prefix.
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
       --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree]
+      --no-group-signatures  do not build within-group leaf signatures (with --tree)
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
@@ -317,6 +319,30 @@ clusters included), which keeps a genome hidden inside one cluster from feeding
 another cluster's family call. Levels whose clustering is identical to the next
 finer level are not written; the query walks whatever level files exist.
 
+**Within-group signatures.** A tree build also writes `<outdir>/sketch_group.tsv`,
+a second signature set for the leaves (turn it off with `--no-group-signatures`).
+A leaf's ordinary signatures are its k-mers that occur in no other genome of the
+index. For a strain with close relatives that pool is small, and mostly for a
+reason that has nothing to do with the relatives: most of what the strain does
+not share with its siblings it does share with some unrelated genome elsewhere in
+the index, so global uniqueness discards it. On 120 *E. coli* genomes the k-mers
+of a strain absent from its siblings but present somewhere else outnumbered its
+globally unique k-mers by a median of 3.2×, and by 26× for the strain with the
+smallest global pool. Those k-mers still separate the strain from its siblings
+whenever the genomes that carry them are not in the sample. So for every leaf,
+`uniqsketch` also selects k-mers unique *within its group* (the leaves under its
+parent node), with the same margin and filters as ordinary signatures, and
+records for each one its *carriers*: the other genomes of the index that contain
+it. `querysketch --tree` uses a within-group signature only when none of its
+carriers is a candidate for the sample (see [querysketch](#querysketch-1)); the
+globally unique signatures stay in use throughout, so the extra set can add
+evidence but never remove any. Building it costs about 40 % more time on the
+120-genome *E. coli* index (361 s against 261 s at 32 threads; the group builds
+run as one parallel job list, so many small groups keep the machine busy) and
+about 15 % more disk under `<outdir>` (the per-group candidate files in
+`<outdir>/groups/`, 3.4 GB against the 22 GB of candidate files the index writes
+anyway). Query time is unchanged.
+
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output
 names individual references rather than cluster representatives.** That is the
@@ -351,6 +377,7 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --solid           only use solid k-mers in reads
       --tree=DIR        hierarchical query using a --tree index directory
       --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
+      --no-group-signatures  leaf level uses globally unique signatures only (with --tree)
       --help            display this help and exit
       --version         version information and exit
 ```
@@ -437,6 +464,26 @@ sub-tree stays in play if its representative gathers at least N hits and one rea
 at the coarse level; the default of 1 is deliberately permissive, because a sub-tree
 pruned here can never be recovered at a finer level. Raise it to speed up queries
 against very large reference sets at some cost in sensitivity at the detection floor.
+
+**Within-group signatures at the leaf level.** If the index has a
+`sketch_group.tsv` (every `uniqsketch --tree` build writes one unless told not to;
+see [uniqsketch](#uniqsketch-1)), the leaf level also scores each candidate leaf's
+within-group signatures: k-mers unique among the leaves of its group but present in
+some other genome of the index, each recorded with those *carriers*. A signature is
+used only if none of its carriers is itself a candidate after the coarse levels, so
+a read from a carrier that is present can never be credited to the leaf; the cost of
+a carrier being present is a smaller supplementary set, never a wrong hit. The
+candidate set at that point is the permissive one the coarse levels leave (any
+sub-tree with one read), so a carrier with any trace of evidence blocks its
+signatures. What remains is a genome present below that floor, whose few reads at
+the shared loci then count for the leaf; on a strict-margin index that needs a
+genome too rare for a single read to reach one of its group's several thousand
+coarse signatures. The globally unique signatures are always scored, so this adds
+evidence and cannot take any away. On the 120-genome *E. coli* set it raised
+strain-level resolution of close members at 0.01 % from 8/28 to 11/28 with no new
+false calls; stderr reports how many within-group signatures were used and how
+many were withheld because a carrier was a candidate. `--no-group-signatures`
+ignores the file, which is useful for comparing the two on a sample.
 
 ### comparesketch
 ```

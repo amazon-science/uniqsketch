@@ -348,6 +348,7 @@ struct TreeBuildParams {
     unsigned minMargin = 1;
     bool strictMargin = false;
     unsigned maxHomopolymer = 0;
+    bool groupSignatures = false; // within-group leaf signatures built (sketch_group.tsv)
     std::string thresholds;      // comma-separated, coarsest first
     bool loaded = false;         // false when the file is absent (pre-2.0 index)
 };
@@ -363,6 +364,7 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "min_margin\t" << p.minMargin << "\n"
         << "strict_margin\t" << (p.strictMargin ? 1 : 0) << "\n"
         << "max_homopolymer\t" << p.maxHomopolymer << "\n"
+        << "group_signatures\t" << (p.groupSignatures ? 1 : 0) << "\n"
         << "tree\t" << p.thresholds << "\n";
 }
 
@@ -381,6 +383,7 @@ inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
             else if (key == "min_margin") p.minMargin = static_cast<unsigned>(std::stoul(val));
             else if (key == "strict_margin") p.strictMargin = (val == "1");
             else if (key == "max_homopolymer") p.maxHomopolymer = static_cast<unsigned>(std::stoul(val));
+            else if (key == "group_signatures") p.groupSignatures = (val == "1");
             else if (key == "tree") p.thresholds = val;
         } catch (const std::exception&) {
             // A malformed value leaves that field at its default; the record is

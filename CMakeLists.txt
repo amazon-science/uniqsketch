@@ -53,8 +53,12 @@ target_link_libraries(bloomfiltertest PRIVATE Threads::Threads)
 add_executable(comparesketchtest test/comparesketchtest.cpp)
 target_link_libraries(comparesketchtest PRIVATE ZLIB::ZLIB)
 
+# Builds a within-group sketch in-process (parallel job lists), so it needs OpenMP.
 add_executable(treesketchtest test/treesketchtest.cpp)
 target_link_libraries(treesketchtest PRIVATE ZLIB::ZLIB)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(treesketchtest PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # Compiles every *Util header into one translation unit; guards against
 # reintroducing file-scope definitions that would stop the headers composing.

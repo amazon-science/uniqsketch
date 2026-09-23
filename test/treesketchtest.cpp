@@ -1,13 +1,16 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "TreeSketchUtil.hpp"
+#include "GroupSketchUtil.hpp"
 
 // Deterministic pseudo-random DNA (varied, so its k-mers are mostly distinct).
 static std::string randDNA(size_t n, uint64_t seed) {
@@ -59,18 +62,20 @@ void testBuildParamsRoundTrip() {
     std::string path = treeBuildParamsPath(dir);
     TreeBuildParams p;
     p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true;
-    p.maxHomopolymer = 6; p.thresholds = "10000,1000,100";
+    p.maxHomopolymer = 6; p.groupSignatures = true; p.thresholds = "10000,1000,100";
     writeTreeBuildParams(path, p);
     TreeBuildParams q = loadTreeBuildParams(path);
     assert(q.loaded);
     assert(q.kmerLen == 81 && q.sketchnum == 500);
     assert(q.minMargin == 2 && q.strictMargin);
     assert(q.maxHomopolymer == 6 && q.thresholds == "10000,1000,100");
+    assert(q.groupSignatures);
     std::remove(path.c_str());
 
     TreeBuildParams missing = loadTreeBuildParams(path);
     assert(!missing.loaded);
     assert(missing.minMargin == 1 && !missing.strictMargin);  // pre-2.0 index: no margin assumed
+    assert(!missing.groupSignatures);                         // and no within-group signatures
     std::cerr << "PASSED: Test build params round trip\n";
 }
 
@@ -143,6 +148,141 @@ void testTreeLevelPartition() {
     std::cerr << "PASSED: Test treeLevelPartition\n";
 }
 
+// Within-group signatures: the groups come from direct parents, and every
+// signature's carriers are exactly the other genomes that contain it.
+void testGroupSignatures() {
+    std::cerr << "START: Test within-group signature groups and carriers... \t";
+    const unsigned k = 21;
+    // A and B differ at two sites 300 bp apart; C is unrelated; D is C plus a copy
+    // of A's neighbourhood around the first site, so A's within-group k-mers
+    // spanning site 1 are carried by D and those spanning site 2 are not.
+    std::string a = randDNA(1200, 4242);
+    std::string b = a;
+    b[400] = (a[400] == 'A') ? 'C' : 'A';
+    b[700] = (a[700] == 'G') ? 'T' : 'G';
+    std::string c = randDNA(1200, 9797);
+    std::string d = c + a.substr(340, 120);
+    writeFasta("grp_A.fa", a); writeFasta("grp_B.fa", b);
+    writeFasta("grp_C.fa", c); writeFasta("grp_D.fa", d);
+    std::vector<std::string> refs = {"grp_A.fa", "grp_B.fa", "grp_C.fa", "grp_D.fa"};
+
+    // Tree: node N (level 0) = {A, B}; C and D never merged.
+    std::vector<TreeNode> t;
+    auto leaf = [&](unsigned id, const char* n, const std::string& p, int parent) {
+        TreeNode x; x.id = id; x.name = n; x.filePath = p; x.level = 1; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+    };
+    leaf(0, "A", "grp_A.fa", 4); leaf(1, "B", "grp_B.fa", 4); leaf(2, "C", "grp_C.fa", -1); leaf(3, "D", "grp_D.fa", -1);
+    TreeNode N; N.id = 4; N.name = "N"; N.filePath = "grp_A.fa"; N.level = 0; N.parentId = -1; N.isLeaf = false; N.children = {0, 1}; t.push_back(N);
+
+    auto groups = signatureGroups(t, refs);
+    assert(groups.size() == 1);
+    assert(groups[0].nodeName == "N");
+    assert(groups[0].members == std::vector<unsigned>({0, 1}));
+    assert(groups[0].directLeaves.size() == 2);
+
+    UniqSketchConfig cfg;
+    cfg.kmerLen = k;
+    std::vector<GroupSignature> sigs;
+    auto add = [&](size_t pos) {   // A's k-mer starting at pos, as A's signature
+        GroupSignature s; s.seq = get_canonical(a.substr(pos, k)); s.refId = 0; s.refName = "A";
+        s.contig = "seq"; s.pos = static_cast<unsigned>(pos); s.node = "N"; sigs.push_back(s);
+    };
+    add(390);   // spans site 1 (400): absent from B, present in D
+    add(690);   // spans site 2 (700): absent from B, absent from D
+    add(100);   // shared by A and B, nowhere else
+    findCarriers(cfg, sigs, refs);
+    assert(sigs[0].carriers == std::vector<unsigned>({3}));
+    assert(sigs[1].carriers.empty());
+    assert(sigs[2].carriers == std::vector<unsigned>({1}));
+
+    // Round trip through the index file.
+    writeGroupSketch("grp_sketch.tsv", sigs, 4);
+    auto back = loadGroupSketch("grp_sketch.tsv");
+    assert(back.size() == 3);
+    assert(back[0].carriers == std::vector<unsigned>({3}) && back[0].refId == 0 && back[0].node == "N");
+    assert(back[1].carriers.empty() && back[1].seq == sigs[1].seq);
+    assert(back[2].carriers == std::vector<unsigned>({1}) && back[2].pos == 100);
+    assert(loadGroupSketch("grp_sketch_missing.tsv").empty());
+
+    for (const char* f : {"grp_A.fa", "grp_B.fa", "grp_C.fa", "grp_D.fa", "grp_sketch.tsv"}) std::remove(f);
+    std::cerr << "PASSED: Test within-group signature groups and carriers\n";
+}
+
+// buildGroupSketch end to end, on the same fixture: A and B differ at two sites,
+// D carries A's neighbourhood around the first. A's k-mers spanning site 1 are
+// therefore unique within the group {A, B} but not globally, and are the only
+// within-group signatures the build should add: A's site-2 k-mers and all of
+// B's are globally unique and already in the leaf sketch. The build runs its
+// candidate and selection phases as parallel job lists; the output must not
+// depend on that, so two builds must be byte-identical.
+void testBuildGroupSketch() {
+    std::cerr << "START: Test buildGroupSketch... \t";
+    const unsigned k = 21;
+    std::string a = randDNA(1200, 4242);
+    std::string b = a;
+    b[400] = (a[400] == 'A') ? 'C' : 'A';
+    b[700] = (a[700] == 'G') ? 'T' : 'G';
+    std::string c = randDNA(1200, 9797);
+    std::string d = c + a.substr(340, 120);
+    writeFasta("gb_A.fa", a); writeFasta("gb_B.fa", b);
+    writeFasta("gb_C.fa", c); writeFasta("gb_D.fa", d);
+    std::vector<std::string> refs = {"gb_A.fa", "gb_B.fa", "gb_C.fa", "gb_D.fa"};
+
+    std::vector<TreeNode> t;
+    auto leaf = [&](unsigned id, const char* n, const std::string& p, int parent) {
+        TreeNode x; x.id = id; x.name = n; x.filePath = p; x.level = 1; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+    };
+    leaf(0, "A", "gb_A.fa", 4); leaf(1, "B", "gb_B.fa", 4); leaf(2, "C", "gb_C.fa", -1); leaf(3, "D", "gb_D.fa", -1);
+    TreeNode N; N.id = 4; N.name = "N"; N.filePath = "gb_A.fa"; N.level = 0; N.parentId = -1; N.isLeaf = false; N.children = {0, 1}; t.push_back(N);
+
+    // The leaf sketch, as uniqsketch's main builds it, then the group sketch.
+    auto build = [&](const std::string& dir) {
+        mkdir(dir.c_str(), 0777);
+        UniqSketchConfig cfg;
+        cfg.kmerLen = k;
+        cfg.threads = 4;
+        cfg.outdir = dir;
+        cfg.outfile = dir + "/sketch_uniq.tsv";
+        cfg.refstat = dir + "/db_uniq_count.tsv";
+        cfg.numRef = refs.size();
+        size_t total = 0;
+        getCardinality(total, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, refs);
+        assert(resolveBloomSizes(total, cfg.dbfSize, cfg.sbfSize));
+        BloomFilter dbf(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+        identifyUniqKmers(cfg, refs, dbf);
+        buildSketch(cfg, cfg.refstat, dbf);
+        return buildGroupSketch(cfg, t, refs, dbf);
+    };
+    size_t n1 = build("gb_idx1");
+    size_t n2 = build("gb_idx2");
+    assert(n1 == n2 && n1 > 0);
+
+    std::vector<GroupSignature> sigs = loadGroupSketch(groupSketchPath("gb_idx1"));
+    assert(sigs.size() == n1);
+    std::set<std::string> leafSigs;
+    {
+        std::ifstream in("gb_idx1/sketch_uniq.tsv");
+        std::string seq, rest;
+        while (in >> seq && std::getline(in, rest)) leafSigs.insert(seq);
+    }
+    for (const GroupSignature& s : sigs) {
+        assert(s.refId == 0 && s.refName == "gb_A" && s.node == "N");
+        assert(s.pos + k > 400 && s.pos <= 400);                    // spans site 1
+        assert(s.seq == get_canonical(a.substr(s.pos, k)));         // and is A's k-mer there
+        assert(s.carriers == std::vector<unsigned>({3}));           // carried by D only
+        assert(leafSigs.count(s.seq) == 0);                         // not repeated from the leaf sketch
+    }
+
+    // Byte-identical across builds: the parallel job lists must not leak scheduling.
+    auto contents = [](const std::string& p) { std::ifstream in(p); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+    assert(contents(groupSketchPath("gb_idx1")) == contents(groupSketchPath("gb_idx2")));
+    assert(contents("gb_idx1/sketch_uniq.tsv") == contents("gb_idx2/sketch_uniq.tsv"));
+
+    for (const char* f : {"gb_A.fa", "gb_B.fa", "gb_C.fa", "gb_D.fa"}) std::remove(f);
+    system("rm -rf gb_idx1 gb_idx2");
+    std::cerr << "PASSED: Test buildGroupSketch (" << n1 << " within-group signatures)\n";
+}
+
 // buildHierarchicalTree must group near-identical references and keep distinct ones apart.
 void testBuildHierarchicalTree() {
     std::cerr << "START: Test buildHierarchicalTree... \t";
@@ -187,6 +327,8 @@ int main() {
     testBuildParamsRoundTrip();
     testGetTreeLevelRefs();
     testTreeLevelPartition();
+    testGroupSignatures();
+    testBuildGroupSketch();
     testBuildHierarchicalTree();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;

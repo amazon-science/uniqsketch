@@ -8,6 +8,7 @@
 #include "ntcard.hpp"
 #include "QuerySketchUtil.hpp"
 #include "TreeSketchUtil.hpp"
+#include "GroupSketchUtil.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -40,13 +41,14 @@ static const char USAGE_MESSAGE[] =
     "      --solid\t\tonly use solid k-mers in reads\n"
     "      --tree=DIR\thierarchical query using a --tree index directory\n"
     "      --tree-prune=N\tmin coarse-level hits to keep a sub-tree in play (with --tree) [1]\n"
+    "      --no-group-signatures\tleaf level uses globally unique signatures only (with --tree)\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\tversion information and exit\n"
     "\n";
 
 static const char shortopts[] = "t:g:l:r:o:h:a:s:b:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE, OPT_NOGROUPSIGS };
 
 // --sensitive / --very-sensitive / --solid are getopt flag entries, which store
 // through a pointer at parse time and so cannot target a struct member. They write
@@ -70,6 +72,7 @@ static const struct option longopts[] = {
     {"solid",          no_argument, &g_solid, 1},
     {"tree",           required_argument, nullptr, OPT_TREE},
     {"tree-prune",     required_argument, nullptr, OPT_TREEPRUNE},
+    {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
     {"help",           no_argument, nullptr, OPT_HELP},
     {"version",        no_argument, nullptr, OPT_VERSION},
     {nullptr, 0, nullptr, 0}
@@ -184,6 +187,43 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         std::vector<std::string> levelRef;
         std::vector<SketchHash> levelSig;
         loadSketch(cfg, sketchPath, levelHash, levelRef, levelSig);
+
+        // Within-group signatures (GroupSketchUtil.hpp) join the leaf level for
+        // candidate leaves, each admitted only if none of the genomes carrying it
+        // is itself a candidate. The candidate set is the permissive one the
+        // coarse levels left, so a carrier with any trace of evidence blocks the
+        // signature; the cost is a smaller supplementary set in samples that
+        // contain the carrier, never a hit attributed to the wrong genome.
+        if (isLeaf && !cfg.noGroupSignatures) {
+            std::vector<GroupSignature> groupSigs = loadGroupSketch(groupSketchPath(treeDir));
+            if (groupSigs.empty()) {
+                std::cerr << "Tree query: index has no within-group signatures (built with "
+                             "--no-group-signatures or by an older uniqsketch); leaf level uses "
+                             "globally unique signatures only\n";
+            } else {
+                std::vector<bool> isCandidate(levelRef.size(), false);
+                for (unsigned i = 0; i < levelRef.size(); i++)
+                    isCandidate[i] = candidates.count(levelRef[i]) > 0;
+                size_t used = 0, blocked = 0, idle = 0;
+                std::unordered_set<unsigned> leavesUsing;
+                for (const GroupSignature& s : groupSigs) {
+                    if (s.refId >= levelRef.size() || !isCandidate[s.refId]) { ++idle; continue; }
+                    bool carrierPresent = false;
+                    for (unsigned c : s.carriers)
+                        if (c < levelRef.size() && isCandidate[c]) { carrierPresent = true; break; }
+                    if (carrierPresent) { ++blocked; continue; }
+                    if (levelHash.emplace(s.seq, s.refId).second) {
+                        levelSig[s.refId].emplace(s.seq, 0);
+                        ++used;
+                        leavesUsing.insert(s.refId);
+                    }
+                }
+                std::cerr << "Tree query: within-group signatures: " << used << " in use for "
+                          << leavesUsing.size() << " candidate leaves, " << blocked
+                          << " withheld (a carrier is a candidate), " << idle
+                          << " belong to non-candidates\n";
+            }
+        }
 
         // Restrict scoring to references that still cover a candidate leaf.
         std::vector<bool> scored(levelRef.size(), false);
@@ -303,6 +343,7 @@ int main(int argc, char* const argv[]) {
         case 'b': arg >> cfg.bits;            break;
         case OPT_TREE: arg >> treeDir;         break;
         case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
+        case OPT_NOGROUPSIGS: cfg.noGroupSignatures = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);

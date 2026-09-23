@@ -14,6 +14,7 @@
 #include "QuerySketchUtil.hpp"
 #include "CompareSketchUtil.hpp"
 #include "TreeSketchUtil.hpp"
+#include "GroupSketchUtil.hpp"
 #include "ClusterUtil.hpp"
 
 int main() {

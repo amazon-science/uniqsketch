@@ -36,8 +36,9 @@ bloomfiltertest: test/bloomfiltertest.cpp
 comparesketchtest: test/comparesketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
 
+# Builds a within-group sketch in-process (parallel job lists), so it needs OpenMP.
 treesketchtest: test/treesketchtest.cpp
-	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
 
 headerstest: test/headerstest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)

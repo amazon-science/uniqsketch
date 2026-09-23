@@ -54,6 +54,7 @@ struct QuerySketchConfig {
 
     // Tree query
     int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
+    bool noGroupSignatures = false;                     // --no-group-signatures: leaf level uses global signatures only
 };
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
