@@ -1,6 +1,7 @@
 #include <getopt.h>
 
 #include <algorithm>
+#include <deque>
 #include <numeric>
 #include <unordered_map>
 
@@ -155,17 +156,131 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     levelSketches.emplace_back(leafLevel, cfg.ref);
     std::sort(levelSketches.begin(), levelSketches.end());
 
-    // Prime cfg.kmerLen from a sketch, then size read Bloom filters once from the sample.
+    // Every level's sketch, coarsest first, into one index. Targets are (level,
+    // reference) pairs; slots point at the per-signature counters in each level's
+    // maps, so the pass writes straight into what the logs print. The sequence
+    // maps are dropped once the index holds the sequences.
+    struct Level {
+        unsigned level;
+        std::vector<std::string> ref;                   // refId -> name
+        std::vector<SketchHash> sig;                    // per ref: signature -> hits; owns the index's sequences
+        std::deque<std::string> extra;                  // sequences the maps do not hold (stable addresses)
+        unsigned targetBase = 0;
+        unsigned slotBegin = 0, slotEnd = 0;            // this level's slot range
+    };
+    std::vector<unsigned> slotRef;                      // per slot: the reference it belongs to
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    auto t0 = now();
+    std::vector<Level> levels(levelSketches.size());
+    QueryIndex index;
+    std::vector<unsigned*> slotCounter;
+
+    // The level files are independent; parse them side by side (each on a copy
+    // of the config, since loadSketch records k in it).
+    std::vector<SketchHash> levelHash(levelSketches.size());
+    #pragma omp parallel for schedule(dynamic) num_threads(static_cast<int>(std::min<size_t>(levelSketches.size(), cfg.threads)))
+    for (size_t li = 0; li < levelSketches.size(); li++) {
+        QuerySketchConfig local = cfg;
+        levels[li].level = levelSketches[li].first;
+        loadSketch(local, levelSketches[li].second, levelHash[li], levels[li].ref, levels[li].sig);
+    }
     {
-        SketchHash h; std::vector<std::string> r; std::vector<SketchHash> sc;
-        loadSketch(cfg, levelSketches.front().second, h, r, sc);
+        // k, as loadSketch would have recorded it: the length of the first signature.
+        std::ifstream in(levelSketches.front().second);
+        std::string first;
+        std::getline(in, first);
+        cfg.kmerLen = static_cast<unsigned>(first.find_first_of(" \t"));
     }
-    size_t totalKmers = 0;
-    getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
-    if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
-        std::cerr << "Error: insufficient k-mer content in the sample for query.\n";
-        exit(EXIT_FAILURE);
+
+    for (size_t li = 0; li < levelSketches.size(); li++) {
+        Level& L = levels[li];
+        SketchHash& hash = levelHash[li];
+        L.targetBase = index.numTargets;
+        index.numTargets += static_cast<unsigned>(L.ref.size());
+        L.slotBegin = static_cast<unsigned>(slotCounter.size());
+        // Each signature's slot is its counter in its reference's map, whose key
+        // also gives the index its sequence. When every line of the sketch is a
+        // distinct k-mer (always, unless a file was edited by hand) the maps hold
+        // exactly the signatures and are walked directly; otherwise the seq -> ref
+        // map decides, as loadSketch's first-line-wins rule has it, and a
+        // signature a map does not hold still counts for its reference.
+        size_t mapped = 0;
+        for (const SketchHash& m : L.sig) mapped += m.size();
+        if (mapped == hash.size()) {
+            for (unsigned i = 0; i < L.ref.size(); i++) {
+                for (auto& kv : L.sig[i]) {
+                    index.add(kv.first, L.targetBase + i, static_cast<unsigned>(slotCounter.size()));
+                    slotCounter.push_back(&kv.second);
+                    slotRef.push_back(i);
+                }
+            }
+        } else {
+            for (const auto& [seq, refId] : hash) {
+                auto it = L.sig[refId].find(seq);
+                if (it != L.sig[refId].end()) {
+                    index.add(it->first, L.targetBase + refId, static_cast<unsigned>(slotCounter.size()));
+                    slotCounter.push_back(&it->second);
+                    slotRef.push_back(refId);
+                } else {
+                    L.extra.push_back(seq);
+                    index.add(L.extra.back(), L.targetBase + refId, NO_SLOT);
+                }
+            }
+        }
+        L.slotEnd = static_cast<unsigned>(slotCounter.size());
+        // The index and the level's maps hold the sequences now; the leaf level's
+        // map stays a little longer, to screen the group signatures against.
+        if (li + 1 < levelSketches.size()) hash = SketchHash();
     }
+    index.numSlots = static_cast<unsigned>(slotCounter.size());
+    const SketchHash& leafHash = levelHash.back();
+
+    // Within-group signatures (GroupSketchUtil.hpp) are each their own target,
+    // so that after the pass the ones whose leaf is a candidate and none of whose
+    // carriers is can be added to that leaf; the rest are discarded unseen. A
+    // group signature that duplicates a leaf signature is dropped, as it was when
+    // the leaf sketch was a map the group signatures were merged into.
+    std::vector<GroupSignature> groupSigs;
+    std::vector<char> groupDropped;
+    unsigned groupBase = index.numTargets;
+    if (!cfg.noGroupSignatures) {
+        groupSigs = loadGroupSketch(groupSketchPath(treeDir));
+        if (groupSigs.empty()) {
+            std::cerr << "Tree query: index has no within-group signatures (built with "
+                         "--no-group-signatures or by an older uniqsketch); leaf level uses "
+                         "globally unique signatures only\n";
+        }
+        groupDropped.assign(groupSigs.size(), 0);
+        for (unsigned g = 0; g < groupSigs.size(); g++) {
+            if (leafHash.count(groupSigs[g].seq)) { groupDropped[g] = 1; continue; }
+            index.add(groupSigs[g].seq, groupBase + g, NO_SLOT);
+        }
+        index.numTargets += static_cast<unsigned>(groupSigs.size());
+    }
+    levelHash.clear();
+    index.finalize();
+
+    auto t1 = now();
+
+    // Size the --solid read filter from the sample. Without --solid nothing uses
+    // the estimate, and the pass over the reads it costs is as long as the query.
+    if (cfg.solid) {
+        size_t totalKmers = 0;
+        getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
+        if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
+            std::cerr << "Error: insufficient k-mer content in the sample for query.\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+    auto t2 = now();
+
+    // The one pass over the reads.
+    QueryTally tally(index);
+    queryReads(cfg, sampleFiles, index, tally);
+    auto t3 = now();
 
     // Candidate leaves. Every leaf starts in play; a leaf drops out only when a
     // representative covering it was scored at some level and fell below the
@@ -178,85 +293,90 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         if (node.isLeaf) candidates.insert(getBaseId(node.filePath));
     std::vector<FamilyCall> familyCalls;         // coarse detections, for level-appropriate reporting
 
-    for (size_t li = 0; li < levelSketches.size(); li++) {
-        unsigned level = levelSketches[li].first;
-        const std::string& sketchPath = levelSketches[li].second;
-        bool isLeaf = (li + 1 == levelSketches.size());
+    // Walk the levels coarse to fine over the tallies. Only references that still
+    // cover a candidate leaf are scored at a level; the others' tallies are
+    // discarded, exactly as their signatures used to be left out of that level's
+    // pass, so a leaf whose family was pruned cannot resurface on its own hits.
+    for (size_t li = 0; li < levels.size(); li++) {
+        Level& L = levels[li];
+        const unsigned level = L.level;
+        const bool isLeaf = (li + 1 == levels.size());
+        const size_t n = L.ref.size();
 
-        SketchHash levelHash;
-        std::vector<std::string> levelRef;
-        std::vector<SketchHash> levelSig;
-        loadSketch(cfg, sketchPath, levelHash, levelRef, levelSig);
-
-        // Within-group signatures (GroupSketchUtil.hpp) join the leaf level for
-        // candidate leaves, each admitted only if none of the genomes carrying it
-        // is itself a candidate. The candidate set is the permissive one the
-        // coarse levels left, so a carrier with any trace of evidence blocks the
-        // signature; the cost is a smaller supplementary set in samples that
-        // contain the carrier, never a hit attributed to the wrong genome.
-        if (isLeaf && !cfg.noGroupSignatures) {
-            std::vector<GroupSignature> groupSigs = loadGroupSketch(groupSketchPath(treeDir));
-            if (groupSigs.empty()) {
-                std::cerr << "Tree query: index has no within-group signatures (built with "
-                             "--no-group-signatures or by an older uniqsketch); leaf level uses "
-                             "globally unique signatures only\n";
-            } else {
-                std::vector<bool> isCandidate(levelRef.size(), false);
-                for (unsigned i = 0; i < levelRef.size(); i++)
-                    isCandidate[i] = candidates.count(levelRef[i]) > 0;
-                size_t used = 0, blocked = 0, idle = 0;
-                std::unordered_set<unsigned> leavesUsing;
-                for (const GroupSignature& s : groupSigs) {
-                    if (s.refId >= levelRef.size() || !isCandidate[s.refId]) { ++idle; continue; }
-                    bool carrierPresent = false;
-                    for (unsigned c : s.carriers)
-                        if (c < levelRef.size() && isCandidate[c]) { carrierPresent = true; break; }
-                    if (carrierPresent) { ++blocked; continue; }
-                    if (levelHash.emplace(s.seq, s.refId).second) {
-                        levelSig[s.refId].emplace(s.seq, 0);
-                        ++used;
-                        leavesUsing.insert(s.refId);
-                    }
-                }
-                std::cerr << "Tree query: within-group signatures: " << used << " in use for "
-                          << leavesUsing.size() << " candidate leaves, " << blocked
-                          << " withheld (a carrier is a candidate), " << idle
-                          << " belong to non-candidates\n";
-            }
-        }
-
-        // Restrict scoring to references that still cover a candidate leaf.
-        std::vector<bool> scored(levelRef.size(), false);
+        std::vector<bool> scored(n, false);
         {
-            std::unordered_set<unsigned> keep;
             const auto& lm = levelMap[level];
-            for (unsigned i = 0; i < levelRef.size(); i++) {
+            for (unsigned i = 0; i < n; i++) {
                 bool inPlay = false;
                 if (isLeaf) {
-                    inPlay = candidates.count(levelRef[i]) > 0;
+                    inPlay = candidates.count(L.ref[i]) > 0;
                 } else {
-                    auto it = lm.find(levelRef[i]);
+                    auto it = lm.find(L.ref[i]);
                     if (it != lm.end())
-                        for (const auto& leaf : it->second)
-                            if (candidates.count(leaf)) { inPlay = true; break; }
+                        for (const auto& lf : it->second)
+                            if (candidates.count(lf)) { inPlay = true; break; }
                 }
-                if (inPlay) { keep.insert(i); scored[i] = true; }
+                scored[i] = inPlay;
             }
-            SketchHash filtered;
-            for (const auto& kv : levelHash)
-                if (keep.count(kv.second)) filtered.emplace(kv.first, kv.second);
-            levelHash.swap(filtered);
         }
 
-        std::vector<unsigned> levelCount(levelRef.size(), 0);
-        std::vector<std::unordered_set<std::string>> levelRead(levelRef.size());
-        querySampleBatch(cfg, sampleFiles, levelHash, levelCount, levelSig, levelRead);
+        std::vector<unsigned> levelCount(n, 0);
+        std::vector<std::unordered_set<std::string>> levelRead(n);
+        for (unsigned i = 0; i < n; i++) {
+            if (!scored[i]) continue;
+            unsigned t = L.targetBase + i;
+            levelCount[i] = tally.count[t];
+            levelRead[i].swap(tally.reads[t]);
+        }
+        for (unsigned s = L.slotBegin; s < L.slotEnd; s++)
+            if (scored[slotRef[s]]) *slotCounter[s] += tally.slotCount[s];
+
+        // Within-group signatures join the leaf level for candidate leaves, each
+        // admitted only if none of the genomes carrying it is itself a candidate.
+        // The candidate set is the permissive one the coarse levels left, so a
+        // carrier with any trace of evidence blocks the signature; the cost is a
+        // smaller supplementary set in samples that contain the carrier, never a
+        // hit attributed to the wrong genome.
+        if (isLeaf && !groupSigs.empty()) {
+            size_t used = 0, blocked = 0, idle = 0;
+            std::unordered_set<unsigned> leavesUsing;
+            std::unordered_set<std::string> admitted;
+            for (unsigned g = 0; g < groupSigs.size(); g++) {
+                const GroupSignature& s = groupSigs[g];
+                if (s.refId >= n || !scored[s.refId]) { ++idle; continue; }
+                bool carrierPresent = false;
+                for (unsigned c : s.carriers)
+                    if (c < n && scored[c]) { carrierPresent = true; break; }
+                if (carrierPresent) { ++blocked; continue; }
+                if (groupDropped[g] || !admitted.insert(s.seq).second) continue;
+                unsigned t = groupBase + g;
+                L.sig[s.refId].emplace(s.seq, tally.count[t]);
+                levelCount[s.refId] += tally.count[t];
+                if (!tally.reads[t].empty()) {
+                    if (levelRead[s.refId].empty()) levelRead[s.refId].swap(tally.reads[t]);
+                    else levelRead[s.refId].insert(tally.reads[t].begin(), tally.reads[t].end());
+                }
+                ++used;
+                leavesUsing.insert(s.refId);
+            }
+            std::cerr << "Tree query: within-group signatures: " << used << " in use for "
+                      << leavesUsing.size() << " candidate leaves, " << blocked
+                      << " withheld (a carrier is a candidate), " << idle
+                      << " belong to non-candidates\n";
+        }
+
+        // Adjust for the first occurrence the --solid filter swallowed.
+        if (cfg.solid)
+            for (unsigned& c : levelCount) if (c) ++c;
 
         if (isLeaf) {
-            generateTreeQueryResult(cfg, levelCount, levelRef, levelSig, levelRead,
+            generateTreeQueryResult(cfg, levelCount, L.ref, L.sig, levelRead,
                                     familyCalls, cfg.out);
             std::cerr << "Tree query: leaf level " << level << " ("
-                      << levelRef.size() << " leaves) -> " << cfg.out << "\n";
+                      << n << " leaves) -> " << cfg.out << "\n";
+            std::cerr << "Tree query time (s): load index " << std::setprecision(1) << std::fixed
+                      << secs(t0, t1) << ", sample cardinality " << secs(t1, t2)
+                      << ", read pass " << secs(t2, t3) << ", report " << secs(t3, now()) << "\n";
             break;
         }
 
@@ -276,23 +396,23 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // levels emit the same number of signatures per reference, so the counts are
         // on a comparable scale and no separate reporting threshold is needed.
         const auto& nameMap = levelNodeName[level];
-        for (unsigned i = 0; i < levelRef.size(); i++) {
+        for (unsigned i = 0; i < n; i++) {
             if (!scored[i]) continue;
-            auto it = lm.find(levelRef[i]);
+            auto it = lm.find(L.ref[i]);
             if (it == lm.end()) continue;
 
             bool survivesPruning =
                 levelCount[i] >= static_cast<unsigned>(cfg.treePruneHit) &&
                 !levelRead[i].empty();
             if (!survivesPruning) {
-                for (const auto& leaf : it->second) candidates.erase(leaf);
+                for (const auto& lf : it->second) candidates.erase(lf);
                 continue;
             }
 
             // A family call needs a real group behind it (levelNodeName holds only
             // nodes standing for two or more leaves); a leaf representing itself at a
             // coarse level is scored again, as a strain, at the leaf level.
-            auto nit = nameMap.find(levelRef[i]);
+            auto nit = nameMap.find(L.ref[i]);
             bool worthReporting =
                 nit != nameMap.end() &&
                 levelCount[i] >= static_cast<unsigned>(cfg.sketchHit) &&
@@ -305,8 +425,8 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 fc.level = level;
                 fc.count = levelCount[i];
                 fc.reads = levelRead[i].size();
-                fc.sigsHit = countSigsHit(levelSig[i]);
-                fc.sigsTotal = levelSig[i].size();
+                fc.sigsHit = countSigsHit(L.sig[i]);
+                fc.sigsTotal = L.sig[i].size();
                 fc.coveredLeaves = it->second;
                 familyCalls.push_back(std::move(fc));
             }
@@ -315,6 +435,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                   << candidates.size() << " candidate leaves\n";
     }
 }
+
 
 int main(int argc, char* const argv[]) {
 #ifdef _OPENMP
@@ -406,25 +527,29 @@ int main(int argc, char* const argv[]) {
         std::cout << "Number of references: " << sketchRef.size() << "\n";
         std::cout << "Size of sketch: " << sketchHash.size() << "\n";
 
-        // Get cardinality of input raw read data to set Bloom filter parameter
-        size_t totalKmers = 0;
-        getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
+        // The sample's k-mer cardinality sizes the --solid read filter. Without
+        // --solid nothing uses it, and estimating it is a full pass over the reads
+        // (and a 512 MB counter table), about as long as the query itself.
+        if (cfg.solid) {
+            size_t totalKmers = 0;
+            getCardinality(totalKmers, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, sampleFiles);
 
-        if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
-            std::cerr << "Error: insufficient k-mer content for Bloom filter construction.\n"
-                      << "  Total k-mers found: " << totalKmers << "\n"
-                      << "  Distinct k-mers (F0): " << cfg.dbfSize << "\n"
-                      << "  Solid k-mers: " << cfg.sbfSize << "\n"
-                      << "  k-mer length: " << cfg.kmerLen << "\n"
-                      << "Possible causes:\n"
-                      << "  - Input reads are shorter than k (" << cfg.kmerLen << ")\n"
-                      << "  - Input files are empty or contain too few reads\n"
-                      << "  - Try a smaller k value in the sketch\n";
-            exit(EXIT_FAILURE);
+            if (!resolveBloomSizes(totalKmers, cfg.dbfSize, cfg.sbfSize)) {
+                std::cerr << "Error: insufficient k-mer content for Bloom filter construction.\n"
+                          << "  Total k-mers found: " << totalKmers << "\n"
+                          << "  Distinct k-mers (F0): " << cfg.dbfSize << "\n"
+                          << "  Solid k-mers: " << cfg.sbfSize << "\n"
+                          << "  k-mer length: " << cfg.kmerLen << "\n"
+                          << "Possible causes:\n"
+                          << "  - Input reads are shorter than k (" << cfg.kmerLen << ")\n"
+                          << "  - Input files are empty or contain too few reads\n"
+                          << "  - Try a smaller k value in the sketch\n";
+                exit(EXIT_FAILURE);
+            }
+
+            std::cout << "Number of weak k-mers: " << cfg.dbfSize - cfg.sbfSize << "\n";
+            std::cout << "Number of solid k-mers: " << cfg.sbfSize << "\n";
         }
-
-        std::cout << "Number of weak k-mers: " << cfg.dbfSize - cfg.sbfSize << "\n";
-        std::cout << "Number of solid k-mers: " << cfg.sbfSize << "\n";
 
         std::vector<unsigned> sketchCount(sketchRef.size());
         std::vector<std::unordered_set<std::string>> refRead(sketchRef.size());

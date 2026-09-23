@@ -11,9 +11,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
-# Dependencies
+# Dependencies. Threads: the query engine parses reads on std::threads
+# (QuerySketchUtil.hpp), which every target that includes it needs to link.
 find_package(ZLIB REQUIRED)
 find_package(OpenMP)
+find_package(Threads REQUIRED)
 
 # Common include directories
 include_directories(${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/include)
@@ -21,10 +23,10 @@ include_directories(${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/include)
 # --- Main binaries ---
 
 add_executable(uniqsketch src/uniqsketch.cpp)
-target_link_libraries(uniqsketch PRIVATE ZLIB::ZLIB)
+target_link_libraries(uniqsketch PRIVATE ZLIB::ZLIB Threads::Threads)
 
 add_executable(querysketch src/querysketch.cpp)
-target_link_libraries(querysketch PRIVATE ZLIB::ZLIB)
+target_link_libraries(querysketch PRIVATE ZLIB::ZLIB Threads::Threads)
 
 add_executable(comparesketch src/comparesketch.cpp)
 target_link_libraries(comparesketch PRIVATE ZLIB::ZLIB)
@@ -43,11 +45,10 @@ add_executable(uniqsketchtest test/uniqsketchtest.cpp)
 target_link_libraries(uniqsketchtest PRIVATE ZLIB::ZLIB)
 
 add_executable(querysketchtest test/querysketchtest.cpp)
-target_link_libraries(querysketchtest PRIVATE ZLIB::ZLIB)
+target_link_libraries(querysketchtest PRIVATE ZLIB::ZLIB Threads::Threads)
 
 add_executable(bloomfiltertest test/bloomfiltertest.cpp)
 # The concurrency test for insert_make_change uses std::thread
-find_package(Threads REQUIRED)
 target_link_libraries(bloomfiltertest PRIVATE Threads::Threads)
 
 add_executable(comparesketchtest test/comparesketchtest.cpp)
@@ -55,7 +56,7 @@ target_link_libraries(comparesketchtest PRIVATE ZLIB::ZLIB)
 
 # Builds a within-group sketch in-process (parallel job lists), so it needs OpenMP.
 add_executable(treesketchtest test/treesketchtest.cpp)
-target_link_libraries(treesketchtest PRIVATE ZLIB::ZLIB)
+target_link_libraries(treesketchtest PRIVATE ZLIB::ZLIB Threads::Threads)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(treesketchtest PRIVATE OpenMP::OpenMP_CXX)
 endif()
@@ -63,12 +64,12 @@ endif()
 # Compiles every *Util header into one translation unit; guards against
 # reintroducing file-scope definitions that would stop the headers composing.
 add_executable(headerstest test/headerstest.cpp)
-target_link_libraries(headerstest PRIVATE ZLIB::ZLIB)
+target_link_libraries(headerstest PRIVATE ZLIB::ZLIB Threads::Threads)
 
 # End-to-end: builds an index from the synthetic genomes in test/e2e/ and queries
 # them in-process. Runs the pipeline functions, which carry OpenMP pragmas.
 add_executable(e2etest test/e2etest.cpp)
-target_link_libraries(e2etest PRIVATE ZLIB::ZLIB)
+target_link_libraries(e2etest PRIVATE ZLIB::ZLIB Threads::Threads)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(e2etest PRIVATE OpenMP::OpenMP_CXX)
 endif()

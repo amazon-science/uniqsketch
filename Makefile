@@ -1,5 +1,6 @@
 CXX=g++ -std=c++17
-CPPFLAGS=-Ivendor
+# -pthread: the query engine parses reads on std::threads (QuerySketchUtil.hpp).
+CPPFLAGS=-Ivendor -pthread
 INCLUDEPATH=-Iinclude
 LIBPATH=-lz
 OPTFLAGS=-O3 -fopenmp

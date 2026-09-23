@@ -3,9 +3,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <numeric>
+#include <thread>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -72,25 +78,42 @@ void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sk
                 std::vector<SketchHash>& refSigCount) {
     std::ifstream sketchFile(fPath);
     bool init = true;
-    std::string seq;
-    while (std::getline(sketchFile, seq)) {
-        std::string uniqSeq, refName, contig;
-        unsigned refId, refNum, pos;
-        std::istringstream seqstm(seq);
-        seqstm >> uniqSeq >> refId >> refName >> refNum >> contig >> pos;
-        if (seqstm.fail()) {
-            std::cerr << "Error in parsing uniqsketch entry:\n" << seq << "\n";
+    std::string line;
+    // Fields: seq, refId, refName, numRef, contig, pos. Split on whitespace by
+    // hand: an istringstream per line cost 1.2 us, which on a 120-genome tree
+    // index (1.5 M signatures over five files) was 1.8 s of the query.
+    std::vector<std::pair<size_t, size_t>> field(6);
+    while (std::getline(sketchFile, line)) {
+        size_t n = 0, i = 0;
+        while (n < 6) {
+            while (i < line.size() && (line[i] == '\t' || line[i] == ' ')) ++i;
+            if (i >= line.size()) break;
+            size_t b = i;
+            while (i < line.size() && line[i] != '\t' && line[i] != ' ') ++i;
+            field[n++] = {b, i - b};
+        }
+        auto number = [&](size_t f, unsigned& out) {
+            char* end = nullptr;
+            unsigned long v = std::strtoul(line.c_str() + field[f].first, &end, 10);
+            if (end != line.c_str() + field[f].first + field[f].second) return false;
+            out = static_cast<unsigned>(v);
+            return true;
+        };
+        unsigned refId = 0, refNum = 0, pos = 0;
+        if (n < 6 || !number(1, refId) || !number(3, refNum) || !number(5, pos)) {
+            std::cerr << "Error in parsing uniqsketch entry:\n" << line << "\n";
             exit(EXIT_FAILURE);
         }
-        sketchHash.emplace(uniqSeq, refId);
+        std::string uniqSeq = line.substr(field[0].first, field[0].second);
         if (init) {
             cfg.kmerLen = uniqSeq.length();
             sketchRef.resize(refNum);
             refSigCount.resize(refNum);
             init = false;
         }
-        sketchRef[refId] = refName;
+        sketchRef[refId].assign(line, field[2].first, field[2].second);
         refSigCount[refId].emplace(uniqSeq, 0);
+        sketchHash.emplace(std::move(uniqSeq), refId);
     }
     sketchFile.close();
 }
@@ -133,123 +156,245 @@ inline bool kmerMatches(const char* kp, const std::string& sig) {
 }
 
 /**
- * Hash-keyed view of a sketch for the query hot loop.
+ * The query engine, shared by the flat and the tree query.
  *
- * Each signature is stored under its canonical ntHash value, the same value the
- * read iterator produces for every k-mer position, so a position can be tested
- * against the whole sketch with one 64-bit probe and no string work. On a probe
- * hit the stored sequence is compared to the read's k-mer before it counts, so a
- * hash collision can never produce a false hit: results are identical to a
- * string-keyed lookup, only the misses got cheap -- and in a typical query more
- * than 99.99% of positions are misses.
+ * Signatures are stored under their canonical ntHash value, the same value the
+ * read iterator produces at every k-mer position, so a position is tested
+ * against every signature in the index with one 64-bit probe and no string
+ * work. On a probe hit the stored sequence is compared to the read's k-mer
+ * before anything counts, so a hash collision can never produce a false hit:
+ * results are identical to a string-keyed lookup, only the misses got cheap,
+ * and in a typical query more than 99.99% of positions are misses.
+ *
+ * A hit counts toward a *target* and, optionally, a per-signature *slot*. The
+ * flat query has one target per reference and one slot per signature. The tree
+ * query puts every level's sketch and the within-group signatures into one index
+ * (targets are (level, reference) pairs and individual group signatures), reads
+ * the sample once, and applies the level-by-level narrowing to the tallies
+ * afterwards. It used to run one pass over the reads per level: on a 120-genome
+ * index that was six parses and six hashings of the same 3 M reads for one
+ * result. The same k-mer may be a signature at several levels; every entry that
+ * matches the read's k-mer counts, which is exactly what the separate passes
+ * added up to.
  */
-struct SketchEntry {
-    std::string seq;        // canonical signature sequence, for collision verification
-    unsigned refId;         // reference the signature belongs to
-    unsigned sigIdx;        // dense index of this signature within its reference
+struct QueryEntry {
+    const std::string* seq; // canonical signature, for collision verification; owned by the caller
+    unsigned target;        // what a hit counts toward
+    unsigned slot;          // per-signature counter, or NO_SLOT
 };
-using SketchIndex = std::unordered_map<uint64_t, std::vector<SketchEntry>>;
+
+static const unsigned NO_SLOT = UINT32_MAX;
 
 /**
- * Build the hash-keyed view of a sketch and a dense per-reference signature
- * ordering, so per-thread hit tallies can be plain integer arrays rather than
- * string-keyed maps.
+ * The index does not own its sequences: `seq` points into the caller's
+ * signature maps (std::unordered_map keys never move) or containers with stable
+ * addresses, which must outlive the index. On a 120-genome tree index that is
+ * 1.8 M signatures of 81 bases; one copy instead of four is ~170 MB.
  *
- * @param sketchHash  Signature -> refId map, as loaded by loadSketch.
- * @param refSigCount  Per-reference signature -> count maps (defines the order).
- * @param sigNames  Output: for each reference, the signature at each dense index.
- * @return The hash-keyed index.
+ * Layout: the entries sorted by hash, and an open-addressing table from hash to
+ * the run of entries carrying it. A probe touches one 16-byte slot, and for the
+ * miss that almost every k-mer position is, that is the whole cost. The
+ * std::unordered_map of vectors this replaced touched a bucket, a node and a
+ * vector's storage, and took 1.7 M allocations and three seconds to build for
+ * that index; this builds in a sort.
  */
-inline SketchIndex buildSketchIndex(const SketchHash& sketchHash,
-                                    const std::vector<SketchHash>& refSigCount,
-                                    std::vector<std::vector<std::string>>& sigNames) {
-    std::vector<std::unordered_map<std::string, unsigned>> sigIndexOf(refSigCount.size());
-    sigNames.assign(refSigCount.size(), {});
-    for (size_t ref = 0; ref < refSigCount.size(); ref++) {
-        for (const auto& [sig, c] : refSigCount[ref]) {
-            sigIndexOf[ref].emplace(sig, static_cast<unsigned>(sigNames[ref].size()));
-            sigNames[ref].push_back(sig);
+struct QueryIndex {
+    struct Slot {
+        uint64_t hash;
+        uint32_t first;         // index of the first entry with this hash
+        uint32_t count;         // number of entries with this hash; 0 marks an empty slot
+    };
+    std::vector<QueryEntry> entries;    // sorted by hash after finalize()
+    std::vector<Slot> slots;            // size is a power of two, at most half full
+    uint64_t mask = 0;
+    // One-hash Bloom filter over the keys, indexed by the hash's high bits (the
+    // table uses the low ones). At 16+ bits per key it answers ~94% of the
+    // misses from a table small enough to stay in cache (4 MB for a 120-genome
+    // tree index), so the common case never touches the 64 MB slot table.
+    std::vector<uint64_t> prefilter;
+    unsigned prefilterShift = 64;
+    unsigned numTargets = 0;
+    unsigned numSlots = 0;
+
+    /** Register a signature. Targets and slots are numbered by the caller. */
+    void add(const std::string& seq, unsigned target, unsigned slot) {
+        entries.push_back({&seq, target, slot});
+    }
+
+    /**
+     * Sort the entries and build the table. Call once, after the last add().
+     * Entries with equal hashes keep their add() order, so a duplicate line in
+     * a sketch resolves the way the string-keyed maps resolved it.
+     */
+    void finalize() {
+        std::vector<std::pair<uint64_t, uint32_t>> keyed(entries.size());
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < entries.size(); i++)
+            keyed[i] = {NTC64(entries[i].seq->c_str(), static_cast<unsigned>(entries[i].seq->size())),
+                        static_cast<uint32_t>(i)};
+        std::sort(keyed.begin(), keyed.end());   // by hash, then by add() order
+
+        std::vector<QueryEntry> sorted(entries.size());
+        for (size_t i = 0; i < keyed.size(); i++) sorted[i] = entries[keyed[i].second];
+        entries.swap(sorted);
+
+        size_t n = 1;
+        while (n < 2 * entries.size() + 1) n <<= 1;
+        slots.assign(n, Slot{0, 0, 0});
+        mask = n - 1;
+        for (size_t i = 0; i < keyed.size();) {
+            size_t j = i + 1;
+            while (j < keyed.size() && keyed[j].first == keyed[i].first) ++j;
+            size_t s = keyed[i].first & mask;
+            while (slots[s].count) s = (s + 1) & mask;
+            slots[s] = Slot{keyed[i].first, static_cast<uint32_t>(i), static_cast<uint32_t>(j - i)};
+            i = j;
+        }
+
+        unsigned bits = 12;                                   // at least 4096 bits
+        while ((size_t(1) << bits) < 16 * entries.size()) ++bits;
+        prefilterShift = 64 - bits;
+        prefilter.assign((size_t(1) << bits) / 64, 0);
+        for (const auto& kv : keyed) {
+            uint64_t b = kv.first >> prefilterShift;
+            prefilter[b >> 6] |= uint64_t(1) << (b & 63);
         }
     }
 
-    SketchIndex index;
-    index.reserve(sketchHash.size());
-    for (const auto& [sig, refId] : sketchHash) {
-        uint64_t h = NTC64(sig.c_str(), static_cast<unsigned>(sig.size()));
-        auto it = sigIndexOf[refId].find(sig);
-        // A signature present in the sketch but absent from refSigCount (e.g. a
-        // filtered tree-level view) is still counted against its reference.
-        unsigned sigIdx = (it != sigIndexOf[refId].end()) ? it->second : UINT32_MAX;
-        index[h].push_back({sig, refId, sigIdx});
+    /**
+     * The entries whose signature hashes to `h`: a pointer to the first and their
+     * number, or nullptr. Linear probing; the table is at most half full.
+     */
+    const QueryEntry* find(uint64_t h, uint32_t& count) const {
+        uint64_t b = h >> prefilterShift;
+        if (!(prefilter[b >> 6] & (uint64_t(1) << (b & 63)))) return nullptr;
+        size_t s = h & mask;
+        while (slots[s].count) {
+            if (slots[s].hash == h) {
+                count = slots[s].count;
+                return &entries[slots[s].first];
+            }
+            s = (s + 1) & mask;
+        }
+        return nullptr;
     }
-    return index;
-}
+};
+
+/** What one pass over the reads produced. */
+struct QueryTally {
+    std::vector<unsigned> count;                            // per target: signature hits
+    std::vector<unsigned> slotCount;                        // per slot: hits on that signature
+    std::vector<std::unordered_set<std::string>> reads;     // per target: distinct read ids
+
+    explicit QueryTally(const QueryIndex& index)
+        : count(index.numTargets, 0), slotCount(index.numSlots, 0), reads(index.numTargets) {}
+};
 
 /**
- * Query an input read file against the uniqsketch index.
+ * One pass over the sample: every k-mer of every read against the index.
  *
- * Threads accumulate hits into private tallies and merge them once per batch,
- * so the hot loop takes no locks and performs no atomics. The previous version
- * took a global critical section on every hit, and applied `omp atomic` to a
- * map subscript -- which only covers the final increment, leaving the map
- * lookup itself unsynchronised.
+ * Reads are parsed by a thread of their own into batches that the OpenMP team
+ * consumes, so parsing and hashing overlap; before, the team sat idle while the
+ * main thread parsed the next batch and then parsed nothing while the team
+ * hashed, which capped a 3 M-read query at six times the single-thread speed no
+ * matter how many threads it had. The hot loop records a hit as (target, slot,
+ * read); the merge, still serial, counts and remembers the read's name once.
+ * The per-target sets of distinct read names are built at the end, in parallel
+ * over targets, from those names: inserting into the sets from the merge cost as
+ * much as the hashing did, and held the dominant reference's names once per
+ * tree level.
  *
- * @param in  Path to the input read file.
- * @param index  Hash-keyed sketch view from buildSketchIndex.
- * @param sigNames  Dense signature ordering from buildSketchIndex.
- * @param dbFilter  Bloom filter for tracking distinct k-mers.
- * @param sbFilter  Bloom filter for tracking solid k-mers.
- * @param sketchCount  Per-reference unique k-mer hit counts.
- * @param refSigCount  Per-reference per-signature counts.
- * @param refRead  Per-reference distinct read id sets.
+ * The read filter for --solid is allocated only when --solid is given; it is
+ * sized for the sample's distinct k-mers (138 M on a 3 M-read E. coli sample,
+ * 1.1 GB at 64 bits each) and used to be allocated, and zeroed, on every query.
+ *
+ * The --solid adjustment (a reference with any hit gets one more, for the first
+ * occurrence the filter swallowed) is the caller's, because it applies per
+ * reference and a tree target may be one signature of a reference.
  */
-void querySample(const QuerySketchConfig& cfg, const std::string& in, const SketchIndex& index,
-                 const std::vector<std::vector<std::string>>& sigNames,
-                 BloomFilter& dbFilter, BloomFilter& sbFilter,
-                 std::vector<unsigned>& sketchCount,
-                 std::vector<SketchHash>& refSigCount,
-                 std::vector<std::unordered_set<std::string>>& refRead) {
-    (void) sbFilter;
+void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sampleFiles,
+                const QueryIndex& index, QueryTally& tally) {
     static const size_t BATCH_SIZE = 4096;
-    gzFile fp = gzopen(in.c_str(), "r");
-    kseq_t* ks = kseq_init(fp);
-
-    const size_t numRef = sketchCount.size();
-    std::vector<std::string> seqBatch;
-    std::vector<std::string> nameBatch;
-    seqBatch.reserve(BATCH_SIZE);
-    nameBatch.reserve(BATCH_SIZE);
-
-    // Per-thread tallies, allocated once and reused across batches.
-    struct Tally {
-        std::vector<unsigned> count;                          // per reference
-        std::vector<std::vector<unsigned>> sig;               // per reference, per dense sig index
-        std::vector<std::vector<unsigned>> readIdx;           // per reference, batch-local read indices
+    static const size_t QUEUE_DEPTH = 4;
+    struct Hit { unsigned target, slot, read; };
+    struct Batch {
+        std::vector<std::string> seq, name;
+        bool last = false;
     };
+
+    std::unique_ptr<BloomFilter> solidFilter;
+    if (cfg.solid) {
+        solidFilter.reset(new BloomFilter(cfg.dbfSize * cfg.bits, cfg.nhash, cfg.kmerLen));
+    }
+
     int maxThreads = 1;
 #ifdef _OPENMP
     maxThreads = omp_get_max_threads();
 #endif
-    std::vector<Tally> tallies(maxThreads);
-    for (Tally& t : tallies) {
-        t.count.assign(numRef, 0);
-        t.sig.resize(numRef);
-        for (size_t ref = 0; ref < numRef; ref++) t.sig[ref].assign(sigNames[ref].size(), 0);
-        t.readIdx.resize(numRef);
+    std::vector<std::vector<Hit>> hits(maxThreads);
+
+    // Names of the reads that hit anything, each once, and per target the ids of
+    // its hit reads (with runs of the same read collapsed).
+    std::vector<std::string> hitNames;
+    std::vector<std::vector<uint32_t>> readIds(index.numTargets);
+
+    // Producers: one parser thread per input file (paired reads are two
+    // independent streams), filling a bounded queue of batches. Consumer: the
+    // OpenMP team. A batch marked `last` is the final one of its file; the
+    // consumer stops when every file has delivered its last batch.
+    std::mutex mu;
+    std::condition_variable cvFull, cvEmpty;
+    std::deque<std::unique_ptr<Batch>> ready, spare;
+    const size_t queueDepth = QUEUE_DEPTH * sampleFiles.size();
+    for (size_t i = 0; i < queueDepth; i++) spare.emplace_back(new Batch);
+
+    std::vector<std::thread> readers;
+    for (const std::string& path : sampleFiles) {
+        readers.emplace_back([&, path] {
+            gzFile fp = gzopen(path.c_str(), "r");
+            kseq_t* ks = kseq_init(fp);
+            bool eof = false;
+            while (!eof) {
+                std::unique_ptr<Batch> b;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cvEmpty.wait(lk, [&] { return !spare.empty(); });
+                    b = std::move(spare.front());
+                    spare.pop_front();
+                }
+                b->seq.clear();
+                b->name.clear();
+                for (size_t i = 0; i < BATCH_SIZE; ++i) {
+                    if (kseq_read(ks) < 0) {
+                        eof = true;
+                        break;
+                    }
+                    b->seq.emplace_back(ks->seq.s, ks->seq.l);
+                    b->name.emplace_back(ks->name.s, ks->name.l);
+                }
+                b->last = eof;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    ready.push_back(std::move(b));
+                }
+                cvFull.notify_one();
+            }
+            kseq_destroy(ks);
+            gzclose(fp);
+        });
     }
 
-    bool eof = false;
-    while (!eof) {
-        seqBatch.clear();
-        nameBatch.clear();
-        for (size_t i = 0; i < BATCH_SIZE; ++i) {
-            if (kseq_read(ks) < 0) {
-                eof = true;
-                break;
-            }
-            seqBatch.emplace_back(ks->seq.s, ks->seq.l);
-            nameBatch.emplace_back(ks->name.s, ks->name.l);
+    std::vector<uint32_t> nameId;   // per read of the current batch: its hitNames index
+    for (size_t filesDone = 0; filesDone < sampleFiles.size();) {
+        std::unique_ptr<Batch> b;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cvFull.wait(lk, [&] { return !ready.empty(); });
+            b = std::move(ready.front());
+            ready.pop_front();
         }
+        if (b->last) ++filesDone;
+        const std::vector<std::string>& seqBatch = b->seq;
 
         #pragma omp parallel
         {
@@ -257,7 +402,8 @@ void querySample(const QuerySketchConfig& cfg, const std::string& in, const Sket
 #ifdef _OPENMP
             tid = omp_get_thread_num();
 #endif
-            Tally& t = tallies[tid];
+            std::vector<Hit>& mine = hits[tid];
+            mine.clear();
 
             #pragma omp for schedule(dynamic, 64)
             for (size_t r = 0; r < seqBatch.size(); ++r) {
@@ -266,24 +412,17 @@ void querySample(const QuerySketchConfig& cfg, const std::string& in, const Sket
 
                 ntHashIterator itr(seq, cfg.nhash, cfg.kmerLen);
                 while (itr != itr.end()) {
-                    if (cfg.solid) {
-                        if (dbFilter.insert_make_change(*itr)) {
-                            ++itr;
-                            continue;
-                        }
+                    if (solidFilter && solidFilter->insert_make_change(*itr)) {
+                        ++itr;
+                        continue;
                     }
-
                     // One 64-bit probe decides the (overwhelmingly common) miss.
-                    auto bucket = index.find((*itr)[0]);
-                    if (bucket != index.end()) {
-                        // Probe hit: confirm the sequence before counting.
+                    uint32_t n = 0;
+                    if (const QueryEntry* e = index.find((*itr)[0], n)) {
                         const char* kp = seq.c_str() + itr.get_pos();
-                        for (const SketchEntry& e : bucket->second) {
-                            if (kmerMatches(kp, e.seq)) {
-                                ++t.count[e.refId];
-                                if (e.sigIdx != UINT32_MAX) ++t.sig[e.refId][e.sigIdx];
-                                t.readIdx[e.refId].push_back(static_cast<unsigned>(r));
-                                break;
+                        for (uint32_t i = 0; i < n; i++) {
+                            if (kmerMatches(kp, *e[i].seq)) {
+                                mine.push_back({e[i].target, e[i].slot, static_cast<unsigned>(r)});
                             }
                         }
                     }
@@ -292,54 +431,94 @@ void querySample(const QuerySketchConfig& cfg, const std::string& in, const Sket
             }
         }
 
-        // Merge this batch's per-thread tallies into the shared results.
-        for (Tally& t : tallies) {
-            for (size_t ref = 0; ref < numRef; ref++) {
-                if (t.count[ref] == 0) continue;
-                sketchCount[ref] += t.count[ref];
-                t.count[ref] = 0;
-                for (size_t s = 0; s < t.sig[ref].size(); s++) {
-                    if (t.sig[ref][s]) {
-                        refSigCount[ref][sigNames[ref][s]] += t.sig[ref][s];
-                        t.sig[ref][s] = 0;
+        // Merge this batch: counts, and the read behind each hit, named once.
+        nameId.assign(seqBatch.size(), UINT32_MAX);
+        for (const std::vector<Hit>& mine : hits) {
+            unsigned prevTarget = UINT32_MAX, prevRead = UINT32_MAX;
+            for (const Hit& h : mine) {
+                ++tally.count[h.target];
+                if (h.slot != NO_SLOT) ++tally.slotCount[h.slot];
+                if (h.target != prevTarget || h.read != prevRead) {
+                    if (nameId[h.read] == UINT32_MAX) {
+                        nameId[h.read] = static_cast<uint32_t>(hitNames.size());
+                        hitNames.push_back(std::move(b->name[h.read]));
                     }
+                    readIds[h.target].push_back(nameId[h.read]);
+                    prevTarget = h.target;
+                    prevRead = h.read;
                 }
-                for (unsigned r : t.readIdx[ref]) refRead[ref].insert(nameBatch[r]);
-                t.readIdx[ref].clear();
             }
         }
+
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            spare.push_back(std::move(b));
+        }
+        cvEmpty.notify_all();
     }
-    kseq_destroy(ks);
-    gzclose(fp);
+    for (std::thread& t : readers) t.join();
+
+    // Distinct read names per target. Two reads with the same name (mates named
+    // alike, say) are one read here, as they were when names went straight into
+    // the set.
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t t = 0; t < readIds.size(); t++) {
+        std::vector<uint32_t>& ids = readIds[t];
+        if (ids.empty()) continue;
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        tally.reads[t].reserve(ids.size());
+        for (uint32_t id : ids) tally.reads[t].insert(hitNames[id]);
+        ids = std::vector<uint32_t>();
+    }
 }
 
 /**
- * Query batch of input read files against the uniqsketch index.
+ * Flat query: every reference of one sketch against the sample.
  *
  * @param sampleFiles  All input read file paths.
- * @param sketchHash  Hash table for the uniqsketch.
- * @param sketchCount  Per-reference unique k-mer hit counts.
- * @param refSigCount  Per-reference per-signature counts.
- * @param refRead  Per-reference distinct read id sets.
+ * @param sketchHash  Signature -> refId map, as loaded by loadSketch.
+ * @param sketchCount  Per-reference signature hit counts (added to).
+ * @param refSigCount  Per-reference signature -> hit count maps (added to).
+ * @param refRead  Per-reference distinct read id sets (added to).
  */
 void querySampleBatch(const QuerySketchConfig& cfg, const std::vector<std::string>& sampleFiles,
                       const SketchHash& sketchHash,
                       std::vector<unsigned>& sketchCount,
                       std::vector<SketchHash>& refSigCount,
                       std::vector<std::unordered_set<std::string>>& refRead) {
-    BloomFilter dbFilter(cfg.dbfSize * cfg.bits, cfg.nhash, cfg.kmerLen);
-    BloomFilter sbFilter(cfg.sbfSize * cfg.bits, cfg.nhash, cfg.kmerLen);
-
-    // Build the hash-keyed view once; it is shared read-only across all files.
-    std::vector<std::vector<std::string>> sigNames;
-    SketchIndex index = buildSketchIndex(sketchHash, refSigCount, sigNames);
-
-    for (unsigned i = 0; i < sampleFiles.size(); i++) {
-        querySample(cfg, sampleFiles[i], index, sigNames, dbFilter, sbFilter,
-                    sketchCount, refSigCount, refRead);
+    // One target per reference; one slot per signature, pointing at its counter
+    // in refSigCount so the pass writes straight into the maps the logs print.
+    QueryIndex index;
+    index.numTargets = static_cast<unsigned>(refSigCount.size());
+    std::vector<unsigned*> slotCounter;
+    for (const auto& [sig, refId] : sketchHash) {
+        auto it = refSigCount[refId].find(sig);
+        // A signature present in the sketch but absent from refSigCount is still
+        // counted against its reference, without a per-signature counter.
+        unsigned slot = NO_SLOT;
+        if (it != refSigCount[refId].end()) {
+            slot = static_cast<unsigned>(slotCounter.size());
+            slotCounter.push_back(&it->second);
+        }
+        index.add(sig, refId, slot);
     }
+    index.numSlots = static_cast<unsigned>(slotCounter.size());
+    index.finalize();
 
-    // Adjust for distinct/solid BF masking
+    QueryTally tally(index);
+    queryReads(cfg, sampleFiles, index, tally);
+
+    for (unsigned ref = 0; ref < index.numTargets; ref++) {
+        sketchCount[ref] += tally.count[ref];
+        if (!tally.reads[ref].empty()) {
+            if (refRead[ref].empty()) refRead[ref].swap(tally.reads[ref]);
+            else refRead[ref].insert(tally.reads[ref].begin(), tally.reads[ref].end());
+        }
+    }
+    for (unsigned s = 0; s < index.numSlots; s++) *slotCounter[s] += tally.slotCount[s];
+
+    // Adjust for the first occurrence the --solid filter swallowed.
     if (cfg.solid) {
         for (auto& count : sketchCount) {
             if (count) {
