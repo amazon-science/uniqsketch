@@ -118,7 +118,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 
 ### uniqsketch
 * `sketch_uniq.tsv`: primary output — tab-separated file storing the final set of signatures for each reference.
-* `outdir_uniqsketch/`: folder containing a file per reference with all signature candidates.
+* `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
 * With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level), `build_params.tsv` (how signatures were selected; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), and `groups/g<i>/` with each group's candidate files.
@@ -336,12 +336,11 @@ records for each one its *carriers*: the other genomes of the index that contain
 it. `querysketch --tree` uses a within-group signature only when none of its
 carriers is a candidate for the sample (see [querysketch](#querysketch-1)); the
 globally unique signatures stay in use throughout, so the extra set can add
-evidence but never remove any. Building it costs about 25 % more time on the
-120-genome *E. coli* index (169 s against 136 s at 32 threads; the group builds
-run as one parallel job list, so many small groups keep the machine busy) and
-about 15 % more disk under `<outdir>` (the per-group candidate files in
-`<outdir>/groups/`, 3.4 GB against the 22 GB of candidate files the index writes
-anyway). Query time is unchanged.
+evidence but never remove any. Building it costs about 20 % more time on the
+120-genome *E. coli* index (153 s against about 125 s at 32 threads; the group
+builds run as one parallel job list, so many small groups keep the machine busy)
+and about 150 MB more candidate scratch under `<outdir>/groups/`. Query time is
+unchanged.
 
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output

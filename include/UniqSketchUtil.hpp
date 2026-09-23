@@ -2,13 +2,16 @@
 #define UNIQSKETCHUTIL_HPP_
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #include "SequenceUtil.hpp"
 #include "BloomFilter.hpp"
@@ -71,6 +74,174 @@ struct UniqSketchConfig {
 using SketchHash = std::unordered_map<std::string, unsigned>;
 
 /**
+ * Walk a FASTA file contig by contig: fn(header, sequence). `header` is the
+ * '>' line without the '>' and with spaces replaced by '_', the form the
+ * sketch's contig column uses; `sequence` is the concatenation of the lines up
+ * to the next '>' line, passed by non-const reference so a caller may move it.
+ * Every scanner of a reference goes through this, so a position recorded by
+ * one of them means the same base to all of them. The line handling is the one
+ * the scanners had when each carried its own copy of the loop, kept exactly:
+ * a header line of just ">" leaves the previous header in force, and an empty
+ * line inside a record is skipped.
+ */
+template <typename Fn>
+inline void scanFasta(const std::string& fPath, Fn fn) {
+    std::ifstream refFile(fPath);
+    std::string line;
+    bool good = static_cast<bool>(std::getline(refFile, line));
+    std::string header = line.empty() ? std::string() : line.substr(1);
+    std::replace(header.begin(), header.end(), ' ', '_');
+    while (good) {
+        std::string faSeq;
+        good = static_cast<bool>(std::getline(refFile, line));
+        while (good && line[0] != '>') {
+            faSeq += line;
+            good = static_cast<bool>(std::getline(refFile, line));
+        }
+        fn(header, faSeq);
+        if (line.size() > 1) {
+            header = line.substr(1);
+            std::replace(header.begin(), header.end(), ' ', '_');
+        }
+    }
+}
+
+/** Candidate file of a reference: <outdir>/<basename without extension>.cand. */
+inline std::string candidatePath(const std::string& outdir, const std::string& refPath) {
+    return outdir + "/" + getBaseId(refPath) + ".cand";
+}
+
+/**
+ * Per-reference candidate file: the reference's unique k-mers, as positions in
+ * its own FASTA file, one run per contig in file order.
+ *
+ *   "UQSKCAND"  u32 version  u32 k  u32 pathLen  path             header
+ *   u32 nameLen  name  u64 seqLen  u64 count  u32 pos[count]       per contig
+ *
+ * `path` is the reference FASTA as given to uniqsketch; `name` is the contig
+ * header as scanFasta reports it; `seqLen` lets a reader notice a genome that
+ * changed under it. A candidate's sequence is the canonical k-mer at `pos` of
+ * its contig, which the reader recomputes for the candidates it examines, a
+ * few thousand of the millions in the file. Native byte order: the file is
+ * scratch for the build that writes it.
+ *
+ * These used to be text, one line per k-mer with the sequence spelled out and
+ * the contig header repeated: 162 bytes each, 22 GB written, read back, parsed
+ * and sorted for a 120-genome tree index, about a quarter of the build and a
+ * hundred megabytes of strings per thread during selection. This is 4 bytes
+ * per k-mer.
+ */
+class CandidateWriter {
+public:
+    static constexpr const char* MAGIC = "UQSKCAND";
+    static constexpr uint32_t FORMAT_VERSION = 1;
+
+    CandidateWriter(const std::string& path, unsigned k, const std::string& refPath)
+        : out_(path, std::ios::binary | std::ios::trunc) {
+        out_.write(MAGIC, 8);
+        put32(FORMAT_VERSION);
+        put32(k);
+        put32(static_cast<uint32_t>(refPath.size()));
+        out_.write(refPath.data(), static_cast<std::streamsize>(refPath.size()));
+    }
+
+    void beginContig(const std::string& name, uint64_t seqLen) {
+        put32(static_cast<uint32_t>(name.size()));
+        out_.write(name.data(), static_cast<std::streamsize>(name.size()));
+        put64(seqLen);
+        countAt_ = out_.tellp();
+        put64(0);                       // patched by endContig
+        count_ = 0;
+    }
+
+    void add(uint32_t pos) {
+        buf_.push_back(pos);
+        ++count_;
+        if (buf_.size() == BUF_ENTRIES) flush();
+    }
+
+    void endContig() {
+        flush();
+        std::streampos end = out_.tellp();
+        out_.seekp(countAt_);
+        put64(count_);
+        out_.seekp(end);
+    }
+
+    bool good() const { return out_.good(); }
+
+private:
+    static constexpr size_t BUF_ENTRIES = size_t(1) << 14;
+
+    void put32(uint32_t v) { out_.write(reinterpret_cast<const char*>(&v), sizeof v); }
+    void put64(uint64_t v) { out_.write(reinterpret_cast<const char*>(&v), sizeof v); }
+    void flush() {
+        if (!buf_.empty())
+            out_.write(reinterpret_cast<const char*>(buf_.data()),
+                       static_cast<std::streamsize>(buf_.size() * sizeof(uint32_t)));
+        buf_.clear();
+    }
+
+    std::ofstream out_;
+    std::vector<uint32_t> buf_;
+    std::streampos countAt_{};
+    uint64_t count_ = 0;
+};
+
+struct CandidateRun {
+    std::string name;                   // contig header, as scanFasta reports it
+    uint64_t seqLen = 0;                // contig length when the candidates were written
+    std::vector<uint32_t> pos;          // positions of the unique k-mers, ascending
+};
+
+struct CandidateSet {
+    unsigned k = 0;
+    std::string refPath;                // the reference FASTA the positions index into
+    std::vector<CandidateRun> runs;     // one per contig, in file order
+    size_t total = 0;
+};
+
+/** Read a candidate file. False, with a message on stderr, if it is not one. */
+inline bool readCandidates(const std::string& path, CandidateSet& out) {
+    std::ifstream in(path, std::ios::binary);
+    auto get32 = [&](uint32_t& v) { return static_cast<bool>(in.read(reinterpret_cast<char*>(&v), sizeof v)); };
+    auto get64 = [&](uint64_t& v) { return static_cast<bool>(in.read(reinterpret_cast<char*>(&v), sizeof v)); };
+    auto getStr = [&](std::string& s) {
+        uint32_t n = 0;
+        if (!get32(n)) return false;
+        s.resize(n);
+        return n == 0 || static_cast<bool>(in.read(&s[0], n));
+    };
+    auto bad = [&](const char* why) {
+        std::cerr << "Error: " << path << ": " << why << "\n";
+        return false;
+    };
+
+    char magic[8];
+    uint32_t version = 0, k = 0;
+    if (!in.read(magic, 8) || std::memcmp(magic, CandidateWriter::MAGIC, 8) != 0)
+        return bad("not a uniqsketch candidate file");
+    if (!get32(version) || version != CandidateWriter::FORMAT_VERSION)
+        return bad("unsupported candidate file version");
+    if (!get32(k) || !getStr(out.refPath)) return bad("truncated header");
+    out.k = k;
+    out.runs.clear();
+    out.total = 0;
+    while (in.peek() != std::char_traits<char>::eof()) {
+        CandidateRun run;
+        uint64_t count = 0;
+        if (!getStr(run.name) || !get64(run.seqLen) || !get64(count)) return bad("truncated contig record");
+        run.pos.resize(count);
+        if (count && !in.read(reinterpret_cast<char*>(run.pos.data()),
+                              static_cast<std::streamsize>(count * sizeof(uint32_t))))
+            return bad("truncated position list");
+        out.total += count;
+        out.runs.push_back(std::move(run));
+    }
+    return true;
+}
+
+/**
  * Insert k-mers from a FASTA reference into distinct and solid Bloom filters.
  *
  * @param fPath  Path to a reference file.
@@ -78,16 +249,7 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  * @param sbFilter  Solid Bloom filter for tracking repeat k-mers.
  */
 void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFilter) {
-    std::ifstream refFile(fPath);
-    std::string seq;
-    bool good = static_cast<bool>(std::getline(refFile, seq));
-    while (good) {
-        std::string faSeq;
-        good = static_cast<bool>(std::getline(refFile, seq));
-        while (good && seq[0] != '>') {
-            faSeq += seq;
-            good = static_cast<bool>(std::getline(refFile, seq));
-        }
+    scanFasta(fPath, [&](const std::string&, const std::string& faSeq) {
         ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
         while (itr != itr.end()) {
             if (!dbFilter.insert_make_change(*itr)) {
@@ -95,11 +257,12 @@ void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter
             }
             ++itr;
         }
-    }
+    });
 }
 
 /**
- * Scan all k-mers in a reference and record unique k-mers.
+ * Scan a reference and record its unique k-mers: every k-mer not in the solid
+ * filter, as a position in the reference's candidate file (see CandidateWriter).
  *
  * @param fPath  Path to a reference file.
  * @param refId  Integer id assigned to the reference.
@@ -108,40 +271,23 @@ void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter
  */
 void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
               const BloomFilter& sbFilter, std::vector<int>& refCount) {
-    std::ifstream refFile(fPath);
-    std::string sampleId = getBaseId(fPath);
-    std::ofstream uniqFile(cfg.outdir + "/" + sampleId + ".tsv");
-    std::string seq;
+    const std::string candPath = candidatePath(cfg.outdir, fPath);
+    CandidateWriter cand(candPath, cfg.kmerLen, fPath);
     size_t countUnique = 0;
-
-    bool good = static_cast<bool>(std::getline(refFile, seq));
-    std::string headerSeq = seq.substr(1);
-    std::replace(headerSeq.begin(), headerSeq.end(), ' ', '_');
-
-    while (good) {
-        std::string faSeq;
-        good = static_cast<bool>(std::getline(refFile, seq));
-        while (good && seq[0] != '>') {
-            faSeq += seq;
-            good = static_cast<bool>(std::getline(refFile, seq));
-        }
+    scanFasta(fPath, [&](const std::string& header, const std::string& faSeq) {
+        cand.beginContig(header, faSeq.size());
         ntHashIterator itr(faSeq, cfg.nhash2, cfg.kmerLen);
         while (itr != itr.end()) {
             if (!sbFilter.contains(*itr)) {
                 ++countUnique;
-                size_t seqLoc = itr.get_pos();
-                uniqFile << get_canonical(faSeq.substr(seqLoc, cfg.kmerLen))
-                         << "\t" << seqLoc << "\t" << headerSeq << "\n";
+                cand.add(static_cast<uint32_t>(itr.get_pos()));
             }
             ++itr;
         }
-        if (seq.size() > 1) {
-            headerSeq = seq.substr(1);
-            std::replace(headerSeq.begin(), headerSeq.end(), ' ', '_');
-        }
-    }
-    uniqFile.close();
-    refCount[refId] = countUnique;
+        cand.endContig();
+    });
+    if (!cand.good()) std::cerr << "Error: could not write " << candPath << "\n";
+    refCount[refId] = static_cast<int>(countUnique);
 }
 
 /**
@@ -172,7 +318,7 @@ void identifyUniqKmers(const UniqSketchConfig& cfg, const std::vector<std::strin
 
     std::ofstream tsvOut(cfg.refstat);
     for (size_t i = 0; i < refCount.size(); i++) {
-        tsvOut << cfg.outdir << "/" << getBaseId(refFiles[i]) << ".tsv\t"
+        tsvOut << candidatePath(cfg.outdir, refFiles[i]) << "\t"
                << refCount[i] << "\t" << i << "\n";
     }
     tsvOut.close();
@@ -214,16 +360,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
     if (bases == 0) bases = 1;
     BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
     for (const auto& fPath : files) {
-        std::ifstream refFile(fPath);
-        std::string seq;
-        bool good = static_cast<bool>(std::getline(refFile, seq));
-        while (good) {
-            std::string faSeq;
-            good = static_cast<bool>(std::getline(refFile, seq));
-            while (good && seq[0] != '>') {
-                faSeq += seq;
-                good = static_cast<bool>(std::getline(refFile, seq));
-            }
+        scanFasta(fPath, [&](const std::string&, const std::string& faSeq) {
             ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
             while (itr != itr.end()) {
                 if (seen.insert_make_change(*itr)) {
@@ -233,7 +370,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
                 }
                 ++itr;
             }
-        }
+        });
     }
 }
 
@@ -274,7 +411,7 @@ void identifyGroupUniqKmers(const UniqSketchConfig& cfg,
 
     std::ofstream tsvOut(cfg.refstat);
     for (size_t i = 0; i < refCount.size(); i++) {
-        tsvOut << cfg.outdir << "/" << getBaseId(groups[i][0]) << ".tsv\t"
+        tsvOut << candidatePath(cfg.outdir, groups[i][0]) << "\t"
                << refCount[i] << "\t" << i << "\n";
     }
     tsvOut.close();
@@ -412,7 +549,7 @@ bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomF
 /**
  * Extract the unique k-mer set for a given reference.
  *
- * @param fPath  Path to a reference's candidate unique k-mers.
+ * @param fPath  Path to a reference's candidate file (see CandidateWriter).
  * @param refId  Integer id assigned to the reference.
  * @param sketchFilter  Bloom filter for the unique sketch.
  * @param out  Stream receiving this reference's signatures. buildSketch passes a
@@ -424,58 +561,91 @@ bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomF
 SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, unsigned refId,
                       BloomFilter& sketchFilter, std::ostream& out,
                       const BloomFilter& dbFilter) {
-    // Read all candidate lines
-    std::vector<std::string> lines;
-    std::ifstream sketchFile(fPath);
-    std::string line;
-    while (std::getline(sketchFile, line)) {
-        lines.push_back(std::move(line));
+    CandidateSet cand;
+    if (!readCandidates(fPath, cand)) return {0, 0};
+    if (cand.total == 0) return {0, 0};
+    if (cand.k != cfg.kmerLen) {
+        std::cerr << "Error: " << fPath << " was written for k=" << cand.k
+                  << ", not k=" << cfg.kmerLen << "\n";
+        return {0, 0};
     }
-    sketchFile.close();
 
-    if (lines.empty()) return {0, 0};
+    // The contigs, split as checkRef split them. A genome that changed since
+    // the candidates were written is refused rather than mis-read.
+    std::vector<std::string> contigs;
+    std::vector<std::string> names;
+    scanFasta(cand.refPath, [&](const std::string& header, std::string& seq) {
+        names.push_back(header);
+        contigs.push_back(std::move(seq));
+    });
+    bool same = contigs.size() == cand.runs.size();
+    for (size_t r = 0; same && r < cand.runs.size(); r++)
+        same = contigs[r].size() == cand.runs[r].seqLen && names[r] == cand.runs[r].name;
+    if (!same) {
+        std::cerr << "Error: " << cand.refPath << " does not match the candidates in " << fPath
+                  << " (changed since the build started?)\n";
+        return {0, 0};
+    }
+    names = std::vector<std::string>();
 
-    // Build a lightweight index: extract (contig, pos) for sorting without extra string copies
-    size_t total = lines.size();
-    std::vector<unsigned> indices(total);
-    std::iota(indices.begin(), indices.end(), 0);
-
-    // Parse position from each line for sorting (format: seq \t pos \t contig)
-    // Use a fast scan: skip first field, read pos, read contig
-    struct PosKey {
-        unsigned pos;
-        const char* contigStart;
-        size_t contigLen;
+    // Candidates in the order selection walks them: by contig name, as the
+    // sketch's contig column compares (byte order, shorter first on a tie),
+    // then by position. With distinct names that is the runs in name order.
+    // Two contigs with the same header interleave by position; that case
+    // starts from file order and sorts, which is what always happened.
+    const size_t nRuns = cand.runs.size();
+    std::vector<uint32_t> runOrder(nRuns);
+    std::iota(runOrder.begin(), runOrder.end(), 0u);
+    auto nameLess = [&](uint32_t a, uint32_t b) {
+        const std::string& x = cand.runs[a].name;
+        const std::string& y = cand.runs[b].name;
+        int c = std::strncmp(x.c_str(), y.c_str(), std::min(x.size(), y.size()));
+        if (c != 0) return c < 0;
+        return x.size() < y.size();
     };
-    std::vector<PosKey> keys(total);
-    for (size_t i = 0; i < total; i++) {
-        const char* s = lines[i].c_str();
-        // skip seq field
-        while (*s && *s != '\t') ++s;
-        if (*s) ++s;
-        // parse pos
-        keys[i].pos = 0;
-        while (*s >= '0' && *s <= '9') {
-            keys[i].pos = keys[i].pos * 10 + (*s - '0');
-            ++s;
-        }
-        if (*s) ++s;
-        // contig starts here
-        keys[i].contigStart = s;
-        keys[i].contigLen = lines[i].c_str() + lines[i].size() - s;
-    }
+    std::stable_sort(runOrder.begin(), runOrder.end(), nameLess);
+    bool duplicateNames = false;
+    for (size_t i = 1; i < nRuns; i++)
+        if (!nameLess(runOrder[i - 1], runOrder[i])) duplicateNames = true;
 
-    std::sort(indices.begin(), indices.end(),
-              [&keys](unsigned a, unsigned b) {
-                  int cmp = std::strncmp(keys[a].contigStart, keys[b].contigStart,
-                                         std::min(keys[a].contigLen, keys[b].contigLen));
-                  if (cmp != 0) return cmp < 0;
-                  if (keys[a].contigLen != keys[b].contigLen) return keys[a].contigLen < keys[b].contigLen;
-                  return keys[a].pos < keys[b].pos;
-              });
+    struct Cand { uint32_t run, pos; };
+    std::vector<Cand> cands;
+    cands.reserve(cand.total);
+    if (!duplicateNames) {
+        for (uint32_t r : runOrder)
+            for (uint32_t p : cand.runs[r].pos) cands.push_back({r, p});
+    } else {
+        std::vector<uint32_t> rank(nRuns);
+        for (size_t i = 0, k = 0; i < nRuns; i++) {
+            if (i && nameLess(runOrder[i - 1], runOrder[i])) ++k;
+            rank[runOrder[i]] = static_cast<uint32_t>(k);
+        }
+        for (uint32_t r = 0; r < nRuns; r++)
+            for (uint32_t p : cand.runs[r].pos) cands.push_back({r, p});
+        std::sort(cands.begin(), cands.end(), [&](const Cand& a, const Cand& b) {
+            if (rank[a.run] != rank[b.run]) return rank[a.run] < rank[b.run];
+            return a.pos < b.pos;
+        });
+    }
+    for (CandidateRun& r : cand.runs) r.pos = std::vector<uint32_t>();
+
+    // The contig column of the sketch: the header's first whitespace-delimited
+    // token, which is what parsing the text candidate lines yielded.
+    std::vector<std::string> contigToken(nRuns);
+    for (size_t r = 0; r < nRuns; r++) {
+        const std::string& n = cand.runs[r].name;
+        size_t b = 0;
+        while (b < n.size() && std::isspace(static_cast<unsigned char>(n[b]))) ++b;
+        size_t e = b;
+        while (e < n.size() && !std::isspace(static_cast<unsigned char>(n[e]))) ++e;
+        contigToken[r] = n.substr(b, e - b);
+    }
+    const std::string baseId = getBaseId(fPath);
 
     // Select evenly spaced candidates, checking low-complexity (and, when
-    // cfg.minMargin >= 2, the cross-reference Hamming margin) lazily.
+    // cfg.minMargin >= 2, the cross-reference Hamming margin) lazily. A
+    // candidate's sequence is computed only here, when its slot is examined.
+    const size_t total = cands.size();
     int count = 0;
     size_t safeCount = 0;
     size_t needed = std::min(static_cast<size_t>(cfg.sketchnum), total);
@@ -486,11 +656,8 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     // 2-safe candidates are accepted. Returns true if a signature was committed.
     auto trySlot = [&](size_t a, size_t b, bool requireSafe) -> bool {
         for (size_t i = a; i < b; i++) {
-            unsigned idx = indices[i];
-            std::istringstream seqstm(lines[idx]);
-            std::string useq, contig;
-            unsigned pos;
-            seqstm >> useq >> pos >> contig;
+            const Cand& c = cands[i];
+            std::string useq = get_canonical(contigs[c.run].substr(c.pos, cfg.kmerLen));
 
             if (lowComplexity(cfg, useq)) continue;
             if (hasLongHomopolymer(cfg, useq)) continue;
@@ -503,8 +670,8 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
                     ++count;
                     found = true;
                     // `out` is this reference's private buffer, so no lock is needed.
-                    out << useq << "\t" << refId << "\t" << getBaseId(fPath)
-                        << "\t" << cfg.numRef << "\t" << contig << "\t" << pos << "\n";
+                    out << useq << "\t" << refId << "\t" << baseId
+                        << "\t" << cfg.numRef << "\t" << contigToken[c.run] << "\t" << c.pos << "\n";
                 }
                 ++itr;
             }

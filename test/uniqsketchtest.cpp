@@ -1,6 +1,9 @@
 #include <fstream>
 #include <iterator>
 #include <algorithm>
+#include <cstdio>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <cassert>
@@ -8,6 +11,57 @@
 #include "SequenceUtil.hpp"
 #include "TestUtil.hpp"
 #include "UniqSketchUtil.hpp"
+
+// The candidate fixtures (expected_ref_test_*.tsv) are in the text form the
+// candidate files had before they went binary: one line per unique k-mer,
+// `canonical k-mer <TAB> position <TAB> contig`, in scan order. They stay the
+// ground truth; the helpers below translate between them and the binary files.
+
+static std::vector<std::string> fileLines(const std::string& path) {
+    std::vector<std::string> lines;
+    std::ifstream in(path);
+    for (std::string l; std::getline(in, l);) lines.push_back(l);
+    return lines;
+}
+
+// Spell a candidate file out as the text fixture would: the canonical k-mer at
+// each recorded position of the reference, with the position and contig.
+static std::vector<std::string> candidateLines(const std::string& candPath) {
+    CandidateSet cand;
+    bool ok = readCandidates(candPath, cand);
+    assert(ok);
+    std::vector<std::string> contigs;
+    scanFasta(cand.refPath, [&](const std::string&, std::string& seq) { contigs.push_back(std::move(seq)); });
+    assert(contigs.size() == cand.runs.size());
+    std::vector<std::string> lines;
+    for (size_t r = 0; r < cand.runs.size(); r++) {
+        assert(contigs[r].size() == cand.runs[r].seqLen);
+        for (uint32_t p : cand.runs[r].pos)
+            lines.push_back(get_canonical(contigs[r].substr(p, cand.k)) + "\t" + std::to_string(p) +
+                            "\t" + cand.runs[r].name);
+    }
+    return lines;
+}
+
+// The reverse: a binary candidate file from a text fixture, for the reference
+// the fixture describes.
+static void candidatesFromText(const std::string& textPath, const std::string& refPath,
+                               const std::string& candPath, unsigned k) {
+    std::map<std::string, std::vector<uint32_t>> posByContig;
+    for (const std::string& l : fileLines(textPath)) {
+        std::istringstream ls(l);
+        std::string seq, contig; uint32_t pos;
+        ls >> seq >> pos >> contig;
+        posByContig[contig].push_back(pos);
+    }
+    CandidateWriter w(candPath, k, refPath);
+    scanFasta(refPath, [&](const std::string& header, const std::string& seq) {
+        w.beginContig(header, seq.size());
+        for (uint32_t p : posByContig[header]) w.add(p);
+        w.endContig();
+    });
+    assert(w.good());
+}
 
 void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
                            const std::vector<std::string>& refFiles) {
@@ -24,10 +78,44 @@ void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     identifyUniqKmers(cfg, refFiles, dbFilter);
 
-    assert(compareFiles("ref_test_1.tsv", "expected_ref_test_1.tsv") == true);
-    assert(compareFiles("ref_test_2.tsv", "expected_ref_test_2.tsv") == true);
+    assert(candidateLines("ref_test_1.cand") == fileLines("expected_ref_test_1.tsv"));
+    assert(candidateLines("ref_test_2.cand") == fileLines("expected_ref_test_2.tsv"));
+    // The stat file names the candidate files with their counts.
+    std::vector<std::string> stat = fileLines(cfg.refstat);
+    assert(stat.size() == 2);
+    assert(stat[0] == "./ref_test_1.cand\t3\t0" && stat[1] == "./ref_test_2.cand\t3\t1");
 
     std::cerr << "PASSED: Test identifyUniqKmers\n";
+}
+
+// Candidate files round-trip, including a contig with no candidates and one
+// long enough to cross the writer's buffer boundary.
+void testCandidateFile() {
+    std::cerr << "START: Test candidate file round trip... \t";
+    const std::string path = "cand_roundtrip.cand";
+    {
+        CandidateWriter w(path, 21, "some/ref.fa");
+        w.beginContig("chr1_first_contig", 500000); for (uint32_t p = 0; p < 20000; p++) w.add(p * 7); w.endContig();
+        w.beginContig("chr2", 12); w.endContig();
+        w.beginContig("plasmid", 99999); w.add(5); w.add(6); w.endContig();
+        assert(w.good());
+    }
+    CandidateSet c;
+    bool ok = readCandidates(path, c);
+    assert(ok);
+    assert(c.k == 21 && c.refPath == "some/ref.fa" && c.total == 20002);
+    assert(c.runs.size() == 3);
+    assert(c.runs[0].name == "chr1_first_contig" && c.runs[0].seqLen == 500000 && c.runs[0].pos.size() == 20000);
+    assert(c.runs[0].pos[19999] == 19999 * 7);
+    assert(c.runs[1].name == "chr2" && c.runs[1].pos.empty());
+    assert(c.runs[2].pos == std::vector<uint32_t>({5, 6}));
+    // Not a candidate file: refused, not misread.
+    { std::ofstream junk("cand_junk.cand"); junk << "AGGCTACAAA\t1\t0\n"; }
+    CandidateSet j;
+    bool junkOk = readCandidates("cand_junk.cand", j);
+    assert(!junkOk);
+    std::remove(path.c_str()); std::remove("cand_junk.cand");
+    std::cerr << "PASSED: Test candidate file round trip\n";
 }
 
 void testBuildSketch(const UniqSketchConfig& cfg) {
@@ -39,6 +127,8 @@ void testBuildSketch(const UniqSketchConfig& cfg) {
     ref_test_2: {AGGCTACAAC, CTCAGCTAAG}
     Total sketch: 4 unique kmers
     */
+    candidatesFromText("expected_ref_test_1.tsv", "ref_test_1.fa", "expected_ref_test_1.cand", cfg.kmerLen);
+    candidatesFromText("expected_ref_test_2.tsv", "ref_test_2.fa", "expected_ref_test_2.cand", cfg.kmerLen);
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     buildSketch(cfg, "expected_db_uniq_count.tsv", dbFilter);
     assert(compareFiles(cfg.outfile, "expected_out_uniqsketch.txt") == true);
@@ -215,6 +305,7 @@ int main() {
     std::vector<std::string> refFiles = {"ref_test_1.fa", "ref_test_2.fa"};
 
     testIdentifyUniqKmers(cfg, refFiles);
+    testCandidateFile();
     testBuildSketch(cfg);
     testLowComplexity();
     testHasLongHomopolymer();

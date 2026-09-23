@@ -117,22 +117,6 @@ inline std::vector<SignatureGroup> signatureGroups(const std::vector<TreeNode>& 
     return out;
 }
 
-/** Apply fn(seq) to every record sequence of a FASTA file. */
-template <typename Fn>
-inline void forEachFastaSequence(const std::string& fPath, Fn fn) {
-    std::ifstream in(fPath);
-    std::string line, seq;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line[0] == '>') {
-            if (!seq.empty()) fn(seq);
-            seq.clear();
-        } else {
-            seq += line;
-        }
-    }
-    if (!seq.empty()) fn(seq);
-}
-
 /**
  * Fill in the carriers of every signature: each genome of the index other than
  * the signature's own leaf that contains the k-mer. One pass over each genome,
@@ -151,7 +135,7 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
     #pragma omp parallel for schedule(dynamic)
     for (unsigned g = 0; g < refFiles.size(); g++) {
         std::vector<bool> mark(sigs.size(), false);
-        forEachFastaSequence(refFiles[g], [&](const std::string& seq) {
+        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq) {
             if (seq.size() < cfg.kmerLen) return;
             ntHashIterator itr(seq, 1, cfg.kmerLen);
             while (itr != itr.end()) {
@@ -306,7 +290,7 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
             std::ofstream stat(gcfg[gi].refstat);
             const auto& dl = groups[gi].directLeaves;
             for (size_t i = 0; i < dl.size(); i++)
-                stat << gcfg[gi].outdir << "/" << getBaseId(refFiles[dl[i]]) << ".tsv\t"
+                stat << candidatePath(gcfg[gi].outdir, refFiles[dl[i]]) << "\t"
                      << candCount[gi][i] << "\t" << dl[i] << "\n";
         }
         batchStart = batchEnd;
@@ -335,7 +319,7 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
     #pragma omp parallel for schedule(dynamic) reduction(+:totalSelected)
     for (size_t j = 0; j < selectJobs.size(); j++) {
         const SelectJob& sj = selectJobs[j];
-        std::string candPath = gcfg[sj.group].outdir + "/" + getBaseId(refFiles[sj.leaf]) + ".tsv";
+        std::string candPath = candidatePath(gcfg[sj.group].outdir, refFiles[sj.leaf]);
         totalSelected += getUniqSet(cfg, candPath, sj.leaf, *pick[sj.group], picked[j], universeDbf).selected;
     }
 

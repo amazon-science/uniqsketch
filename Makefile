@@ -62,7 +62,7 @@ test_clean:
 	rm uniqsketchtest \
 	querysketchtest \
 	bloomfiltertest \
-	ref_test_1.tsv \
-	ref_test_2.tsv \
+	ref_test_1.cand expected_ref_test_1.cand \
+	ref_test_2.cand expected_ref_test_2.cand \
 	test_out_uniqsketch.txt \
 	out_querysketch.tsv

@@ -16,8 +16,10 @@
 
 # Test-generated outputs (the expected_* fixtures are tracked)
 /test/db_uniq_count.tsv
-/test/ref_test_1.tsv
-/test/ref_test_2.tsv
+/test/ref_test_1.cand
+/test/expected_ref_test_1.cand
+/test/ref_test_2.cand
+/test/expected_ref_test_2.cand
 /test/out_querysketch*.tsv
 /test/log_out_querysketch*.tsv
 /test/logread_out_querysketch*.tsv
