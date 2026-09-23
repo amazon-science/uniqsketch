@@ -385,26 +385,26 @@ struct SketchStat {
  * drop an otherwise-good signature but never keeps an unsafe one. ntHash is
  * canonical, so probing a mutated neighbor is reverse-complement-correct.
  *
+ * The k-mer is hashed once; each of the 3k neighbors' hashes is then derived
+ * from it in O(1) with NTMC64sub (ntHash is an XOR of per-base terms), so a
+ * candidate costs one O(k) hash plus 3k Bloom probes instead of 3k O(k) hashes.
+ *
  * @param sig  Candidate signature (length cfg.kmerLen).
  * @param dbFilter  Distinct Bloom filter over all universe k-mers.
  * @return True if no Hamming-1 neighbor is present in the universe.
  */
 bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomFilter& dbFilter) {
     static const char BASES[4] = {'A', 'C', 'G', 'T'};
-    std::string neighbor = sig;
+    uint64_t fhVal = 0, rhVal = 0;
+    NTC64(sig.c_str(), cfg.kmerLen, fhVal, rhVal);
     uint64_t hVal[cfg.nhash1];
-    for (size_t i = 0; i < neighbor.size(); ++i) {
-        const char orig = neighbor[i];
+    for (unsigned i = 0; i < cfg.kmerLen; ++i) {
+        const char orig = sig[i];
         for (char b : BASES) {
             if (b == orig) continue;
-            neighbor[i] = b;
-            NTMC64(neighbor.c_str(), cfg.kmerLen, cfg.nhash1, hVal);
-            if (dbFilter.contains(hVal)) {
-                neighbor[i] = orig;
-                return false;
-            }
+            NTMC64sub(fhVal, rhVal, i, orig, b, cfg.kmerLen, cfg.nhash1, hVal);
+            if (dbFilter.contains(hVal)) return false;
         }
-        neighbor[i] = orig;
     }
     return true;
 }

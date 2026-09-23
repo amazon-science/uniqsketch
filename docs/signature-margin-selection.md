@@ -1,6 +1,9 @@
 # Margin-based signature selection (Hamming-distance hardening against read errors)
 
-**Status:** Design note / proposal (candidate for v2.0). Not yet implemented.
+**Status:** Design note. Method A shipped in 1.5.0 as `--min-margin=2`
+(`isTwoSafe`, `UniqSketchUtil.hpp`; `dbFilter` is passed to the selection stage),
+`--strict-margin` in 1.6.0, and the O(1) substitution update below in 2.0
+(`NTMC64sub`, `vendor/nthash.hpp`). Method B is not implemented.
 
 ## Motivation
 

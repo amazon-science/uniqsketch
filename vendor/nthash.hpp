@@ -369,6 +369,38 @@ inline void NTMC64(const char* kmerSeq, const unsigned k, const unsigned m, uint
     }
 }
 
+// Single-base substitution without rehashing. ntHash is an XOR of per-base
+// terms: in NTF64 base c at position i (0-based) contributes srol^(k-1-i) of
+// its seed, and in NTR64 the complement's seed rotated i times; msTab31l /
+// msTab33r hold exactly those rotated seeds (the sliding functions use them to
+// remove the outgoing base). Changing one base is therefore two XORs per strand.
+
+// forward-strand term of base c at position i of a k-mer
+inline uint64_t NTF64base(const unsigned char c, const unsigned i, const unsigned k) {
+    const unsigned s = k - 1 - i;
+    return msTab31l[c][s%31] | msTab33r[c][s%33];
+}
+
+// reverse-strand term of base c at position i of a k-mer
+inline uint64_t NTR64base(const unsigned char c, const unsigned i) {
+    return msTab31l[c&cpOff][i%31] | msTab33r[c&cpOff][i%33];
+}
+
+// canonical multihash of the k-mer with position i changed from charOut to
+// charIn, given the strand hashes fhVal/rhVal of the unchanged k-mer (from
+// NTC64(kmerSeq, k, fhVal, rhVal)); same values as NTMC64 on the mutated string
+inline void NTMC64sub(const uint64_t fhVal, const uint64_t rhVal, const unsigned i,
+                      const unsigned char charOut, const unsigned char charIn,
+                      const unsigned k, const unsigned m, uint64_t* hVal) {
+    uint64_t f = fhVal ^ NTF64base(charOut, i, k) ^ NTF64base(charIn, i, k);
+    uint64_t r = rhVal ^ NTR64base(charOut, i) ^ NTR64base(charIn, i);
+    uint64_t bVal = r + f;
+    hVal[0] = bVal;
+    for(unsigned j=1; j<m; j++) {
+        hVal[j] = NTE64(bVal, k, j);
+    }
+}
+
 // canonical multihash ntHash
 inline void NTMC64(const char* kmerSeq, const unsigned k, const unsigned m, uint64_t& fhVal, uint64_t& rhVal, uint64_t* hVal) {
     uint64_t bVal=0, tVal=0;

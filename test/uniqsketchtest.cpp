@@ -124,6 +124,81 @@ void testGetBaseId() {
     std::cerr << "PASSED: Test getBaseId\n";
 }
 
+// NTMC64sub must reproduce NTMC64 bit for bit on every single-base substitution.
+// isTwoSafe relies on that to test a candidate's 3k neighbours without
+// rehashing, so an error here would change which signatures are selected.
+// Exercised across k values with different remainders mod 31 and 33 (the
+// rotation tables are indexed by those), at every position and for every
+// base, including a no-op substitution, lowercase bases and N.
+void testSubstitutionHash() {
+    std::cerr << "START: Test NTMC64sub matches NTMC64... \t";
+    const unsigned m = 5;
+    const char* alphabet = "ACGTACGTACGTACGTacgtN";   // mostly upper case
+    uint64_t x = 20260923;
+    auto next = [&x]() { x = x * 6364136223846793005ULL + 1442695040888963407ULL; return x >> 33; };
+    size_t checked = 0;
+    for (unsigned k : {21u, 31u, 33u, 62u, 64u, 81u, 100u}) {
+        for (int rep = 0; rep < 40; rep++) {
+            std::string s(k, 'A');
+            for (unsigned i = 0; i < k; i++) s[i] = alphabet[next() % 21];
+            uint64_t fh = 0, rh = 0;
+            NTC64(s.c_str(), k, fh, rh);
+            uint64_t expect[m], got[m];
+            for (unsigned i = 0; i < k; i++) {
+                for (char b : {'A', 'C', 'G', 'T', 'N', 'a'}) {
+                    std::string t = s;
+                    t[i] = b;
+                    NTMC64(t.c_str(), k, m, expect);
+                    NTMC64sub(fh, rh, i, s[i], b, k, m, got);
+                    for (unsigned j = 0; j < m; j++) assert(got[j] == expect[j]);
+                    ++checked;
+                }
+            }
+        }
+    }
+    std::cerr << "PASSED: Test NTMC64sub matches NTMC64 (" << checked << " substitutions)\n";
+}
+
+// isTwoSafe against a brute-force definition on a small universe: a candidate
+// is 2-safe iff none of its Hamming-1 neighbours is in the universe. The
+// filter is sized so that false positives cannot occur at this scale.
+void testIsTwoSafe() {
+    std::cerr << "START: Test isTwoSafe... \t";
+    UniqSketchConfig cfg;
+    cfg.kmerLen = 31;
+    cfg.dbfSize = 100000;
+    BloomFilter dbf(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+
+    uint64_t x = 777;
+    auto next = [&x]() { x = x * 6364136223846793005ULL + 1442695040888963407ULL; return x >> 33; };
+    auto randKmer = [&]() { std::string s(cfg.kmerLen, 'A'); for (auto& c : s) c = "ACGT"[next() % 4]; return s; };
+
+    // Universe: 200 random k-mers plus, for 50 further candidates, exactly one
+    // Hamming-1 neighbour each (at a random position, random other base).
+    std::vector<std::string> safe, unsafe;
+    for (int i = 0; i < 200; i++) { std::string u = randKmer(); dbf.insert(u.c_str()); safe.push_back(u); }
+    for (int i = 0; i < 50; i++) {
+        std::string c = randKmer(), n = c;
+        unsigned pos = next() % cfg.kmerLen;
+        char b; do { b = "ACGT"[next() % 4]; } while (b == c[pos]);
+        n[pos] = b;
+        dbf.insert(n.c_str());
+        unsafe.push_back(c);
+    }
+    // A universe k-mer's own presence is not a neighbour; a random 31-mer has
+    // no neighbour in a 250-k-mer universe, so the first set is 2-safe ...
+    for (const std::string& s : safe) assert(isTwoSafe(cfg, s, dbf));
+    // ... and every candidate with a planted neighbour is not.
+    for (const std::string& s : unsafe) assert(!isTwoSafe(cfg, s, dbf));
+    // Reverse complement of a planted neighbour is the same k-mer to ntHash.
+    for (const std::string& s : unsafe) {
+        std::string rc(s.rbegin(), s.rend());
+        for (auto& c : rc) c = (c == 'A') ? 'T' : (c == 'T') ? 'A' : (c == 'C') ? 'G' : 'C';
+        assert(!isTwoSafe(cfg, rc, dbf));
+    }
+    std::cerr << "PASSED: Test isTwoSafe\n";
+}
+
 int main() {
     // Shared fixture for the two-reference, k=10 index tests. m1/m2 are now
     // derived (bits * size) rather than set by hand.
@@ -145,6 +220,8 @@ int main() {
     testHasLongHomopolymer();
     testGetCanonical();
     testGetBaseId();
+    testSubstitutionHash();
+    testIsTwoSafe();
 
     std::cerr << "UniqSketch: All tests PASSED!\n\n";
     return 0;
