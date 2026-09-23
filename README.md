@@ -202,7 +202,7 @@ together:
 ### uniqsketch
 ```
 Usage: uniqsketch [OPTION] @LIST_FILES (or FILES)
-Creates unique sketch from a list of fasta reference files.
+Creates unique sketch from a list of fasta reference files (plain or gzip).
 A list of files containing file names in each row can be passed with @ prefix.
 
  Options:
@@ -602,6 +602,15 @@ reference set does not contain enough distinct k-mers to size the Bloom filters.
 usual cause is reads shorter than `k`: with the default k=81, 75 bp reads yield no
 k-mers at all. Check your read length and, if it is short, rebuild the index with a
 smaller `-k`. Near-empty or truncated input files produce the same error.
+
+**`Warning: <file>: no k-mers of length 81 ...` or `... no unique k-mers ...`
+during a build.** The first means the file yielded nothing to index: it is empty,
+not FASTA, or every sequence in it is shorter than `k`. The second means every
+k-mer of that reference also occurs in another reference, which is what a
+duplicate genome under two names looks like. In both cases the reference gets no
+signatures and can never be reported; fix the input or drop the file. Two
+references whose file names differ only in directory or extension (`a/x.fa` and
+`b/x.fa`) are refused outright, because the reference is named by its base name.
 
 **No references reported (output has only the header).** Nothing cleared the
 reporting thresholds. Confirm the sample really should contain something in your

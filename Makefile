@@ -26,7 +26,7 @@ comparesketch:$(comparesketch_SOURCES)
 	$(CXX) $(OPTFLAGS) $(CPPFLAGS) $(INCLUDEPATH) -o bin/$@ $^ $(LIBPATH)
 
 uniqsketchtest: test/uniqsketchtest.cpp
-	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
 
 querysketchtest: test/querysketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)

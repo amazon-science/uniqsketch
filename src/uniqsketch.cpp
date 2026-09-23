@@ -25,7 +25,7 @@ static const char VERSION_MESSAGE[] =
 
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTION] @LIST_FILES (or FILES)\n"
-    "Creates unique sketch from a list of fasta reference files.\n"
+    "Creates unique sketch from a list of fasta reference files (plain or gzip).\n"
     "A list of files containing file names in each row can be passed with @ prefix.\n"
     "\n"
     " Options:\n"
@@ -216,6 +216,23 @@ int main(int argc, char** argv) {
 
     if (!validateFiles(refFiles, "reference file")) {
         exit(EXIT_FAILURE);
+    }
+
+    // A reference is named by its file's base name, in the sketch and in the
+    // candidate file it gets under -f. Two references with the same base name
+    // would overwrite each other's candidates and be one name in every output.
+    {
+        std::unordered_map<std::string, std::string> byName;
+        bool clash = false;
+        for (const std::string& f : refFiles) {
+            auto [it, fresh] = byName.emplace(getBaseId(f), f);
+            if (!fresh) {
+                std::cerr << "Error: reference files " << it->second << " and " << f
+                          << " have the same name (" << it->first << ")\n";
+                clash = true;
+            }
+        }
+        if (clash) exit(EXIT_FAILURE);
     }
 
     mkdir(cfg.outdir.c_str(), 0777);

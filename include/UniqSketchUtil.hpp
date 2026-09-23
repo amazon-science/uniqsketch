@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "SequenceUtil.hpp"
+#include "FileUtil.hpp"
 #include "BloomFilter.hpp"
 #include "ntHashIterator.hpp"
 
@@ -86,17 +87,17 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  */
 template <typename Fn>
 inline void scanFasta(const std::string& fPath, Fn fn) {
-    std::ifstream refFile(fPath);
+    GzLineReader refFile(fPath);          // plain or gzip
     std::string line;
-    bool good = static_cast<bool>(std::getline(refFile, line));
+    bool good = refFile.getline(line);
     std::string header = line.empty() ? std::string() : line.substr(1);
     std::replace(header.begin(), header.end(), ' ', '_');
     while (good) {
         std::string faSeq;
-        good = static_cast<bool>(std::getline(refFile, line));
+        good = refFile.getline(line);
         while (good && line[0] != '>') {
             faSeq += line;
-            good = static_cast<bool>(std::getline(refFile, line));
+            good = refFile.getline(line);
         }
         fn(header, faSeq);
         if (line.size() > 1) {
@@ -273,11 +274,12 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
               const BloomFilter& sbFilter, std::vector<int>& refCount) {
     const std::string candPath = candidatePath(cfg.outdir, fPath);
     CandidateWriter cand(candPath, cfg.kmerLen, fPath);
-    size_t countUnique = 0;
+    size_t countUnique = 0, countAll = 0;
     scanFasta(fPath, [&](const std::string& header, const std::string& faSeq) {
         cand.beginContig(header, faSeq.size());
         ntHashIterator itr(faSeq, cfg.nhash2, cfg.kmerLen);
         while (itr != itr.end()) {
+            ++countAll;
             if (!sbFilter.contains(*itr)) {
                 ++countUnique;
                 cand.add(static_cast<uint32_t>(itr.get_pos()));
@@ -286,7 +288,20 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
         }
         cand.endContig();
     });
-    if (!cand.good()) std::cerr << "Error: could not write " << candPath << "\n";
+    // A reference that contributes nothing is almost always an input problem
+    // (not FASTA, empty, sequences shorter than k) or a duplicate of another
+    // reference. Either way it gets no signatures and cannot be detected, which
+    // used to pass in silence. One message each, built first: this runs inside
+    // a parallel loop.
+    if (!cand.good()) {
+        std::cerr << "Error: could not write " + candPath + "\n";
+    } else if (countAll == 0) {
+        std::cerr << "Warning: " + fPath + ": no k-mers of length " + std::to_string(cfg.kmerLen) +
+                     " (empty, not FASTA, or every sequence shorter than k); it will get no signatures\n";
+    } else if (countUnique == 0) {
+        std::cerr << "Warning: " + fPath + ": no unique k-mers (identical to another reference?); "
+                     "it will get no signatures\n";
+    }
     refCount[refId] = static_cast<int>(countUnique);
 }
 
@@ -353,10 +368,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
         return;
     }
     size_t bases = 0;
-    for (const auto& f : files) {
-        std::ifstream in(f, std::ios::binary | std::ios::ate);
-        if (in) bases += static_cast<size_t>(in.tellg());
-    }
+    for (const auto& f : files) bases += uncompressedSize(f);
     if (bases == 0) bases = 1;
     BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
     for (const auto& fPath : files) {

@@ -123,6 +123,16 @@ static inline std::string getBaseId(const std::string& fPath) {
     std::string fName = (posPath == std::string::npos)
                         ? fPath
                         : fPath.substr(posPath + 1);
+    // A compression suffix is not the extension: x.fa.gz names the same
+    // reference as x.fa.
+    for (const char* z : {".gz", ".bgz"}) {
+        std::string suffix(z);
+        if (fName.size() > suffix.size() &&
+            fName.compare(fName.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            fName.erase(fName.size() - suffix.size());
+            break;
+        }
+    }
     size_t posFile = fName.rfind('.');
     if (posFile == std::string::npos) {
         return fName;

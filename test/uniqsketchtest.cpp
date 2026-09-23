@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <cassert>
+#include <zlib.h>
 
 #include "SequenceUtil.hpp"
 #include "TestUtil.hpp"
@@ -86,6 +87,81 @@ void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
     assert(stat[0] == "./ref_test_1.cand\t3\t0" && stat[1] == "./ref_test_2.cand\t3\t1");
 
     std::cerr << "PASSED: Test identifyUniqKmers\n";
+}
+
+// Write `content` to `path` gzip-compressed.
+static void writeGzip(const std::string& path, const std::string& content) {
+    gzFile g = gzopen(path.c_str(), "wb");
+    assert(g);
+    int n = gzwrite(g, content.data(), static_cast<unsigned>(content.size()));
+    assert(n == static_cast<int>(content.size()));
+    gzclose(g);
+}
+
+static std::string slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// GzLineReader has std::getline's contract on plain and gzip files alike:
+// empty lines are lines, the last line needs no newline, a trailing newline
+// does not make an extra empty line, and a line longer than the read buffer
+// comes back whole.
+void testGzLineReader() {
+    std::cerr << "START: Test GzLineReader... \t";
+    std::string longLine(200000, 'A');
+    std::string content = "first\n\nthird\r\n" + longLine + "\nlast";
+    { std::ofstream o("gzline_plain.txt", std::ios::binary); o << content; }
+    writeGzip("gzline.txt.gz", content);
+    std::vector<std::string> expect = {"first", "", "third\r", longLine, "last"};
+    for (const char* p : {"gzline_plain.txt", "gzline.txt.gz"}) {
+        GzLineReader r(p);
+        assert(r);
+        std::vector<std::string> got;
+        for (std::string l; r.getline(l);) got.push_back(l);
+        assert(got == expect);
+        std::string scratch;
+        assert(!r.getline(scratch));             // stays at end
+    }
+    { std::ofstream o("gzline_nl.txt"); o << "a\nb\n"; }
+    {
+        GzLineReader r("gzline_nl.txt");
+        std::vector<std::string> got;
+        for (std::string l; r.getline(l);) got.push_back(l);
+        assert(got == std::vector<std::string>({"a", "b"}));
+    }
+    GzLineReader missing("gzline_missing.txt");
+    assert(!missing);
+    std::string l;
+    assert(!missing.getline(l));
+
+    // uncompressedSize: the plain size, or the gzip trailer's.
+    assert(uncompressedSize("gzline_plain.txt") == content.size());
+    assert(uncompressedSize("gzline.txt.gz") == content.size());
+    assert(uncompressedSize("gzline_missing.txt") == 0);
+
+    for (const char* f : {"gzline_plain.txt", "gzline.txt.gz", "gzline_nl.txt"}) std::remove(f);
+    std::cerr << "PASSED: Test GzLineReader\n";
+}
+
+// A gzipped reference is scanned like the plain one: same candidates, same
+// name, same count in the stat file. Before this was true the gzipped genome
+// silently got no candidates and the others' pools were inflated by everything
+// they shared with it.
+void testGzipReference(UniqSketchConfig cfg) {
+    std::cerr << "START: Test gzipped reference... \t";
+    writeGzip("ref_test_2.fa.gz", slurp("ref_test_2.fa"));
+    cfg.refstat = "db_uniq_count_gz.tsv";
+    std::vector<std::string> refs = {"ref_test_1.fa", "ref_test_2.fa.gz"};
+    BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+    identifyUniqKmers(cfg, refs, dbFilter);
+    assert(candidateLines("ref_test_1.cand") == fileLines("expected_ref_test_1.tsv"));
+    assert(candidateLines("ref_test_2.cand") == fileLines("expected_ref_test_2.tsv"));   // named ref_test_2, not ref_test_2.fa
+    std::vector<std::string> stat = fileLines(cfg.refstat);
+    assert(stat.size() == 2 && stat[1] == "./ref_test_2.cand\t3\t1");
+    std::remove("ref_test_2.fa.gz");
+    std::remove(cfg.refstat.c_str());
+    std::cerr << "PASSED: Test gzipped reference\n";
 }
 
 // Candidate files round-trip, including a contig with no candidates and one
@@ -210,6 +286,11 @@ void testGetBaseId() {
     // No extension
     assert(getBaseId("refonly") == "refonly");
     assert(getBaseId("/path/to/refonly") == "refonly");
+    // A compression suffix is not the extension
+    assert(getBaseId("ref.fa.gz") == "ref");
+    assert(getBaseId("/path/to/genome.fna.gz") == "genome");
+    assert(getBaseId("ref.fa.bgz") == "ref");
+    assert(getBaseId("ref.gz") == "ref");
 
     std::cerr << "PASSED: Test getBaseId\n";
 }
@@ -305,6 +386,8 @@ int main() {
     std::vector<std::string> refFiles = {"ref_test_1.fa", "ref_test_2.fa"};
 
     testIdentifyUniqKmers(cfg, refFiles);
+    testGzLineReader();
+    testGzipReference(cfg);
     testCandidateFile();
     testBuildSketch(cfg);
     testLowComplexity();
