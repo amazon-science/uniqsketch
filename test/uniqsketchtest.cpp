@@ -89,6 +89,61 @@ void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
     std::cerr << "PASSED: Test identifyUniqKmers\n";
 }
 
+// A k-mer that occurs twice inside the representative is not a group signature.
+//
+// loadBFfa marks such a k-mer solid on its second sighting, so a leaf never gets
+// one. loadBFfaGroup counts each k-mer once per group, which is what makes a
+// k-mer shared by every member the best kind of group signature, but left at
+// that the second copy inside a single genome never reaches the solid filter
+// either. Multi-copy k-mers sit in mobile elements, so they are the sequence
+// most likely to be present in organisms outside the index entirely: a two-copy
+// erm(B) in one representative turned ~250 reads of a human gut metagenome,
+// which held no Escherichia at all, into a family call.
+//
+// One k-mer per contig keeps the fixture unambiguous.
+void testGroupRepeatExclusion(UniqSketchConfig cfg) {
+    std::cerr << "START: Test group repeat exclusion... \t";
+    const std::string dup     = "ACGTACGTAC";   // twice in the representative
+    const std::string shared  = "TTGGTTGGTT";   // once in the representative, once in the member
+    const std::string solo    = "AAACCCGGGT";   // once, representative only
+    const std::string memOnly = "GGGTTTAAAC";   // once, member only
+    {
+        std::ofstream rep("group_rep.fa");
+        rep << ">dup_a\n" << dup << "\n>dup_b\n" << dup << "\n"
+            << ">shared\n" << shared << "\n>solo\n" << solo << "\n";
+        std::ofstream mem("group_mem.fa");
+        mem << ">shared\n" << shared << "\n>mem_only\n" << memOnly << "\n";
+    }
+    // Sized well clear of a solid-filter false positive, which would show up
+    // here as a missing signature rather than a surviving repeat.
+    cfg.dbfSize = 64;
+    cfg.sbfSize = 64;
+    cfg.refstat = "db_uniq_count_group.tsv";
+    std::vector<std::vector<std::string>> groups = {{"group_rep.fa", "group_mem.fa"}};
+    BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+    identifyGroupUniqKmers(cfg, groups, dbFilter);
+
+    std::vector<std::string> seqs;
+    for (const std::string& l : candidateLines("group_rep.cand"))
+        seqs.push_back(l.substr(0, l.find('\t')));
+    auto has = [&](const std::string& kmer) {
+        return std::find(seqs.begin(), seqs.end(), get_canonical(kmer)) != seqs.end();
+    };
+    assert(!has(dup));      // the regression: neither copy may become a candidate
+    assert(has(shared));    // a k-mer the whole group carries is still a signature
+    assert(has(solo));
+    assert(seqs.size() == 2);
+    // Only the representative is scanned for candidates.
+    std::vector<std::string> stat = fileLines(cfg.refstat);
+    assert(stat.size() == 1 && stat[0] == "./group_rep.cand\t2\t0");
+
+    std::remove("group_rep.fa");
+    std::remove("group_mem.fa");
+    std::remove("group_rep.cand");
+    std::remove(cfg.refstat.c_str());
+    std::cerr << "PASSED: Test group repeat exclusion\n";
+}
+
 // Write `content` to `path` gzip-compressed.
 static void writeGzip(const std::string& path, const std::string& content) {
     gzFile g = gzopen(path.c_str(), "wb");
@@ -386,6 +441,7 @@ int main() {
     std::vector<std::string> refFiles = {"ref_test_1.fa", "ref_test_2.fa"};
 
     testIdentifyUniqKmers(cfg, refFiles);
+    testGroupRepeatExclusion(cfg);
     testGzLineReader();
     testGzipReference(cfg);
     testCandidateFile();

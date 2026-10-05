@@ -360,6 +360,22 @@ void identifyUniqKmers(const UniqSketchConfig& cfg, const std::vector<std::strin
  * false-positive rate ~2e-6) because a false positive here is not conservative:
  * it drops the group's only insertion of a k-mer, so a k-mer this group shares
  * with one other group is counted once and handed to that group as a signature.
+ *
+ * Counting once per group must not also hide a k-mer that occurs twice inside a
+ * single genome. loadBFfa marks such a k-mer solid on its second sighting and a
+ * leaf therefore never gets one as a signature; left to the seen filter alone
+ * the second sighting never reaches the solid filter and the repeat survives as
+ * a group signature. Multi-copy k-mers sit in mobile elements, so they are the
+ * sequence most likely to be present in organisms outside the index entirely: a
+ * two-copy erm(B) in one representative took ~250 reads of a human gut
+ * metagenome, from no Escherichia at all, and turned them into a family call.
+ * Candidates are drawn from the representative only (see identifyGroupUniqKmers
+ * and the checkRef call there), so the representative is the one genome whose
+ * internal multiplicity can reach a signature, and repSeen restores loadBFfa's
+ * rule for it. A false positive in repSeen costs a signature rather than
+ * admitting a bad one, the opposite of the seen filter's exposure. Marking the
+ * k-mer solid cannot harm another group: one present in two groups is already
+ * solid by way of the seen/distinct path above.
  */
 void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& files,
                    BloomFilter& dbFilter, BloomFilter& sbFilter) {
@@ -371,10 +387,16 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
     for (const auto& f : files) bases += uncompressedSize(f);
     if (bases == 0) bases = 1;
     BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
-    for (const auto& fPath : files) {
-        scanFasta(fPath, [&](const std::string&, const std::string& faSeq) {
+    BloomFilter repSeen(std::max<size_t>(uncompressedSize(files[0]), 1) * 64,
+                        cfg.nhash1, cfg.kmerLen);
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        const bool isRep = (fi == 0);
+        scanFasta(files[fi], [&](const std::string&, const std::string& faSeq) {
             ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
             while (itr != itr.end()) {
+                if (isRep && !repSeen.insert_make_change(*itr)) {
+                    sbFilter.insert(*itr);
+                }
                 if (seen.insert_make_change(*itr)) {
                     if (!dbFilter.insert_make_change(*itr)) {
                         sbFilter.insert(*itr);
@@ -391,11 +413,11 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
  *
  * Each group is a tree-level entry: its first file is the representative whose
  * k-mers are the candidates, the rest are the other members of the node (none
- * for a leaf standing for itself). A candidate is a k-mer of the representative
- * that occurs in no other group, members included (see loadBFfaGroup). Built
- * over the complete partition of the leaves at a level, this makes every
- * coarse-level signature unique against every genome in the index, not just
- * against the other representatives.
+ * for a leaf standing for itself). A candidate is a k-mer that occurs once in
+ * the representative and in no other group, members included (see
+ * loadBFfaGroup). Built over the complete partition of the leaves at a level,
+ * this makes every coarse-level signature unique against every genome in the
+ * index, not just against the other representatives.
  *
  * Output layout matches identifyUniqKmers: one candidate file per group named
  * after the representative, and a stat file buildSketch can consume.

@@ -313,11 +313,15 @@ the query narrows candidates from the coarsest level down to individual referenc
 
 At every level, each reference is represented by the cluster that spans that level
 on its path to the root, or by itself if it never clustered, so a level's sketch
-covers every reference in the index. A cluster's signatures are k-mers of its
-representative that occur in no genome outside the cluster (members of other
+covers every reference in the index. A cluster's signatures are k-mers that occur
+once in its representative and in no genome outside the cluster (members of other
 clusters included), which keeps a genome hidden inside one cluster from feeding
-another cluster's family call. Levels whose clustering is identical to the next
-finer level are not written; the query walks whatever level files exist.
+another cluster's family call. The single-copy requirement is the one the leaf
+level applies too: a k-mer repeated inside the representative sits in a mobile
+element, so it is liable to turn up in an organism missing from the index and
+collect that organism's reads for the cluster. Levels whose clustering is
+identical to the next finer level are not written; the query walks whatever level
+files exist.
 
 **Within-group signatures.** A tree build also writes `<outdir>/sketch_group.tsv`,
 a second signature set for the leaves (turn it off with `--no-group-signatures`).
