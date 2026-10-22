@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <cassert>
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include "BloomFilter.hpp"
+#include "BlockedBloomFilter.hpp"
 
 namespace opt {
 size_t size;
@@ -186,6 +188,60 @@ void testStoreLoad() {
     std::cerr << "PASSED: Test store/load\n";
 }
 
+// The blocked filter's own invariants, independent of which class BloomFilter
+// names. Block locality is the point of the design; exact sizing is what makes
+// it free in memory; recall must be perfect for either filter to be usable.
+void testBlockedLocalityAndSizing() {
+    std::cerr << "START: Test blocked filter locality, sizing, recall... \t";
+
+    // Exact sizing: a request is rounded up only to a whole 512-bit block.
+    BlockedBloomFilter f1(1000, 5, 32);
+    assert(f1.sizeBits() == 1024);
+    BlockedBloomFilter f2(512 * 1000, 5, 32);
+    assert(f2.sizeBits() == 512 * 1000);           // not 2^19
+
+    // Locality: every bit a k-mer sets lies in the one block its leading hash
+    // chose. Insert one k-mer into an empty filter and read the words back.
+    BlockedBloomFilter f(512 * 4096, 5, 32);
+    uint64_t h[5] = {0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull, 0x8CB92BA72F3D8DD7ull,
+                     0x5851F42D4C957F2Dull, 0x14057B7EF767814Full};
+    f.insert(h);
+    const uint64_t* w = reinterpret_cast<const uint64_t*>(f.getFilter());
+    size_t nonZeroWords = 0, firstBlock = SIZE_MAX, lastBlock = 0;
+    for (size_t i = 0; i < f.sizeBits() / 64; i++) {
+        if (w[i]) {
+            ++nonZeroWords;
+            firstBlock = std::min(firstBlock, i / BlockedBloomFilter::BLOCK_WORDS);
+            lastBlock = std::max(lastBlock, i / BlockedBloomFilter::BLOCK_WORDS);
+        }
+    }
+    assert(nonZeroWords >= 1 && nonZeroWords <= 5);
+    assert(firstBlock == lastBlock);                 // all set bits in one block
+    assert(f.get_pop() <= 5 && f.get_pop() >= 1);
+    assert(f.contains(h));
+
+    // Recall: everything inserted is found, at a realistic load.
+    BlockedBloomFilter g(static_cast<size_t>(100000) * 128, 5, 81);
+    uint64_t x[5];
+    uint64_t s = 42;
+    auto next = [&s]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    std::vector<uint64_t> saved;
+    for (int i = 0; i < 100000; i++) {
+        for (auto& v : x) v = next();
+        saved.insert(saved.end(), x, x + 5);
+        g.insert(x);
+    }
+    for (int i = 0; i < 100000; i++) assert(g.contains(&saved[5 * i]));
+
+    // insert_make_change contract on the blocked class specifically.
+    BlockedBloomFilter c(65536, 3, 32);
+    uint64_t a[] = {34987645632ull, 89ull, 37692833ull};
+    assert(c.insert_make_change(a) == true);
+    assert(c.insert_make_change(a) == false);
+
+    std::cerr << "PASSED: Test blocked filter locality, sizing, recall\n";
+}
+
 int main() {
     initialize();
     testInsertContain();
@@ -194,6 +250,7 @@ int main() {
     testEmptyFilter();
     testGetPop();
     testStoreLoad();
+    testBlockedLocalityAndSizing();
 
     std::cerr << "BloomFilter: All tests PASSED!\n\n";
     return 0;

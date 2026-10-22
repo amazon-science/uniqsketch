@@ -20,6 +20,16 @@
 
 #include "nthash.hpp"
 
+// The class below is the standard Bloom filter: one random cache line per hash.
+// Since 2.0 the name BloomFilter refers to the cache-line-blocked filter in
+// BlockedBloomFilter.hpp (one line per insert or hit; index builds 1.4-1.5x
+// faster on bacterial sets, identical sweep results; see CHANGELOG). The
+// standard class stays available as StandardBloomFilter, and
+// -DUNIQSKETCH_STANDARD_BF makes it the default again for comparison.
+#ifndef UNIQSKETCH_STANDARD_BF
+#define BloomFilter StandardBloomFilter
+#endif
+
 /**
  * Count the number of set bits in a byte.
  *
@@ -212,5 +222,13 @@ private:
     unsigned m_hashNum;
     unsigned m_kmerSize;
 };
+
+#ifndef UNIQSKETCH_STANDARD_BF
+#undef BloomFilter
+#include "BlockedBloomFilter.hpp"
+using BloomFilter = BlockedBloomFilter;
+#else
+using StandardBloomFilter = BloomFilter;
+#endif
 
 #endif // BLOOMFILTER_HPP_
