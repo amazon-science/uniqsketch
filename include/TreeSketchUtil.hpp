@@ -350,8 +350,26 @@ struct TreeBuildParams {
     unsigned maxHomopolymer = 0;
     bool groupSignatures = false; // within-group leaf signatures built (sketch_group.tsv)
     std::string thresholds;      // comma-separated, coarsest first
+    std::string bloomFilter;     // filter layout the index was built with (see bloomFilterName)
     bool loaded = false;         // false when the file is absent (pre-2.0 index)
 };
+
+/**
+ * Name of the Bloom filter layout this binary was compiled with. The blocked and
+ * standard filters draw different signatures from the same candidate pool (their
+ * false positives fall on different k-mers), so an index should be queried by a
+ * binary using the layout that built it. The build records this name and the
+ * query compares it; a mismatch is a warning, not an error, since the signatures
+ * in the sketch file are what they are and the query reads them verbatim. The
+ * only query-side filter is the --solid read filter, which is sample-local.
+ */
+inline const char* bloomFilterName() {
+#ifdef UNIQSKETCH_STANDARD_BF
+    return "standard";
+#else
+    return "blocked";
+#endif
+}
 
 inline std::string treeBuildParamsPath(const std::string& treeDir) {
     return treeDir + "/build_params.tsv";
@@ -365,7 +383,8 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "strict_margin\t" << (p.strictMargin ? 1 : 0) << "\n"
         << "max_homopolymer\t" << p.maxHomopolymer << "\n"
         << "group_signatures\t" << (p.groupSignatures ? 1 : 0) << "\n"
-        << "tree\t" << p.thresholds << "\n";
+        << "tree\t" << p.thresholds << "\n"
+        << "bloom_filter\t" << p.bloomFilter << "\n";
 }
 
 inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
@@ -385,6 +404,7 @@ inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
             else if (key == "max_homopolymer") p.maxHomopolymer = static_cast<unsigned>(std::stoul(val));
             else if (key == "group_signatures") p.groupSignatures = (val == "1");
             else if (key == "tree") p.thresholds = val;
+            else if (key == "bloom_filter") p.bloomFilter = val;
         } catch (const std::exception&) {
             // A malformed value leaves that field at its default; the record is
             // advisory, so this must never take the query down.

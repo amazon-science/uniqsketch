@@ -306,7 +306,7 @@ sketch: references are clustered at each threshold (sorted descending, so the fi
 is the coarsest level) into a nested tree. The tree is written to
 `<outdir>/tree_index.tsv`, a coarse sketch per level to
 `<outdir>/sketch_level_<L>.tsv`, the selection parameters (`k`, `-c`, margin,
-homopolymer filter, thresholds) to `<outdir>/build_params.tsv`, and the
+homopolymer filter, thresholds, Bloom filter layout) to `<outdir>/build_params.tsv`, and the
 full-resolution leaf sketch to `-o`. Query it with `querysketch --tree=DIR`
 (pointing at that output directory) together with `--ref` set to the leaf sketch;
 the query narrows candidates from the coarsest level down to individual references.

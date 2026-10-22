@@ -63,6 +63,7 @@ void testBuildParamsRoundTrip() {
     TreeBuildParams p;
     p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true;
     p.maxHomopolymer = 6; p.groupSignatures = true; p.thresholds = "10000,1000,100";
+    p.bloomFilter = bloomFilterName();
     writeTreeBuildParams(path, p);
     TreeBuildParams q = loadTreeBuildParams(path);
     assert(q.loaded);
@@ -70,12 +71,21 @@ void testBuildParamsRoundTrip() {
     assert(q.minMargin == 2 && q.strictMargin);
     assert(q.maxHomopolymer == 6 && q.thresholds == "10000,1000,100");
     assert(q.groupSignatures);
+    assert(q.bloomFilter == bloomFilterName());               // the layout that built it, named
+    assert(q.bloomFilter == "blocked" || q.bloomFilter == "standard");
     std::remove(path.c_str());
 
     TreeBuildParams missing = loadTreeBuildParams(path);
     assert(!missing.loaded);
+    assert(missing.bloomFilter.empty());                      // no layout recorded
     assert(missing.minMargin == 1 && !missing.strictMargin);  // pre-2.0 index: no margin assumed
     assert(!missing.groupSignatures);                         // and no within-group signatures
+    // A file from before the field existed loads with the field empty, so the
+    // query's mismatch check stays silent on older indexes.
+    { std::ofstream old(path); old << "kmer\t81\ncov\t500\nmin_margin\t2\nstrict_margin\t1\n"; }
+    TreeBuildParams older = loadTreeBuildParams(path);
+    assert(older.loaded && older.bloomFilter.empty());
+    std::remove(path.c_str());
     std::cerr << "PASSED: Test build params round trip\n";
 }
 

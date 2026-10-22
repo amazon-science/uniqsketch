@@ -103,8 +103,16 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     // abundance, often all the evidence a sample holds. Margin-1 signatures are
     // hit by single-error reads of any abundant relative, and there the cutoff
     // must stay. The index records which case applies; an explicit --rcutoff wins.
+    TreeBuildParams bp = loadTreeBuildParams(treeBuildParamsPath(treeDir));
+    // The two filter layouts select different signatures from the same pool, so
+    // an index is meant to be queried by a binary built with the layout that
+    // built it. The sketch is read verbatim either way; this is a warning only.
+    if (bp.loaded && !bp.bloomFilter.empty() && bp.bloomFilter != bloomFilterName()) {
+        std::cerr << "Tree query: index was built with the " << bp.bloomFilter
+                  << " Bloom filter, this binary uses the " << bloomFilterName()
+                  << "; results are valid but will not match an index built by this binary\n";
+    }
     if (!readCutoffGiven) {
-        TreeBuildParams bp = loadTreeBuildParams(treeBuildParamsPath(treeDir));
         if (bp.loaded && bp.minMargin >= 2 && bp.strictMargin) {
             cfg.readCutoff = 0;
             std::cerr << "Tree query: index built with --min-margin=2 --strict-margin; "

@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
         bp.strictMargin = cfg.strictMargin;
         bp.maxHomopolymer = cfg.maxHomopolymer;
         bp.groupSignatures = groupSignatures;
+        bp.bloomFilter = bloomFilterName();
         for (size_t i = 0; i < treeThresholds.size(); i++) {
             if (i) bp.thresholds += ",";
             bp.thresholds += std::to_string(treeThresholds[i]);
