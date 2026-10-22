@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use UniqSketch, please cite the paper and the archived software."
+type: software
+title: "UniqSketch: sensitive and resource-efficient strain-level detection in metagenomes"
+authors:
+  - family-names: Mohamadi
+    given-names: Hamid
+    affiliation: Amazon
+  - family-names: Turner
+    given-names: Keith H.
+    affiliation: Amazon
+  - family-names: Schmieder
+    given-names: Robert
+    affiliation: Amazon
+  - family-names: Hurwitz
+    given-names: Bonnie L.
+    affiliation: "Amazon; North Carolina State University"
+    orcid: "https://orcid.org/0000-0001-8699-957X"
+repository-code: "https://github.com/amazon-science/uniqsketch"
+license: MIT
+version: 1.6.1
+# Concept DOI of the Zenodo software record (covers v1.1.0, used for the paper's benchmarks, and every later release).
+doi: 10.5281/zenodo.23046441
+date-released: 2026-09-03
+keywords:
+  - metagenomics
+  - strain detection
+  - k-mer
+  - Bloom filter
+preferred-citation:
+  type: article
+  title: "UniqSketch: sensitive and resource-efficient strain-level detection in metagenomes"
+  authors:
+    - family-names: Mohamadi
+      given-names: Hamid
+    - family-names: Turner
+      given-names: Keith H.
+    - family-names: Schmieder
+      given-names: Robert
+    - family-names: Hurwitz
+      given-names: Bonnie L.
+  journal: Genome Biology
+  year: 2026
+  # doi: to be added at publication

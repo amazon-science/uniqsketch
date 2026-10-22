@@ -1,0 +1,19 @@
+{
+  "title": "UniqSketch: sensitive and resource-efficient strain-level detection in metagenomes",
+  "description": "UniqSketch identifies and quantifies target strains in shotgun metagenomes from unique k-mer signatures of a user-defined reference database, using compact Bloom filters. Source code archive of the GitHub repository amazon-science/uniqsketch.",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "creators": [
+    {"name": "Mohamadi, Hamid", "affiliation": "Amazon"},
+    {"name": "Turner, Keith H.", "affiliation": "Amazon"},
+    {"name": "Schmieder, Robert", "affiliation": "Amazon"},
+    {"name": "Hurwitz, Bonnie L.", "affiliation": "Amazon; North Carolina State University", "orcid": "0000-0001-8699-957X"}
+  ],
+  "keywords": ["metagenomics", "strain detection", "k-mer", "Bloom filter", "bioinformatics"],
+  "related_identifiers": [
+    {"identifier": "https://github.com/amazon-science/uniqsketch", "relation": "isSupplementTo", "scheme": "url"},
+    {"identifier": "10.5281/zenodo.19319588", "relation": "isSupplementedBy", "scheme": "doi"}
+  ],
+  "language": "eng"
+}

@@ -645,3 +645,21 @@ System requirements:
 * C++17 compiler (GCC 7+, Clang 5+)
 * zlib
 * OpenMP (optional, for multi-threading)
+
+## License
+
+UniqSketch is released under the [MIT License](LICENSE), an OSI-approved open-source
+license. The same license applies to the archived releases on Zenodo.
+
+## Citation
+
+If you use UniqSketch, please cite:
+
+> Mohamadi H, Turner KH, Schmieder R, Hurwitz BL. UniqSketch: sensitive and
+> resource-efficient strain-level detection in metagenomes. *Genome Biology* (2026,
+> in press).
+
+The source code is archived on Zenodo at
+[10.5281/zenodo.23046441](https://doi.org/10.5281/zenodo.23046441). That is the concept
+DOI, so it always resolves to the latest archived release; each release also has its own
+version DOI. A machine-readable citation is in [`CITATION.cff`](CITATION.cff).
