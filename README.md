@@ -597,7 +597,11 @@ since it removes the error-driven cross-hits that otherwise appear at the 0.01â€
 level whenever one relative is abundant.
 
 **`-t, --threads`.** Set this to your core count for both indexing and querying;
-both stages parallelize well. A query's floor is the reading of its input: each
+both stages parallelize well. An index is the same file for file whatever the
+thread count: the Bloom filter scans split the k-mers by hash so that every
+thread replays the serial order on its own slice (`GroupScanner` in
+`include/UniqSketchUtil.hpp`), and selection has no cross-thread state. A
+query's floor is the reading of its input: each
 read file is decompressed and parsed by one thread, about 5 s per 900 MB of
 FASTQ when gzipped and 3 s when plain, however many threads hash. Linking against
 [zlib-ng](https://github.com/zlib-ng/zlib-ng) in compat mode (or `LD_PRELOAD`ing

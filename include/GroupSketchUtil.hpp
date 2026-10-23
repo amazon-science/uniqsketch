@@ -182,12 +182,15 @@ inline void writeGroupSketch(const std::string& path, const std::vector<GroupSig
  * groups. Filter sizes come from ntCard one group at a time (it runs its own
  * parallel region over the group's files and sets the OpenMP thread count, so
  * it cannot be called from inside a parallel loop). Candidate identification is
- * the ordinary distinct/solid filter pass, but over one flat list of (group,
- * genome) jobs with every group's filters of a batch live at once, so a group
- * of two genomes does not leave the rest of the machine idle; a batch takes as
- * many groups as fit in the memory the main build's own filters already used,
- * so peak memory does not grow with the number of groups. Candidates are
- * written only for the direct leaves, the only ones selected from here.
+ * the ordinary distinct/solid filter pass: each group's members go into its
+ * filters with every thread on that group (GroupScanner, so the result does not
+ * depend on the thread count), then the direct leaves of a whole batch of groups
+ * are scanned for candidates as one flat list of (group, leaf) jobs with the
+ * batch's filters live at once, so a group of two genomes does not leave the
+ * rest of the machine idle; a batch takes as many groups as fit in the memory
+ * the main build's own filters already used, so peak memory does not grow with
+ * the number of groups. Candidates are written only for the direct leaves, the
+ * only ones selected from here.
  * Selection is one flat list of (group, leaf) jobs, each writing to its own
  * buffer, so the output order is fixed regardless of scheduling. The sequential
  * form of this (one group after another, one leaf after another) took 23
@@ -251,6 +254,7 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
     t = Clock::now();
     std::vector<std::vector<int>> candCount(groups.size());   // per direct leaf
     const size_t budgetBits = cfg.m1() + cfg.m2();
+    GroupScanner scanner(cfg);                                 // scratch shared by every group
     for (size_t batchStart = 0; batchStart < groups.size();) {
         size_t batchEnd = batchStart;
         for (size_t bits = 0; batchEnd < groups.size(); batchEnd++) {
@@ -260,20 +264,26 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
         }
 
         std::vector<std::unique_ptr<BloomFilter>> dbf(groups.size()), sbf(groups.size());
-        std::vector<std::pair<unsigned, unsigned>> loadJobs, scanJobs;   // (group, refId)
+        std::vector<std::pair<unsigned, unsigned>> scanJobs;   // (group, refId)
         for (size_t gi = batchStart; gi < batchEnd; gi++) {
             if (!usable[gi]) continue;
             dbf[gi].reset(new BloomFilter(gcfg[gi].m1(), gcfg[gi].nhash1, gcfg[gi].kmerLen));
             sbf[gi].reset(new BloomFilter(gcfg[gi].m2(), gcfg[gi].nhash2, gcfg[gi].kmerLen));
-            for (unsigned m : groups[gi].members) loadJobs.emplace_back(gi, m);
             for (unsigned l : groups[gi].directLeaves) scanJobs.emplace_back(gi, l);
             candCount[gi].assign(groups[gi].directLeaves.size(), 0);
         }
 
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t j = 0; j < loadJobs.size(); j++) {
-            unsigned gi = loadJobs[j].first;
-            loadBFfa(gcfg[gi], refFiles[loadJobs[j].second], *dbf[gi], *sbf[gi]);
+        // Each group's members into its filters, one group at a time with every
+        // thread on it (GroupScanner): the same filters on any thread count, and
+        // a group of twenty genomes no longer waits on one thread. Members went
+        // into the filters one per thread before, over a flat list of (group,
+        // member) jobs, which was order-dependent in the same way as the level
+        // scans.
+        for (size_t gi = batchStart; gi < batchEnd; gi++) {
+            if (!usable[gi]) continue;
+            std::vector<std::vector<std::string>> singles;
+            for (unsigned m : groups[gi].members) singles.push_back({refFiles[m]});
+            scanner.load(singles, *dbf[gi], *sbf[gi]);
         }
         #pragma omp parallel for schedule(dynamic)
         for (size_t j = 0; j < scanJobs.size(); j++) {
@@ -298,19 +308,14 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
     const double secCandidates = since(t);
 
     // Select for every direct leaf, with the leaf sketch's numbering and the
-    // universe margin. One pick filter per group: candidates are unique within
-    // their group by construction, so it only has to keep one leaf's picks
-    // distinct from another's in the same group, as the sketch filter does in
-    // buildSketch.
+    // universe margin. Candidates are unique within their group by construction
+    // (and across groups by the leaf-sketch exclusion below), so no claim filter
+    // is needed between leaves; see getUniqSet.
     t = Clock::now();
     struct SelectJob { unsigned group, leaf; };
     std::vector<SelectJob> selectJobs;
-    std::vector<std::unique_ptr<BloomFilter>> pick(groups.size());
     for (size_t gi = 0; gi < groups.size(); gi++) {
         if (!usable[gi]) continue;
-        pick[gi].reset(new BloomFilter(
-            static_cast<size_t>(cfg.bits) * cfg.sketchnum * groups[gi].directLeaves.size() + 1024,
-            cfg.nhash1, cfg.kmerLen));
         for (unsigned l : groups[gi].directLeaves)
             selectJobs.push_back({static_cast<unsigned>(gi), l});
     }
@@ -320,7 +325,7 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
     for (size_t j = 0; j < selectJobs.size(); j++) {
         const SelectJob& sj = selectJobs[j];
         std::string candPath = candidatePath(gcfg[sj.group].outdir, refFiles[sj.leaf]);
-        totalSelected += getUniqSet(cfg, candPath, sj.leaf, *pick[sj.group], picked[j], universeDbf).selected;
+        totalSelected += getUniqSet(cfg, candPath, sj.leaf, picked[j], universeDbf).selected;
     }
 
     std::vector<GroupSignature> all;

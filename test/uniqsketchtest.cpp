@@ -8,6 +8,9 @@
 #include <vector>
 #include <cassert>
 #include <zlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "SequenceUtil.hpp"
 #include "TestUtil.hpp"
@@ -144,16 +147,23 @@ void testGroupRepeatExclusion(UniqSketchConfig cfg) {
     std::cerr << "PASSED: Test group repeat exclusion\n";
 }
 
-// loadBFfaGroupParallel must leave the distinct and solid filters bit for bit as
-// loadBFfaGroup does: the partitioned scan replays the serial order of
-// operations on every block, so the filters' false positives, and through them
-// the candidates, cannot depend on the thread count. The group here exercises
-// every path: a contig longer than one hashing piece, several flushes (a small
-// flush size), the representative's internal repeat, a k-mer shared by two
-// members but not the representative, k-mers shared by the whole group, runs
-// of N, a contig shorter than k, and a gzip member.
-void testGroupParallelScanIdentical() {
-    std::cerr << "START: Test parallel group scan identical to serial... \t";
+// loadBFfaGroups must leave the distinct and solid filters bit for bit as the
+// serial scan does (loadBFfaGroup on each group in turn), on any thread count:
+// the partitioned scan replays the serial order of operations on every block, so
+// the filters' false positives, and through them the candidates, cannot depend
+// on scheduling. The groups exercise every path: a five-genome group with a
+// contig longer than one hashing piece, the representative's internal repeat, a
+// k-mer shared by two members but not the representative, k-mers shared by the
+// whole group, runs of N, a contig shorter than k and a gzip member; a group of
+// one (loadBFfa's rule, no group-private filters); a group of two; another
+// single. A small flush size forces several flushes within and across files.
+//
+// The filters are thin (16 bits per element) so that false positives are
+// common, and the test first checks that it can see order dependence at all:
+// the serial scan with the groups in reverse order must give different filters.
+// Without that, a replay that silently fell back to some other order could pass.
+void testGroupScanIdentical() {
+    std::cerr << "START: Test group scan identical to serial on any thread count... \t";
     uint64_t s = 0x9E3779B97F4A7C15ull;
     auto rnd = [&s]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     auto dna = [&](size_t n) {
@@ -168,56 +178,102 @@ void testGroupParallelScanIdentical() {
     const std::string core = dna(600000);                 // > 2^18 k-mers: several hashing pieces
     const std::string repeat = dna(5000);
     const std::string pairShared = dna(2000);             // in two members, not the representative
-    const std::vector<std::string> files = {"pgroup_rep.fa", "pgroup_m1.fa", "pgroup_m2.fa",
-                                            "pgroup_m3.fa", "pgroup_m4.fa.gz"};
+    const std::vector<std::vector<std::string>> groups = {
+        {"pgroup_rep.fa", "pgroup_m1.fa", "pgroup_m2.fa", "pgroup_m3.fa", "pgroup_m4.fa.gz"},
+        {"pgroup_s1.fa"},
+        {"pgroup_p1.fa", "pgroup_p2.fa"},
+        {"pgroup_s2.fa"},
+    };
     {
-        std::ofstream rep(files[0]);
+        std::ofstream rep(groups[0][0]);
         rep << ">core\n" << core << "\n"
             << ">rep_dup\n" << dna(20000) << repeat << dna(20000) << repeat << dna(3000) << "\n"
             << ">with_n\n" << dna(4000) << std::string(50, 'N') << dna(4000) << "\n"
             << ">short\nACGTACGT\n"
             << ">tail\n" << dna(30000) << "\n";
-        std::ofstream m1(files[1]);
+        std::ofstream m1(groups[0][1]);
         m1 << ">m1_core\n" << mutate(core, 997) << "\n>m1_own\n" << dna(100000) << pairShared << "\n";
-        std::ofstream m2(files[2]);
+        std::ofstream m2(groups[0][2]);
         m2 << ">m2_core\n" << mutate(core, 1009) << "\n>m2_own\n" << pairShared << dna(90000) << "\n";
-        std::ofstream m3(files[3]);
+        std::ofstream m3(groups[0][3]);
         m3 << ">m3_core\n" << mutate(core, 1013) << "\n>m3_own\n" << dna(110000) << "\n";
         std::ostringstream m4;
         m4 << ">m4_core\n" << mutate(core, 1019) << "\n>m4_own\n" << dna(70000) << "\n";
-        gzFile g = gzopen(files[4].c_str(), "wb");
+        gzFile g = gzopen(groups[0][4].c_str(), "wb");
         assert(g);
         const std::string m4s = m4.str();
         assert(gzwrite(g, m4s.data(), static_cast<unsigned>(m4s.size())) == static_cast<int>(m4s.size()));
         gzclose(g);
+        // A single with its own internal repeat (solid for it, as loadBFfa rules),
+        // a pair sharing most of their sequence, and a plain single.
+        const std::string dup = dna(3000);
+        std::ofstream s1(groups[1][0]);
+        s1 << ">s1\n" << dna(150000) << dup << dna(50000) << dup << dna(20000) << "\n";
+        const std::string pairCore = dna(200000);
+        std::ofstream p1(groups[2][0]);
+        p1 << ">p1\n" << pairCore << dna(30000) << "\n";
+        std::ofstream p2(groups[2][1]);
+        p2 << ">p2_a\n" << mutate(pairCore, 503) << "\n>p2_b\n" << dna(40000) << "\n";
+        std::ofstream s2(groups[3][0]);
+        s2 << ">s2\n" << dna(180000) << "\n";
     }
     UniqSketchConfig cfg;
     cfg.kmerLen = 31;
-    cfg.bits = 32;                                         // a filled filter, so false positives occur
-    cfg.dbfSize = 1200000;
-    cfg.sbfSize = 700000;
-    auto scan = [&](bool parallel, size_t flushBases) {
-        BloomFilter db(cfg.m1(), cfg.nhash1, cfg.kmerLen);
-        BloomFilter sb(cfg.m2(), cfg.nhash2, cfg.kmerLen);
-        if (parallel) loadBFfaGroupParallel(cfg, files, db, sb, flushBases);
-        else loadBFfaGroup(cfg, files, db, sb);
-        std::string bits(reinterpret_cast<const char*>(db.getFilter()), db.sizeBytes());
-        bits.append(reinterpret_cast<const char*>(sb.getFilter()), sb.sizeBytes());
-        assert(db.get_pop() > 0 && sb.get_pop() > 0);
+    cfg.bits = 16;                                         // thin filters: false positives are common
+    cfg.dbfSize = 1800000;
+    cfg.sbfSize = 900000;
+    auto bitsOf = [&](const BloomFilter& db, const BloomFilter& sb) {
+        std::string bits(reinterpret_cast<const char*>(const_cast<BloomFilter&>(db).getFilter()), db.sizeBytes());
+        bits.append(reinterpret_cast<const char*>(const_cast<BloomFilter&>(sb).getFilter()), sb.sizeBytes());
         return bits;
     };
-    const std::string serial = scan(false, 0);
+    auto serial = [&](const std::vector<std::vector<std::string>>& gs) {
+        BloomFilter db(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+        BloomFilter sb(cfg.m2(), cfg.nhash2, cfg.kmerLen);
+        for (const auto& g : gs) loadBFfaGroup(cfg, g, db, sb);
+        assert(db.get_pop() > 0 && sb.get_pop() > 0);
+        return bitsOf(db, sb);
+    };
+    auto scanned = [&](size_t flushBases) {
+        BloomFilter db(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+        BloomFilter sb(cfg.m2(), cfg.nhash2, cfg.kmerLen);
+        loadBFfaGroups(cfg, groups, db, sb, flushBases);
+        return bitsOf(db, sb);
+    };
+    const std::string reference = serial(groups);
+    // The test has teeth: order dependence is visible in these filters. It shows
+    // in the solid filter only; the distinct filter is a union of the k-mers each
+    // group admits (a group-private decision), so it is the same in any order.
+    std::vector<std::vector<std::string>> reversed(groups.rbegin(), groups.rend());
+    const std::string reorderedRef = serial(reversed);
+    const size_t dbBytes = BloomFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen).sizeBytes();
+    assert(reorderedRef != reference);
+    assert(reorderedRef.compare(0, dbBytes, reference, 0, dbBytes) == 0);
+    auto check = [&](const std::string& got) {
+        if (BloomFilter::kPartitioned) {
+            assert(got == reference);
+        } else {
+            // Standard filter: no partitions, groups go one per thread, and the
+            // solid filter depends on how they interleave. The distinct filter
+            // must still come out the same.
+            assert(got.compare(0, dbBytes, reference, 0, dbBytes) == 0);
+        }
+    };
 #ifdef _OPENMP
     const int savedThreads = omp_get_max_threads();
-    omp_set_num_threads(8);
-#endif
-    assert(scan(true, 100000) == serial);                 // several flushes within and across files
-    assert(scan(true, size_t(32) << 20) == serial);       // the default: one flush per side
-#ifdef _OPENMP
+    for (int threads : {1, 8}) {
+        omp_set_num_threads(threads);
+        check(scanned(100000));                           // several flushes within and across files
+        check(scanned(size_t(32) << 20));                 // the default: one flush per file side
+    }
     omp_set_num_threads(savedThreads);
+#else
+    check(scanned(100000));
+    check(scanned(size_t(32) << 20));
 #endif
-    for (const std::string& f : files) std::remove(f.c_str());
-    std::cerr << "PASSED: Test parallel group scan identical to serial\n";
+    for (const auto& g : groups)
+        for (const std::string& f : g) std::remove(f.c_str());
+    std::cerr << "PASSED: Test group scan identical to serial on any thread count\n";
 }
 
 // Write `content` to `path` gzip-compressed.
@@ -518,7 +574,7 @@ int main() {
 
     testIdentifyUniqKmers(cfg, refFiles);
     testGroupRepeatExclusion(cfg);
-    testGroupParallelScanIdentical();
+    testGroupScanIdentical();
     testGzLineReader();
     testGzipReference(cfg);
     testCandidateFile();

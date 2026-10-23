@@ -190,9 +190,8 @@ int main(int argc, char** argv) {
     }
 
 #ifdef _OPENMP
-    // Before the tree is built: the tree levels (and their thread-count-based
-    // scheduling in identifyGroupUniqKmers) run ahead of the leaf sketch, and
-    // used to pick up -t only as a side effect of the cardinality estimate.
+    // Before the tree is built: the tree levels run ahead of the leaf sketch
+    // and used to pick up -t only as a side effect of the cardinality estimate.
     omp_set_num_threads(cfg.threads);
 #endif
 
