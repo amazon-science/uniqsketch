@@ -144,6 +144,82 @@ void testGroupRepeatExclusion(UniqSketchConfig cfg) {
     std::cerr << "PASSED: Test group repeat exclusion\n";
 }
 
+// loadBFfaGroupParallel must leave the distinct and solid filters bit for bit as
+// loadBFfaGroup does: the partitioned scan replays the serial order of
+// operations on every block, so the filters' false positives, and through them
+// the candidates, cannot depend on the thread count. The group here exercises
+// every path: a contig longer than one hashing piece, several flushes (a small
+// flush size), the representative's internal repeat, a k-mer shared by two
+// members but not the representative, k-mers shared by the whole group, runs
+// of N, a contig shorter than k, and a gzip member.
+void testGroupParallelScanIdentical() {
+    std::cerr << "START: Test parallel group scan identical to serial... \t";
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&s]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    auto dna = [&](size_t n) {
+        std::string d(n, 'A');
+        for (char& c : d) c = "ACGT"[rnd() & 3];
+        return d;
+    };
+    auto mutate = [&](std::string d, size_t every) {
+        for (size_t i = every / 2; i < d.size(); i += every) d[i] = "ACGT"[(rnd() & 3)];
+        return d;
+    };
+    const std::string core = dna(600000);                 // > 2^18 k-mers: several hashing pieces
+    const std::string repeat = dna(5000);
+    const std::string pairShared = dna(2000);             // in two members, not the representative
+    const std::vector<std::string> files = {"pgroup_rep.fa", "pgroup_m1.fa", "pgroup_m2.fa",
+                                            "pgroup_m3.fa", "pgroup_m4.fa.gz"};
+    {
+        std::ofstream rep(files[0]);
+        rep << ">core\n" << core << "\n"
+            << ">rep_dup\n" << dna(20000) << repeat << dna(20000) << repeat << dna(3000) << "\n"
+            << ">with_n\n" << dna(4000) << std::string(50, 'N') << dna(4000) << "\n"
+            << ">short\nACGTACGT\n"
+            << ">tail\n" << dna(30000) << "\n";
+        std::ofstream m1(files[1]);
+        m1 << ">m1_core\n" << mutate(core, 997) << "\n>m1_own\n" << dna(100000) << pairShared << "\n";
+        std::ofstream m2(files[2]);
+        m2 << ">m2_core\n" << mutate(core, 1009) << "\n>m2_own\n" << pairShared << dna(90000) << "\n";
+        std::ofstream m3(files[3]);
+        m3 << ">m3_core\n" << mutate(core, 1013) << "\n>m3_own\n" << dna(110000) << "\n";
+        std::ostringstream m4;
+        m4 << ">m4_core\n" << mutate(core, 1019) << "\n>m4_own\n" << dna(70000) << "\n";
+        gzFile g = gzopen(files[4].c_str(), "wb");
+        assert(g);
+        const std::string m4s = m4.str();
+        assert(gzwrite(g, m4s.data(), static_cast<unsigned>(m4s.size())) == static_cast<int>(m4s.size()));
+        gzclose(g);
+    }
+    UniqSketchConfig cfg;
+    cfg.kmerLen = 31;
+    cfg.bits = 32;                                         // a filled filter, so false positives occur
+    cfg.dbfSize = 1200000;
+    cfg.sbfSize = 700000;
+    auto scan = [&](bool parallel, size_t flushBases) {
+        BloomFilter db(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+        BloomFilter sb(cfg.m2(), cfg.nhash2, cfg.kmerLen);
+        if (parallel) loadBFfaGroupParallel(cfg, files, db, sb, flushBases);
+        else loadBFfaGroup(cfg, files, db, sb);
+        std::string bits(reinterpret_cast<const char*>(db.getFilter()), db.sizeBytes());
+        bits.append(reinterpret_cast<const char*>(sb.getFilter()), sb.sizeBytes());
+        assert(db.get_pop() > 0 && sb.get_pop() > 0);
+        return bits;
+    };
+    const std::string serial = scan(false, 0);
+#ifdef _OPENMP
+    const int savedThreads = omp_get_max_threads();
+    omp_set_num_threads(8);
+#endif
+    assert(scan(true, 100000) == serial);                 // several flushes within and across files
+    assert(scan(true, size_t(32) << 20) == serial);       // the default: one flush per side
+#ifdef _OPENMP
+    omp_set_num_threads(savedThreads);
+#endif
+    for (const std::string& f : files) std::remove(f.c_str());
+    std::cerr << "PASSED: Test parallel group scan identical to serial\n";
+}
+
 // Write `content` to `path` gzip-compressed.
 static void writeGzip(const std::string& path, const std::string& content) {
     gzFile g = gzopen(path.c_str(), "wb");
@@ -442,6 +518,7 @@ int main() {
 
     testIdentifyUniqKmers(cfg, refFiles);
     testGroupRepeatExclusion(cfg);
+    testGroupParallelScanIdentical();
     testGzLineReader();
     testGzipReference(cfg);
     testCandidateFile();

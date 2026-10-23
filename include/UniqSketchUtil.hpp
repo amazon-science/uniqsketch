@@ -12,6 +12,9 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "SequenceUtil.hpp"
 #include "FileUtil.hpp"
@@ -409,6 +412,124 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
 }
 
 /**
+ * loadBFfaGroup with every thread on one group, producing the same filters bit
+ * for bit as the serial scan.
+ *
+ * A level's groups are scanned one per thread (identifyGroupUniqKmers), so its
+ * wall time is at least the serial scan of its largest group: on the 120-genome
+ * E. coli set the top level has a 20-genome cluster, and that one scan took 11 s
+ * of a 12 s phase while 31 threads finished the other 58 groups in 3 s.
+ *
+ * Splitting a group's files across threads would be simple but not equivalent.
+ * Which k-mers a Bloom filter mistakes for present depends on which bits were
+ * set before them, so the filters' decisions (and through them the signatures)
+ * depend on the order of insertion, and files scanned concurrently have no
+ * fixed order. Instead the k-mers are split by hash. Every filter here is
+ * blocked (BlockedBloomFilter): a k-mer touches one 512-bit block per filter,
+ * chosen by its leading hash h0, and the block counts are multiples of
+ * BloomFilter::PARTITIONS, so the k-mers with h0 in the p-th slice of the hash
+ * space own the p-th slice of the blocks of all four filters. One thread per
+ * slice, replaying its k-mers in file order, performs on every block exactly
+ * the operations the serial scan performs, in the same order. Nothing else
+ * touches dbFilter or sbFilter while a group is scanned this way (the caller
+ * runs these groups one at a time, before the per-thread loop), so the shared
+ * filters end up identical as well, and so do the candidates.
+ *
+ * Mechanically: contigs are read in file order and hashed in parallel pieces,
+ * each k-mer's h0 landing in the bucket of its partition (per piece, so that
+ * bucket order is file order); then one thread per partition walks its buckets
+ * and derives the remaining hashes from h0 as ntHashIterator does (NTE64). A
+ * flush at the end of the representative keeps the "second sighting in the
+ * representative" rule on exactly the representative's k-mers.
+ *
+ * With the standard filter a k-mer's bits are spread over the whole array,
+ * partitions isolate nothing, and this falls back to the serial scan.
+ */
+void loadBFfaGroupParallel(const UniqSketchConfig& cfg, const std::vector<std::string>& files,
+                           BloomFilter& dbFilter, BloomFilter& sbFilter,
+                           size_t flushBases = size_t(32) << 20) {    // ~256 MB of h0 per flush
+    if (!BloomFilter::kPartitioned || files.size() == 1) {
+        loadBFfaGroup(cfg, files, dbFilter, sbFilter);
+        return;
+    }
+    constexpr unsigned P = BloomFilter::PARTITIONS;
+    constexpr size_t PIECE_KMERS = size_t(1) << 18;      // hashing work unit
+
+    size_t bases = 0;
+    for (const auto& f : files) bases += uncompressedSize(f);
+    if (bases == 0) bases = 1;
+    BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
+    BloomFilter repSeen(std::max<size_t>(uncompressedSize(files[0]), 1) * 64,
+                        cfg.nhash1, cfg.kmerLen);
+    const unsigned k = cfg.kmerLen;
+    const unsigned nh = std::max(cfg.nhash1, cfg.nhash2);
+
+    std::vector<std::string> contigs;                     // pending, in file order
+    size_t pendingBases = 0;
+    // One bucket list per piece: piece order is file order, and within a piece
+    // each bucket is in position order, so partition p's k-mers come out in the
+    // order the serial scan would visit them.
+    std::vector<std::vector<std::vector<uint64_t>>> pieceBuckets;
+
+    auto flush = [&](bool isRep) {
+        struct Piece { size_t contig, begin, end; };     // k-mer start positions [begin, end)
+        std::vector<Piece> pieces;
+        for (size_t c = 0; c < contigs.size(); c++) {
+            if (contigs[c].size() < k) continue;
+            const size_t n = contigs[c].size() - k + 1;
+            for (size_t b = 0; b < n; b += PIECE_KMERS)
+                pieces.push_back({c, b, std::min(n, b + PIECE_KMERS)});
+        }
+        pieceBuckets.resize(pieces.size());
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < pieces.size(); i++) {
+            auto& buckets = pieceBuckets[i];
+            buckets.resize(P);
+            for (auto& b : buckets) b.clear();
+            const Piece& pc = pieces[i];
+            ntHashIterator itr(contigs[pc.contig].substr(pc.begin, pc.end - pc.begin + k - 1), 1, k);
+            while (itr != itr.end()) {
+                const uint64_t h0 = (*itr)[0];
+                buckets[BloomFilter::partition(h0)].push_back(h0);
+                ++itr;
+            }
+        }
+        #pragma omp parallel for schedule(dynamic)
+        for (unsigned p = 0; p < P; p++) {
+            uint64_t hVal[nh];
+            for (size_t i = 0; i < pieces.size(); i++) {
+                for (uint64_t h0 : pieceBuckets[i][p]) {
+                    hVal[0] = h0;
+                    for (unsigned j = 1; j < nh; j++) hVal[j] = NTE64(h0, k, j);
+                    // This thread is the only one touching these blocks: the
+                    // exclusive forms skip the stripe locks (see the filter).
+                    if (isRep && !repSeen.insert_make_change_exclusive(hVal)) {
+                        sbFilter.insert_exclusive(hVal);
+                    }
+                    if (seen.insert_make_change_exclusive(hVal)) {
+                        if (!dbFilter.insert_make_change_exclusive(hVal)) {
+                            sbFilter.insert_exclusive(hVal);
+                        }
+                    }
+                }
+            }
+        }
+        contigs.clear();
+        pendingBases = 0;
+    };
+
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        const bool isRep = (fi == 0);
+        scanFasta(files[fi], [&](const std::string&, std::string& faSeq) {
+            pendingBases += faSeq.size();
+            contigs.push_back(std::move(faSeq));
+            if (pendingBases >= flushBases) flush(isRep);
+        });
+        if (isRep || fi + 1 == files.size()) flush(isRep);
+    }
+}
+
+/**
  * identifyUniqKmers for a universe of genome groups.
  *
  * Each group is a tree-level entry: its first file is the representative whose
@@ -432,9 +553,32 @@ void identifyGroupUniqKmers(const UniqSketchConfig& cfg,
 
     BloomFilter sbFilter(cfg.m2(), cfg.nhash2, cfg.kmerLen);
 
-    #pragma omp parallel for schedule(dynamic)
+    // One thread per group leaves the level waiting on its largest cluster
+    // while the other threads sit idle. A group larger than an even share of
+    // the level's genomes is scanned by all threads instead, one such group at
+    // a time (loadBFfaGroupParallel needs the shared filters to itself), then
+    // the rest go one per thread as before.
+    unsigned threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    const size_t share = (members + threads - 1) / threads;
+    std::vector<unsigned> wide, narrow;
     for (unsigned i = 0; i < groups.size(); ++i) {
-        loadBFfaGroup(cfg, groups[i], dbFilter, sbFilter);
+        (threads > 1 && groups[i].size() > std::max<size_t>(share, 1) ? wide : narrow).push_back(i);
+    }
+    for (unsigned i : wide) {
+        loadBFfaGroupParallel(cfg, groups[i], dbFilter, sbFilter);
+    }
+    // Largest first, so the long scans start while there is still work to fill
+    // in behind them; in list order a 4-genome group picked up last ran alone
+    // for its full two seconds.
+    std::stable_sort(narrow.begin(), narrow.end(), [&](unsigned a, unsigned b) {
+        return groups[a].size() > groups[b].size();
+    });
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned j = 0; j < narrow.size(); ++j) {
+        loadBFfaGroup(cfg, groups[narrow[j]], dbFilter, sbFilter);
     }
 
     std::vector<int> refCount(groups.size());

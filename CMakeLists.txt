@@ -41,8 +41,13 @@ endif()
 
 enable_testing()
 
+# Runs the partitioned group scan against the serial one, so it needs OpenMP to
+# exercise the threads.
 add_executable(uniqsketchtest test/uniqsketchtest.cpp)
-target_link_libraries(uniqsketchtest PRIVATE ZLIB::ZLIB)
+target_link_libraries(uniqsketchtest PRIVATE ZLIB::ZLIB Threads::Threads)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(uniqsketchtest PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(querysketchtest test/querysketchtest.cpp)
 target_link_libraries(querysketchtest PRIVATE ZLIB::ZLIB Threads::Threads)

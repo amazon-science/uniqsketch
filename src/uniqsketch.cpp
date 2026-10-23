@@ -189,6 +189,13 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
+#ifdef _OPENMP
+    // Before the tree is built: the tree levels (and their thread-count-based
+    // scheduling in identifyGroupUniqKmers) run ahead of the leaf sketch, and
+    // used to pick up -t only as a side effect of the cardinality estimate.
+    omp_set_num_threads(cfg.threads);
+#endif
+
     std::vector<std::string> refFiles;
     for (int i = optind; i < argc; i++) {
         std::string file(argv[i]);
@@ -329,11 +336,22 @@ int main(int argc, char** argv) {
             mkdir(lvl.outdir.c_str(), 0777);
 
             if (resolveBloomSizes(universeKmers, lvl.dbfSize, lvl.sbfSize)) {
+#ifdef _OPENMP
+                double t0 = omp_get_wtime();
+#endif
                 BloomFilter levelDbf(lvl.m1(), lvl.nhash1, lvl.kmerLen);
                 identifyGroupUniqKmers(lvl, groups, levelDbf);
+#ifdef _OPENMP
+                double t1 = omp_get_wtime();
+#endif
                 buildSketch(lvl, lvl.refstat, levelDbf);
                 std::cerr << "Built sketch for tree level " << level
                           << ": " << lvl.outfile << "\n";
+#ifdef _OPENMP
+                std::cerr << "Tree level " << level << " build time (s): candidates "
+                          << std::setprecision(1) << std::fixed << t1 - t0
+                          << ", selection " << omp_get_wtime() - t1 << "\n";
+#endif
             } else {
                 std::cerr << "Warning: skipping sketch for tree level " << level
                           << " (no k-mer content)\n";
@@ -350,10 +368,6 @@ int main(int argc, char** argv) {
     }
 
     cfg.numRef = refFiles.size();
-
-#ifdef _OPENMP
-    omp_set_num_threads(cfg.threads);
-#endif
 
     // Get cardinality of input reference universe data to set Bloom filter parameter
     size_t totalKmers = 0;

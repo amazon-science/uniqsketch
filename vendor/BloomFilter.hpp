@@ -200,6 +200,22 @@ public:
     unsigned getHashNum() const { return m_hashNum; }
     unsigned getKmerSize() const { return m_kmerSize; }
     unsigned char* getFilter() { return m_filter; }
+    size_t sizeBits() const { return m_size; }
+    size_t sizeBytes() const { return (m_size + CHAR_BIT - 1) / CHAR_BIT; }
+
+    // Same partition interface as the blocked filter, so callers compile against
+    // either class. A k-mer's bits are spread over the whole filter here, so
+    // partitions do not isolate memory: kPartitioned is false and
+    // loadBFfaGroupParallel keeps to the serial scan with this class. The
+    // exclusive variants are the locked ones; nothing here can be exclusive.
+    static constexpr unsigned PARTITION_BITS = 8;
+    static constexpr unsigned PARTITIONS = 1u << PARTITION_BITS;
+    static constexpr bool kPartitioned = false;
+    static unsigned partition(uint64_t h0) {
+        return static_cast<unsigned>(h0 >> (64 - PARTITION_BITS));
+    }
+    bool insert_make_change_exclusive(const uint64_t* hVal) { return insert_make_change(hVal); }
+    void insert_exclusive(const uint64_t* hVal) { insert(hVal); }
 
 private:
     /**

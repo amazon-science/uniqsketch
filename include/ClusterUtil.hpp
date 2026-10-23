@@ -106,7 +106,7 @@ inline std::vector<std::string> clusterReferencesExact(
     {
         BloomFilter dbFilter(bfBits, nhash, kmerLen);
         unsigned char* filterPtr = dbFilter.getFilter();
-        size_t filterBytes = (bfBits + CHAR_BIT - 1) / CHAR_BIT;
+        size_t filterBytes = dbFilter.sizeBytes();   // the allocation: the blocked filter rounds up
 
         #pragma omp for schedule(dynamic)
         for (unsigned i = 0; i < n; i++) {

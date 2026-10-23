@@ -194,11 +194,34 @@ void testStoreLoad() {
 void testBlockedLocalityAndSizing() {
     std::cerr << "START: Test blocked filter locality, sizing, recall... \t";
 
-    // Exact sizing: a request is rounded up only to a whole 512-bit block.
+    // Sizing: a request is rounded up to whole 512-bit blocks and then to a
+    // multiple of PARTITIONS blocks (at most 16 KB over), never to a power of two.
+    constexpr size_t P = BlockedBloomFilter::PARTITIONS;
+    assert(P == 256);
     BlockedBloomFilter f1(1000, 5, 32);
-    assert(f1.sizeBits() == 1024);
+    assert(f1.blockCount() == P && f1.sizeBits() == P * 512);
     BlockedBloomFilter f2(512 * 1000, 5, 32);
-    assert(f2.sizeBits() == 512 * 1000);           // not 2^19
+    assert(f2.blockCount() == 1024 && f2.sizeBits() == 512 * 1024);
+    BlockedBloomFilter f3(512 * 100000 + 1, 5, 32);
+    assert(f3.blockCount() == 100096 && f3.blockCount() % P == 0);   // not 131072
+    assert(f3.sizeBytes() == f3.blockCount() * 64);
+    // Partition isolation: a block never straddles two partitions, whatever the
+    // filter size, so one thread per partition gives every block one writer.
+    // Checked on the hashes nearest each partition boundary of a filter whose
+    // block count is not a power of two.
+    for (unsigned p = 1; p < P; p++) {
+        const uint64_t edge = static_cast<uint64_t>(p) << (64 - BlockedBloomFilter::PARTITION_BITS);
+        for (uint64_t d = 1; d <= 3; d++) {
+            const uint64_t below = edge - d, above = edge + d - 1;
+            auto blockOf = [&](uint64_t h0) {
+                return static_cast<size_t>((static_cast<unsigned __int128>(h0) * f3.blockCount()) >> 64);
+            };
+            assert(BlockedBloomFilter::partition(below) == p - 1);
+            assert(BlockedBloomFilter::partition(above) == p);
+            assert(blockOf(below) / (f3.blockCount() / P) == p - 1);
+            assert(blockOf(above) / (f3.blockCount() / P) == p);
+        }
+    }
 
     // Locality: every bit a k-mer sets lies in the one block its leading hash
     // chose. Insert one k-mer into an empty filter and read the words back.

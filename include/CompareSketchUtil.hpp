@@ -177,7 +177,7 @@ void identifyDifference(const CompareSketchConfig& cfg, const std::vector<std::s
         {
             BloomFilter dbFilter(bfBits, cfg.nhash, cfg.kmerLen);
             unsigned char* filterPtr = dbFilter.getFilter();
-            size_t filterBytes = (bfBits + CHAR_BIT - 1) / CHAR_BIT;
+            size_t filterBytes = dbFilter.sizeBytes();   // the allocation: the blocked filter rounds up
 
             #pragma omp for schedule(dynamic)
             for (unsigned i = 0; i < refSet1.size(); i++) {

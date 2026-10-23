@@ -25,8 +25,9 @@ querysketch:$(querysketch_SOURCES)
 comparesketch:$(comparesketch_SOURCES)
 	$(CXX) $(OPTFLAGS) $(CPPFLAGS) $(INCLUDEPATH) -o bin/$@ $^ $(LIBPATH)
 
+# Runs the partitioned group scan against the serial one, so it needs OpenMP.
 uniqsketchtest: test/uniqsketchtest.cpp
-	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
 
 querysketchtest: test/querysketchtest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
