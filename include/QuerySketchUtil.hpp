@@ -293,16 +293,30 @@ struct QueryTally {
 /**
  * One pass over the sample: every k-mer of every read against the index.
  *
- * Reads are parsed by a thread of their own into batches that the OpenMP team
- * consumes, so parsing and hashing overlap; before, the team sat idle while the
- * main thread parsed the next batch and then parsed nothing while the team
- * hashed, which capped a 3 M-read query at six times the single-thread speed no
- * matter how many threads it had. The hot loop records a hit as (target, slot,
- * read); the merge, still serial, counts and remembers the read's name once.
- * The per-target sets of distinct read names are built at the end, in parallel
- * over targets, from those names: inserting into the sets from the merge cost as
- * much as the hashing did, and held the dominant reference's names once per
- * tree level.
+ * Reads are parsed by a thread of their own per file into batches that the
+ * OpenMP team consumes, so parsing and hashing overlap; before, the team sat
+ * idle while the main thread parsed the next batch and then parsed nothing
+ * while the team hashed, which capped a 3 M-read query at six times the
+ * single-thread speed no matter how many threads it had.
+ *
+ * The team is one parallel region for the whole sample. Each thread takes a
+ * batch from the queue, hashes it, and merges its hits under a lock. Earlier
+ * each batch was its own parallel region: the main thread took the batch and
+ * merged alone, and the other threads, with nothing to do, spun at the barrier
+ * until the next batch arrived. With gzip input the readers deliver a batch
+ * every few milliseconds and the hashing takes a fraction of that, so the spin
+ * was most of the process: 436 s of CPU for a 25 s query at 32 threads (27 s
+ * with OMP_WAIT_POLICY=passive). A thread that finds the queue empty now sleeps
+ * on the condition variable like the readers do. The merge order follows
+ * scheduling, as the per-thread merge order did before; the results it feeds
+ * are counts and, per target, the *set* of read names, which do not depend on
+ * it.
+ *
+ * The hot loop records a hit as (target, slot, read); the merge counts and
+ * remembers the read's name once. The per-target sets of distinct read names
+ * are built at the end, in parallel over targets, from those names: inserting
+ * into the sets from the merge cost as much as the hashing did, and held the
+ * dominant reference's names once per tree level.
  *
  * The read filter for --solid is allocated only when --solid is given; it is
  * sized for the sample's distinct k-mers (138 M on a 3 M-read E. coli sample,
@@ -339,19 +353,23 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
     std::vector<std::vector<uint32_t>> readIds(index.numTargets);
 
     // Producers: one parser thread per input file (paired reads are two
-    // independent streams), filling a bounded queue of batches. Consumer: the
+    // independent streams), filling a bounded queue of batches. Consumers: the
     // OpenMP team. A batch marked `last` is the final one of its file; the
-    // consumer stops when every file has delivered its last batch.
+    // consumers stop once every file has delivered its last batch and the queue
+    // is empty.
     std::mutex mu;
     std::condition_variable cvFull, cvEmpty;
     std::deque<std::unique_ptr<Batch>> ready, spare;
-    const size_t queueDepth = QUEUE_DEPTH * sampleFiles.size();
+    size_t filesDone = 0;           // files whose last batch has been taken (under mu)
+    // One batch in hand per consumer, plus QUEUE_DEPTH per reader to fill ahead.
+    const size_t queueDepth = static_cast<size_t>(maxThreads) + QUEUE_DEPTH * sampleFiles.size();
     for (size_t i = 0; i < queueDepth; i++) spare.emplace_back(new Batch);
 
     std::vector<std::thread> readers;
     for (const std::string& path : sampleFiles) {
         readers.emplace_back([&, path] {
             gzFile fp = gzopen(path.c_str(), "r");
+            if (fp) gzbuffer(fp, 1 << 20);
             kseq_t* ks = kseq_init(fp);
             bool eof = false;
             while (!eof) {
@@ -384,28 +402,28 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
         });
     }
 
-    std::vector<uint32_t> nameId;   // per read of the current batch: its hitNames index
-    for (size_t filesDone = 0; filesDone < sampleFiles.size();) {
-        std::unique_ptr<Batch> b;
-        {
-            std::unique_lock<std::mutex> lk(mu);
-            cvFull.wait(lk, [&] { return !ready.empty(); });
-            b = std::move(ready.front());
-            ready.pop_front();
-        }
-        if (b->last) ++filesDone;
-        const std::vector<std::string>& seqBatch = b->seq;
-
-        #pragma omp parallel
-        {
-            int tid = 0;
+    std::mutex mergeMu;
+    #pragma omp parallel
+    {
+        int tid = 0;
 #ifdef _OPENMP
-            tid = omp_get_thread_num();
+        tid = omp_get_thread_num();
 #endif
-            std::vector<Hit>& mine = hits[tid];
+        std::vector<Hit>& mine = hits[tid];
+        std::vector<uint32_t> nameId;   // per read of the current batch: its hitNames index
+        for (;;) {
+            std::unique_ptr<Batch> b;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cvFull.wait(lk, [&] { return !ready.empty() || filesDone == sampleFiles.size(); });
+                if (ready.empty()) break;
+                b = std::move(ready.front());
+                ready.pop_front();
+                if (b->last && ++filesDone == sampleFiles.size()) cvFull.notify_all();
+            }
+            const std::vector<std::string>& seqBatch = b->seq;
             mine.clear();
 
-            #pragma omp for schedule(dynamic, 64)
             for (size_t r = 0; r < seqBatch.size(); ++r) {
                 const std::string& seq = seqBatch[r];
                 if (seq.length() < cfg.kmerLen) continue;
@@ -429,32 +447,33 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
                     ++itr;
                 }
             }
-        }
 
-        // Merge this batch: counts, and the read behind each hit, named once.
-        nameId.assign(seqBatch.size(), UINT32_MAX);
-        for (const std::vector<Hit>& mine : hits) {
-            unsigned prevTarget = UINT32_MAX, prevRead = UINT32_MAX;
-            for (const Hit& h : mine) {
-                ++tally.count[h.target];
-                if (h.slot != NO_SLOT) ++tally.slotCount[h.slot];
-                if (h.target != prevTarget || h.read != prevRead) {
-                    if (nameId[h.read] == UINT32_MAX) {
-                        nameId[h.read] = static_cast<uint32_t>(hitNames.size());
-                        hitNames.push_back(std::move(b->name[h.read]));
+            // Merge this batch: counts, and the read behind each hit, named once.
+            if (!mine.empty()) {
+                nameId.assign(seqBatch.size(), UINT32_MAX);
+                std::lock_guard<std::mutex> lk(mergeMu);
+                unsigned prevTarget = UINT32_MAX, prevRead = UINT32_MAX;
+                for (const Hit& h : mine) {
+                    ++tally.count[h.target];
+                    if (h.slot != NO_SLOT) ++tally.slotCount[h.slot];
+                    if (h.target != prevTarget || h.read != prevRead) {
+                        if (nameId[h.read] == UINT32_MAX) {
+                            nameId[h.read] = static_cast<uint32_t>(hitNames.size());
+                            hitNames.push_back(std::move(b->name[h.read]));
+                        }
+                        readIds[h.target].push_back(nameId[h.read]);
+                        prevTarget = h.target;
+                        prevRead = h.read;
                     }
-                    readIds[h.target].push_back(nameId[h.read]);
-                    prevTarget = h.target;
-                    prevRead = h.read;
                 }
             }
-        }
 
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            spare.push_back(std::move(b));
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                spare.push_back(std::move(b));
+            }
+            cvEmpty.notify_one();
         }
-        cvEmpty.notify_all();
     }
     for (std::thread& t : readers) t.join();
 

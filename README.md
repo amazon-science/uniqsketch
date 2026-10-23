@@ -597,7 +597,13 @@ since it removes the error-driven cross-hits that otherwise appear at the 0.01â€
 level whenever one relative is abundant.
 
 **`-t, --threads`.** Set this to your core count for both indexing and querying;
-both stages parallelize well.
+both stages parallelize well. A query's floor is the reading of its input: each
+read file is decompressed and parsed by one thread, about 5 s per 900 MB of
+FASTQ when gzipped and 3 s when plain, however many threads hash. Linking against
+[zlib-ng](https://github.com/zlib-ng/zlib-ng) in compat mode (or `LD_PRELOAD`ing
+it) decompresses 1.5Ã— faster and took a 3 M-pair gzipped query from 5.4 s to
+4.0 s at 32 threads; the output is the same. Threads waiting for input sleep, so a
+32-thread query no longer costs 32 threads of CPU.
 
 ## Troubleshooting
 
