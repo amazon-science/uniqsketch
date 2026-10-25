@@ -318,10 +318,11 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
  * the solid filter ends up holding k-mers present in two or more *groups*, and
  * "distinct but not solid" means unique to one group.
  *
- * The seen filter is sized generously (64 bits per base of input, five hashes:
- * false-positive rate ~2e-6) because a false positive here is not conservative:
- * it drops the group's only insertion of a k-mer, so a k-mer this group shares
- * with one other group is counted once and handed to that group as a signature.
+ * The seen filter is sized generously (64 bits per element it can hold, five
+ * hashes: false-positive rate ~2e-6; seenFilterBits) because a false positive
+ * here is not conservative: it drops the group's only insertion of a k-mer, so
+ * a k-mer this group shares with one other group is counted once and handed to
+ * that group as a signature.
  *
  * Counting once per group must not also hide a k-mer that occurs twice inside a
  * single genome. loadBFfa marks such a k-mer solid on its second sighting and a
@@ -339,6 +340,28 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
  * k-mer solid cannot harm another group: one present in two groups is already
  * solid by way of the seen/distinct path above.
  */
+
+/**
+ * Size of a group's seen filter, in bits: 64 per element it can be asked to
+ * hold. The elements are the group's distinct k-mers, which are no more than
+ * the group's bases and no more than the distinct k-mers of the whole index
+ * (cfg.dbfSize, ntCard's estimate, which every tree level scans against), so
+ * the smaller of the two sizes it; a configuration without a cardinality
+ * (dbfSize 0, as in a unit test) keeps the base count. Sized by bases alone,
+ * the filter of the largest node of a 5 493-genome E. coli index, 896 genomes
+ * of 5.1 Mb, was 36.6 GB and the build's memory peak (42.6 GB), where the
+ * index has 332 M distinct k-mers in all: 2.7 GB. The bound binds for a node
+ * whose bases exceed the universe's distinct k-mers (on the 120-genome index
+ * its 20-genome node alone; 25 of 1 143 nodes at 5 493 genomes), and there it
+ * moves the filter's false positives, as any resizing does; the rate stays at
+ * or below the 64-bit one.
+ */
+inline size_t seenFilterBits(const UniqSketchConfig& cfg, size_t bases) {
+    size_t elems = std::max<size_t>(bases, 1);
+    if (cfg.dbfSize > 0) elems = std::min(elems, cfg.dbfSize);
+    return elems * 64;
+}
+
 void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& files,
                    BloomFilter& dbFilter, BloomFilter& sbFilter) {
     if (files.size() == 1) {
@@ -347,8 +370,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
     }
     size_t bases = 0;
     for (const auto& f : files) bases += uncompressedSize(f);
-    if (bases == 0) bases = 1;
-    BloomFilter seen(bases * 64, cfg.nhash1, cfg.kmerLen);
+    BloomFilter seen(seenFilterBits(cfg, bases), cfg.nhash1, cfg.kmerLen);
     BloomFilter repSeen(std::max<size_t>(uncompressedSize(files[0]), 1) * 64,
                         cfg.nhash1, cfg.kmerLen);
     for (size_t fi = 0; fi < files.size(); ++fi) {
@@ -457,8 +479,7 @@ private:
         if (files.size() > 1) {
             size_t bases = 0;
             for (const auto& f : files) bases += uncompressedSize(f);
-            if (bases == 0) bases = 1;
-            seen.reset(new BloomFilter(bases * 64, cfg_.nhash1, k));
+            seen.reset(new BloomFilter(seenFilterBits(cfg_, bases), cfg_.nhash1, k));
             repSeen.reset(new BloomFilter(std::max<size_t>(uncompressedSize(files[0]), 1) * 64,
                                           cfg_.nhash1, k));
         }
