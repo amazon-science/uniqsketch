@@ -89,6 +89,31 @@ void testBuildParamsRoundTrip() {
     std::cerr << "PASSED: Test build params round trip\n";
 }
 
+// leaves.tsv names every leaf by refId, including the ones no sketch mentions.
+// The query relies on it to treat a signature-less leaf as the carrier of its
+// relatives' within-group signatures; an index without it must load as empty so
+// the query can fall back rather than fail.
+void testTreeLeavesRoundTrip() {
+    std::cerr << "START: Test leaves.tsv round trip... \t";
+    const char* dir = ".";
+    std::string path = treeLeavesPath(dir);
+    std::vector<std::string> files = {"refs/GCF_1_A.fna", "refs/GCF_2_B.fna.gz", "GCF_3_C with space.fa"};
+    writeTreeLeaves(path, files);
+    std::vector<std::string> names = loadTreeLeaves(path);
+    assert(names.size() == 3);
+    assert(names[0] == "GCF_1_A" && names[1] == "GCF_2_B" && names[2] == "GCF_3_C with space");
+    // The name column is what getBaseId gives the sketches, so the two agree.
+    for (size_t i = 0; i < files.size(); i++) assert(names[i] == getBaseId(files[i]));
+    std::remove(path.c_str());
+    assert(loadTreeLeaves(path).empty());                       // pre-leaves.tsv index
+    // A damaged line is skipped, not fatal; ids need not be dense.
+    { std::ofstream bad(path); bad << "ref_id\tname\tfile_path\n0\tX\tx.fa\nnot-a-number\tY\ty.fa\n2\tZ\tz.fa\n"; }
+    names = loadTreeLeaves(path);
+    assert(names.size() == 3 && names[0] == "X" && names[1].empty() && names[2] == "Z");
+    std::remove(path.c_str());
+    std::cerr << "PASSED: Test leaves.tsv round trip\n";
+}
+
 // getTreeLevelRefs must group internal-node representatives by their level.
 void testGetTreeLevelRefs() {
     std::cerr << "START: Test getTreeLevelRefs... \t";
@@ -335,6 +360,7 @@ void testBuildHierarchicalTree() {
 int main() {
     testLoadTree();
     testBuildParamsRoundTrip();
+    testTreeLeavesRoundTrip();
     testGetTreeLevelRefs();
     testTreeLevelPartition();
     testGroupSignatures();

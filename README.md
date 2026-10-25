@@ -188,7 +188,9 @@ together:
 * **`sigs_hit` low relative to `sigs_total`, with a high `count`,** means many hits on
   few signatures — the pattern of a repeat or a cross-mapping rather than genuine
   presence. Support spread across most of a reference's signatures is what a real
-  detection looks like.
+  detection looks like. The tree query applies this as a rule (`--tree-breadth`,
+  see [querysketch](#querysketch-1)) and withholds such rows; in a flat query they
+  are reported and this column is how to see them.
 * Every call has already cleared `--hit` (on `count`) and `--rcutoff` (on `reads`).
   These columns let you see how far above those floors a call sits: `reads=3` is one
   read above the flat-index cutoff; `reads=1` is the floor on a strict-margin tree
@@ -380,6 +382,9 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --solid           only use solid k-mers in reads
       --tree=DIR        hierarchical query using a --tree index directory
       --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
+      --tree-breadth=F  min breadth of a call: distinct signatures hit, as a fraction of
+                        what its hit count would spread over if the genome were present;
+                        below it the hits sit in one locus and the call is withheld (with --tree) [0.5]
       --no-group-signatures  leaf level uses globally unique signatures only (with --tree)
       --help            display this help and exit
       --version         version information and exit
@@ -468,25 +473,70 @@ at the coarse level; the default of 1 is deliberately permissive, because a sub-
 pruned here can never be recovered at a finer level. Raise it to speed up queries
 against very large reference sets at some cost in sensitivity at the detection floor.
 
+**A leaf with evidence of its own is never lost to pruning.** A node's signatures
+are its representative's k-mers, and in a dense reference set (hundreds of close
+genomes) a member often carries few or none of them: on 5 493 *E. coli* genomes
+44 % of leaves had an ancestor whose signatures they carry none of, so pruning on
+the representative's evidence alone dropped genomes at 90 % abundance. At the leaf
+level a leaf therefore also stays in play when its own globally unique signatures
+clear the reporting thresholds (`--hit`, `--rcutoff`), or when the within-group
+signatures of its own that no other genome carries do. One read is enough for
+this only if the leaf's lineage is attested, that is if at some coarse level a
+representative covering it cleared `--hit` on two or more reads; otherwise the
+leaf needs two reads of its own, whatever `--rcutoff` says. The reason is that
+across thousands of close genomes a read of the dominant organism carrying two
+coincident errors does now and then reproduce a run of 10–40 consecutive signature
+k-mers of an unrelated genome, while a genuine member's family has evidence of its
+own (hundreds of reads on its node, in the validation sweeps): on the 5 493-genome
+*E. coli* index this rule took the false strain rows of the 280-mixture sweep from
+43 to 13 and kept every true single-read row (one three-read row at 0.01 % was
+lost, 10 → 9 of 56). A stray hit on an ancestor
+would not do as support: nearly every lineage collects one from a few million
+error-carrying reads of the dominant genome, and gating on that removed 2 of the
+43. stderr reports how many leaves the narrowing kept, how many came back on their
+own evidence, and how many of those came back on one read.
+
 **Within-group signatures at the leaf level.** If the index has a
 `sketch_group.tsv` (every `uniqsketch --tree` build writes one unless told not to;
 see [uniqsketch](#uniqsketch-1)), the leaf level also scores each candidate leaf's
 within-group signatures: k-mers unique among the leaves of its group but present in
 some other genome of the index, each recorded with those *carriers*. A signature is
-used only if none of its carriers is itself a candidate after the coarse levels, so
-a read from a carrier that is present can never be credited to the leaf; the cost of
-a carrier being present is a smaller supplementary set, never a wrong hit. The
-candidate set at that point is the permissive one the coarse levels leave (any
-sub-tree with one read), so a carrier with any trace of evidence blocks its
-signatures. What remains is a genome present below that floor, whose few reads at
-the shared loci then count for the leaf; on a strict-margin index that needs a
-genome too rare for a single read to reach one of its group's several thousand
-coarse signatures. The globally unique signatures are always scored, so this adds
-evidence and cannot take any away. On the 120-genome *E. coli* set it raised
-strain-level resolution of close members at 0.01 % from 8/28 to 11/28 with no new
-false calls; stderr reports how many within-group signatures were used and how
-many were withheld because a carrier was a candidate. `--no-group-signatures`
-ignores the file, which is useful for comparing the two on a sample.
+used only if none of its carriers may be present, so a read from a carrier that is
+present can never be credited to the leaf; the cost of a carrier being present is a
+smaller supplementary set, never a wrong hit. "May be present" is deliberately
+wide: a carrier blocks if it is in play at the leaf level, or if at *any* coarse
+level a representative covering it had one hit and one read, whether or not the
+narrowing later dropped it, and whether or not it has any signatures of its own (an
+index written by this version names every leaf in `leaves.tsv`, so a genome with no
+unique k-mers left can still be recognised as a carrier). What remains is a genome
+present below that floor, whose few reads at the shared loci then count for the
+leaf; on a strict-margin index that needs a genome too rare for a single read to
+reach one of its group's several thousand coarse signatures. The globally unique
+signatures are always scored, so this adds evidence and cannot take any away. On
+the 120-genome *E. coli* set it raised strain-level resolution of close members at
+0.01 % from 8/28 to 11/28 with no new false calls; stderr reports how many
+within-group signatures were used and how many were withheld because a carrier may
+be present. `--no-group-signatures` ignores the file, which is useful for comparing
+the two on a sample.
+
+**Breadth: a strain call must come from more than one locus.** `--tree-breadth=F`
+(default 0.5) withholds a strain row whose hits sit on too few distinct
+signatures for its count. Reads of a present genome fall all over it, so with
+λ = `count`/`sigs_total` hits per signature about `sigs_total`·(1−e^−λ) distinct
+signatures should be hit; the ratio of `sigs_hit` to that expectation is near 1 for
+presence and far below it when the sample carries one locus of the genome in some
+other organism (a mobile element, a plasmid). In the validation sweeps the ratio of
+1 978 true strain rows never fell below 0.73; a human gut metagenome with no
+*Escherichia* in it covered a 785-bp insertion of one *E. coli* genome at 137×,
+hit its 80 signatures there 2 732 times, and scored 0.035. Withheld calls are listed
+on stderr with their numbers; `--tree-breadth=0` reports them. A read-limited call
+is not affected: at λ ≪ 1 the expectation is the count itself and distinct reads
+hit distinct signatures, so the ratio is about 1 however few reads there are.
+Family rows are not subject to the floor: a node's signatures are its
+representative's, a member carries only part of them, and a present member looks
+no different from one locus by this measure. Family rows are protected against
+mobile sequence by the build instead (see the repeat exclusion under
+[uniqsketch](#uniqsketch-1)).
 
 ### comparesketch
 ```
@@ -538,8 +588,19 @@ default 100).** This sets how many signatures represent each reference. More
 signatures means more chances to hit a low-abundance organism, at the cost of a
 larger index and slower queries. `--sensitive` selects 100 — identical to the
 default — and `--very-sensitive` selects 1000, which is the setting to use when you
-care about trace-level detection. Signatures are spread across the genome rather
-than clustered, so a higher count also buys robustness against uneven coverage.
+care about trace-level detection. Signatures are spread along the genome: it is cut
+into `-c` windows of equal length and the first usable candidate of each window is
+taken, so a higher count also buys robustness against uneven coverage. Windows that
+have nothing to offer (no unique k-mer, or none that passes the margin) do not pass
+their place on; what remains of the quota goes to the windows that did supply, each
+in proportion to its candidates and capped at a common level chosen so the shares
+add up to `-c`. A reference with unique sequence everywhere therefore ends up with
+one signature per window, and one whose unique sequence is confined to a few loci
+gets all of it, up to `-c`; the cap only comes into play for a reference that
+reaches `-c`, so below the quota a locus rich in candidates (a plasmid, an
+insertion) still supplies in proportion to them, which is why the query has a
+[breadth floor](#querysketch-1). A reference can end up with fewer than `-c`
+signatures; `sigs_total` in the query output says how many it has.
 
 The detection floor this sets is easy to estimate. A reference at abundance *a* in
 *N* reads of length *L* has coverage *a·N·L/G* for genome size *G*, and each

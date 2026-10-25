@@ -387,6 +387,51 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "bloom_filter\t" << p.bloomFilter << "\n";
 }
 
+/**
+ * The leaf numbering of a tree index: `<outdir>/leaves.tsv`, one row per leaf
+ * reference in refId order (`ref_id`, `name`, `file_path`).
+ *
+ * The leaf sketch, the within-group sketch and its carriers column all refer to
+ * leaves by this refId, but a leaf with no signatures of its own has no line in
+ * either sketch, so until this file existed the query could not name it: it
+ * could neither report it nor recognise it as the carrier of a within-group
+ * signature. On a 5 493-genome E. coli index 416 leaves were in that position,
+ * and one of them (a K-12 derivative at 90 % abundance) put 5 667 of its reads
+ * into a relative's within-group signatures because the carrier mask could not
+ * see it. Written by uniqsketch; loadTreeLeaves returns an empty vector for an
+ * index that predates it, and the query then falls back to the names the
+ * sketches carry.
+ */
+inline std::string treeLeavesPath(const std::string& treeDir) {
+    return treeDir + "/leaves.tsv";
+}
+
+inline void writeTreeLeaves(const std::string& path, const std::vector<std::string>& refFiles) {
+    std::ofstream out(path);
+    out << "ref_id\tname\tfile_path\n";
+    for (size_t i = 0; i < refFiles.size(); i++)
+        out << i << "\t" << getBaseId(refFiles[i]) << "\t" << refFiles[i] << "\n";
+}
+
+/** refId -> leaf name, or an empty vector when the file is absent. */
+inline std::vector<std::string> loadTreeLeaves(const std::string& path) {
+    std::vector<std::string> names;
+    std::ifstream in(path);
+    if (!in) return names;
+    std::string line;
+    std::getline(in, line);                       // header
+    while (std::getline(in, line)) {
+        size_t a = line.find('\t');
+        if (a == std::string::npos) continue;
+        size_t b = line.find('\t', a + 1);
+        unsigned id = 0;
+        try { id = static_cast<unsigned>(std::stoul(line.substr(0, a))); } catch (const std::exception&) { continue; }
+        if (id >= names.size()) names.resize(id + 1);
+        names[id] = line.substr(a + 1, (b == std::string::npos ? line.size() : b) - a - 1);
+    }
+    return names;
+}
+
 inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
     TreeBuildParams p;
     std::ifstream in(path);

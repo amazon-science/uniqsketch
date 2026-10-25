@@ -385,10 +385,13 @@ void testBuildSketch(const UniqSketchConfig& cfg) {
     std::cerr << "START: Test buildSketch... \t";
 
     /*
-    With sketchnum = 2, each ref gets 2 unique kmers uniformly selected:
-    ref_test_1: {AGACTGAACT, AGGCTACAAA}
-    ref_test_2: {AGGCTACAAC, CTCAGCTAAG}
-    Total sketch: 4 unique kmers
+    With sketchnum = 2, each ref gets 2 unique k-mers spread along its genome:
+    the two 11-bp contigs make two 11-bp windows, and the first candidate of
+    each is taken.
+    ref_test_1: {AGGCTACAAA (contig 0), GAGACTGAAC (contig 1)}
+    ref_test_2: {CTCAGCTAAG (contig 3), AGGCTACAAC (contig 4)}
+    Total sketch: 4 unique k-mers. (Slots spaced over the candidate list, as
+    selection used to do, took two from contig 3 and none from contig 4.)
     */
     candidatesFromText("expected_ref_test_1.tsv", "ref_test_1.fa", "expected_ref_test_1.cand", cfg.kmerLen);
     candidatesFromText("expected_ref_test_2.tsv", "ref_test_2.fa", "expected_ref_test_2.cand", cfg.kmerLen);

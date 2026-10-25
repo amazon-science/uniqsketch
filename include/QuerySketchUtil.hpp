@@ -2,10 +2,12 @@
 #define QUERYSKETCHUTIL_HPP_
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <condition_variable>
 #include <deque>
@@ -61,6 +63,7 @@ struct QuerySketchConfig {
     // Tree query
     int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
     bool noGroupSignatures = false;                     // --no-group-signatures: leaf level uses global signatures only
+    double treeBreadth = 0.5;                           // --tree-breadth: min observed/expected signatures hit (0 = off)
 };
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -608,6 +611,36 @@ inline double hitsPerSignature(size_t count, size_t sigsTotal) {
 }
 
 /**
+ * Breadth of the evidence behind a call: the number of distinct signatures hit,
+ * relative to what the hit count would spread over if the whole genome were
+ * present.
+ *
+ * Reads of a present genome land all over it, so with lambda = count / sigs_total
+ * hits per signature about sigs_total * (1 - exp(-lambda)) distinct signatures
+ * are hit. Reads of one locus of it, a mobile element the sample carries in some
+ * other organism, pile their hits onto the few signatures in that locus. The
+ * ratio observed / expected is near 1 in the first case and far below it in the
+ * second, and the count alone cannot tell them apart: 717 reads of a human gut
+ * metagenome with no Escherichia in it covered a 785-bp insertion of one E. coli
+ * genome at 137x, hit its 80 signatures there 2 732 times, and would have been
+ * reported as that strain at abundance 1. Over the 1 978 true strain rows of the
+ * four validation sweeps the ratio was never below 0.73 (1 % quantile 0.88 or
+ * better); that call scored 0.035, the family-level erm(B) call that began the
+ * repeat investigation would have scored 0.02. A read-limited call is safe: at
+ * lambda << 1 the expectation is the count itself, and distinct reads hit
+ * distinct signatures, so the ratio is about 1 however few reads there are.
+ *
+ * @return observed / expected distinct signatures hit, or 1 when nothing was hit
+ *         (the caller's count threshold decides that case).
+ */
+inline double breadthRatio(size_t count, size_t sigsHit, size_t sigsTotal) {
+    if (count == 0 || sigsHit == 0 || sigsTotal == 0) return 1.0;
+    const double lambda = static_cast<double>(count) / static_cast<double>(sigsTotal);
+    const double expected = static_cast<double>(sigsTotal) * (1.0 - std::exp(-lambda));
+    return expected > 0.0 ? static_cast<double>(sigsHit) / expected : 1.0;
+}
+
+/**
  * Write the per-signature hit log (`log_<out>`): one row per signature that was
  * seen at least once, with the number of distinct reads supporting its reference.
  * Shared by the flat and tree writers so both produce the same evidence trail.
@@ -682,19 +715,39 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
                              const std::string& fPath) {
     (void) fPath;
 
-    auto leafReported = [&](unsigned i) {
-        return refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
-               sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit);
-    };
-
-    // Which leaves clear the reporting thresholds.
+    // Which leaves clear the reporting thresholds: hits, reads, and the breadth
+    // of the hits over the signatures (breadthRatio). A row that clears the first
+    // two and fails the third is a single locus of the genome, not the genome;
+    // it is withheld and named on stderr.
+    std::vector<size_t> leafSigsHit(sketchCount.size(), 0);
+    std::vector<char> leafReported(sketchCount.size(), 0);
+    struct Withheld { std::string name; unsigned count; size_t reads, sigsHit, sigsTotal; double ratio; };
+    std::vector<Withheld> withheld;
+    for (unsigned i = 0; i < sketchCount.size(); i++) {
+        if (refRead[i].size() <= static_cast<size_t>(cfg.readCutoff) ||
+            sketchCount[i] < static_cast<unsigned>(cfg.sketchHit)) continue;
+        leafSigsHit[i] = countSigsHit(refSigCount[i]);
+        const double ratio = breadthRatio(sketchCount[i], leafSigsHit[i], refSigCount[i].size());
+        if (ratio < cfg.treeBreadth) {
+            withheld.push_back({sketchRef[i], sketchCount[i], refRead[i].size(), leafSigsHit[i], refSigCount[i].size(), ratio});
+            continue;
+        }
+        leafReported[i] = 1;
+    }
     std::unordered_set<std::string> reportedLeaves;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (leafReported(i)) reportedLeaves.insert(sketchRef[i]);
+        if (leafReported[i]) reportedLeaves.insert(sketchRef[i]);
     }
 
     // A family is only worth reporting when it is itself confident and none of the
     // leaves it covers was resolved; otherwise the leaf rows already say more.
+    // The breadth floor does not apply here: a node's signatures are its
+    // representative's node-unique k-mers, which sit in that genome's accessory
+    // sequence, and a member carries only a part of them (36 % for one E. coli
+    // node, a median 13 % across the 5 493-genome tree), so a present member
+    // gives its node a low-breadth pattern that cannot be told from one locus.
+    // The repeat exclusion in the group scan is what guards family rows against
+    // mobile sequence.
     std::vector<const FamilyCall*> reportedFamilies;
     for (const FamilyCall& f : families) {
         if (f.count < static_cast<unsigned>(cfg.sketchHit) ||
@@ -746,9 +799,9 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     };
     std::vector<Row> rows;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
-        if (leafReported(i)) {
+        if (leafReported[i]) {
             rows.push_back({sketchRef[i], sketchCount[i], refRead[i].size(),
-                            countSigsHit(refSigCount[i]), refSigCount[i].size(), false});
+                            leafSigsHit[i], refSigCount[i].size(), false});
         }
     }
     for (const FamilyCall* f : reportedFamilies) {
@@ -788,6 +841,15 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
             std::cerr << " " << f->name << "(" << f->coveredLeaves.size() << " members)";
         }
         std::cerr << "\n";
+    }
+    if (!withheld.empty()) {
+        std::cerr << "Tree query: " << withheld.size() << " strain call(s) withheld, hits confined to a few signatures "
+                     "(breadth below " << cfg.treeBreadth << "; --tree-breadth=0 to report them):\n";
+        for (const Withheld& w : withheld) {
+            std::cerr << "  " << w.name << "\tcount " << w.count << "\treads " << w.reads
+                      << "\tsigs_hit " << w.sigsHit << "/" << w.sigsTotal
+                      << "\tbreadth " << std::setprecision(3) << w.ratio << "\n";
+        }
     }
 
     // Signature and read logs over leaves, same files as the flat writer.

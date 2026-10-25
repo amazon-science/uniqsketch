@@ -1,4 +1,4 @@
 AGGCTACAAA	0	expected_ref_test_1	2	0	1
 GAGACTGAAC	0	expected_ref_test_1	2	1	0
 CTCAGCTAAG	1	expected_ref_test_2	2	3	0
-CCTCAGCTAA	1	expected_ref_test_2	2	3	1
+AGGCTACAAC	1	expected_ref_test_2	2	4	1

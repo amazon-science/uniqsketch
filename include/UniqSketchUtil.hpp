@@ -860,6 +860,7 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
         });
     }
     for (CandidateRun& r : cand.runs) r.pos = std::vector<uint32_t>();
+    if (cands.empty()) return {0, 0};
 
     // The contig column of the sketch: the header's first whitespace-delimited
     // token, which is what parsing the text candidate lines yielded.
@@ -874,59 +875,221 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     }
     const std::string baseId = getBaseId(fPath);
 
-    // Select evenly spaced candidates, checking low-complexity (and, when
-    // cfg.minMargin >= 2, the cross-reference Hamming margin) lazily. A
-    // candidate's sequence is computed only here, when its slot is examined.
+    // Selection: spread the signatures along the genome.
+    //
+    // The genome (its contigs laid end to end in the order above) is cut into
+    // `quota` windows of equal length, and the first usable candidate of every
+    // window is taken. Windows left empty, because they hold no candidate or no
+    // candidate passes the margin, do not hand their place to anyone; the quota
+    // that remains goes to the windows that did supply one, each in proportion
+    // to its candidates and capped at a common level chosen so that the shares
+    // add up to the quota (pass 2 below). The cap binds only when the supplied
+    // windows' shares exceed the quota, that is for a reference that reaches
+    // it: such a reference gets a flat density, one signature per window when
+    // the windows outnumber the quota. Below the quota the cap is idle and a
+    // window's share is its candidate share, which is the old allocation with
+    // the slots the old grid left empty now filled: on a 120-genome E. coli
+    // index at -c5000 no reference reaches the quota, the sketch grows from
+    // 352 797 to 373 001 signatures, and the share of each reference's
+    // signatures in its densest 2-kb window is unchanged (median 0.027).
+    //
+    // Selection used to space its slots over the candidate list instead, one per
+    // total/quota candidates, and fill rates differ by locus: in the core of a
+    // bacterial genome most candidates are a substitution away from a relative
+    // and fail the strict margin, while every position of a foreign insertion
+    // is a candidate and every one passes. On that 120-genome index a 785-bp
+    // insertion holding 3 % of one genome's candidates took 21 % of its
+    // chromosomal signatures (191 per kb against 0.15 elsewhere), a 65-kb
+    // plasmid took 72 % of the whole set, and 717 reads of a human gut
+    // metagenome with no Escherichia in it hit 155 of those signatures and
+    // called the strain. Mobile sequence is both the most candidate-dense and
+    // the most likely to turn up in organisms outside the index, which is
+    // the same mechanism as the family-level erm(B) call fixed in the group
+    // scan. Spacing by position does not cure that below the quota (the
+    // insertion keeps its 150 signatures; that genome has 2-safe candidates in
+    // 63 of 5 000 windows, so any rule that honours the quota gives each of
+    // them dozens), and the two rules that flattened regardless of the quota
+    // were rejected on the sweep (pass 2 below); the query's breadth floor
+    // (QuerySketchUtil.hpp, breadthRatio) is what closes the gut call. What
+    // selection by position guarantees is a floor, one signature in every
+    // window that has a usable candidate, and a flat layout for a reference at
+    // its quota.
+    //
+    // Candidates are examined lazily, and only as far as needed: a window is
+    // walked in position order until one candidate is usable (low-complexity
+    // and homopolymer filters, then the margin when cfg.minMargin >= 2), so a
+    // dense window costs one margin check and a sparse one at most its size.
+    // In soft-margin mode a window with no 2-safe candidate takes its first
+    // margin-1 one; strict mode leaves it empty.
     const size_t total = cands.size();
-    int count = 0;
-    size_t safeCount = 0;
-    size_t needed = std::min(static_cast<size_t>(cfg.sketchnum), total);
-    double step = static_cast<double>(total) / needed;
     const bool useMargin = (cfg.minMargin >= 2);
+    const size_t quota = static_cast<size_t>(std::max(cfg.sketchnum, 1));
 
-    // Commit the first usable candidate in [a, b). When requireSafe is set, only
-    // 2-safe candidates are accepted. Returns true if a signature was committed.
-    auto trySlot = [&](size_t a, size_t b, bool requireSafe) -> bool {
+    // Global coordinate: contigs end to end in sorted order. Same-named contigs
+    // share one span (their positions interleave in `cands`), so rank, not run,
+    // indexes the offsets; with distinct names rank is the sorted position.
+    std::vector<uint32_t> rankOf(nRuns);
+    std::vector<uint64_t> rankLen;
+    for (size_t i = 0; i < nRuns; i++) {
+        if (i == 0 || nameLess(runOrder[i - 1], runOrder[i])) rankLen.push_back(0);
+        rankOf[runOrder[i]] = static_cast<uint32_t>(rankLen.size() - 1);
+        rankLen.back() = std::max<uint64_t>(rankLen.back(), cand.runs[runOrder[i]].seqLen);
+    }
+    std::vector<uint64_t> rankOffset(rankLen.size(), 0);
+    for (size_t r = 1; r < rankLen.size(); r++) rankOffset[r] = rankOffset[r - 1] + rankLen[r - 1];
+    const uint64_t genomeLen = std::max<uint64_t>(rankOffset.back() + rankLen.back(), 1);
+    const size_t windows = static_cast<size_t>(std::min<uint64_t>(quota, genomeLen));
+    auto windowOf = [&](const Cand& c) -> size_t {
+        const uint64_t g = rankOffset[rankOf[c.run]] + c.pos;
+        return static_cast<size_t>(std::min<uint64_t>(windows - 1, g * windows / genomeLen));
+    };
+    // cands is sorted by (rank, pos), so windows are contiguous ranges of it.
+    std::vector<size_t> wBegin(windows + 1, total);
+    for (size_t i = 0, w = 0; i < total; i++) {
+        const size_t wi = windowOf(cands[i]);
+        while (w <= wi) wBegin[w++] = i;
+    }
+
+    struct Pick { size_t index; std::string seq; bool safe; };
+    std::vector<Pick> picks;
+    picks.reserve(std::min(quota, total));
+    std::vector<char> noSafeLeft(windows, 0);       // a full walk of the window found no 2-safe candidate
+
+    // 0: unusable; 1: usable, margin 1 (or margin not required); 2: usable, 2-safe.
+    auto examine = [&](size_t i, bool checkMargin, std::string& useq) -> int {
+        const Cand& c = cands[i];
+        useq = get_canonical(contigs[c.run].substr(c.pos, cfg.kmerLen));
+        if (lowComplexity(cfg, useq) || hasLongHomopolymer(cfg, useq)) return 0;
+        if (!checkMargin) return 1;
+        return isTwoSafe(cfg, useq, dbFilter) ? 2 : 1;
+    };
+    // Take the first usable candidate in [a, b), a range inside window w, or
+    // report that it has none. On the window's first call, in soft-margin mode,
+    // a window with no 2-safe candidate yields its first margin-1 one; strict
+    // mode leaves it empty. Either way a window once found to have no 2-safe
+    // candidate is not probed for the margin again.
+    auto takeIn = [&](size_t w, size_t a, size_t b) -> bool {
+        const bool wantSafe = useMargin && !noSafeLeft[w];
+        size_t fallback = total;
+        std::string fallbackSeq, useq;
         for (size_t i = a; i < b; i++) {
-            const Cand& c = cands[i];
-            std::string useq = get_canonical(contigs[c.run].substr(c.pos, cfg.kmerLen));
-
-            if (lowComplexity(cfg, useq)) continue;
-            if (hasLongHomopolymer(cfg, useq)) continue;
-            if (requireSafe && !isTwoSafe(cfg, useq, dbFilter)) continue;
-
-            // No claim filter across references. A candidate is a k-mer the
-            // solid filter does not contain, and a Bloom filter has no false
-            // negatives, so a k-mer in two references, or twice in one, is a
-            // candidate for neither; the shared filter that used to gate this
-            // line could only ever drop a valid candidate on a false positive,
-            // and which one depended on the order the threads reached it. The
-            // index must not depend on that (see GroupScanner).
-            ++count;
-            // `out` is this reference's private buffer, so no lock is needed.
-            out << useq << "\t" << refId << "\t" << baseId
-                << "\t" << cfg.numRef << "\t" << contigToken[c.run] << "\t" << c.pos << "\n";
-            return true;
+            const int v = examine(i, wantSafe, useq);
+            if (v == 2 || (v == 1 && !wantSafe)) {
+                picks.push_back({i, useq, v == 2});
+                return true;
+            }
+            if (v == 1 && fallback == total) { fallback = i; fallbackSeq = useq; }
+        }
+        if (wantSafe && a == wBegin[w] && b == wBegin[w + 1]) {
+            noSafeLeft[w] = 1;
+            if (!cfg.strictMargin && fallback != total) {
+                picks.push_back({fallback, fallbackSeq, false});
+                return true;
+            }
         }
         return false;
     };
 
-    for (size_t s = 0; s < needed && count < cfg.sketchnum; s++) {
-        size_t slotStart = static_cast<size_t>(s * step);
-        size_t slotEnd = (s + 1 < needed) ? static_cast<size_t>((s + 1) * step) : total;
-
-        if (useMargin) {
-            // Prefer a 2-safe candidate. In soft mode (default) fall back to a
-            // margin-1 candidate if the slot has no 2-safe option; in strict mode
-            // leave the slot empty rather than admit a margin-1 signature.
-            if (trySlot(slotStart, slotEnd, true)) ++safeCount;
-            else if (!cfg.strictMargin) trySlot(slotStart, slotEnd, false);
-        } else {
-            trySlot(slotStart, slotEnd, false);
+    // Pass 1: the first usable candidate of every window.
+    std::vector<size_t> active;             // windows that supplied
+    std::vector<size_t> firstPick(windows, total);
+    for (size_t w = 0; w < windows && picks.size() < quota; w++) {
+        if (wBegin[w] == wBegin[w + 1]) continue;
+        if (takeIn(w, wBegin[w], wBegin[w + 1])) { active.push_back(w); firstPick[w] = picks.back().index; }
+    }
+    // Pass 2: the unfilled quota goes to the windows that supplied. A window's
+    // share is its share of the candidates, quota * (its candidates / total),
+    // capped at a common level chosen so that the shares add up to the quota.
+    // The share is laid out as equal runs of the window's candidate list, one
+    // pick per run (the first usable), which inside a window is what the old
+    // slots did over the whole list.
+    //
+    // The candidate share alone was the old rule, and it concentrated: a
+    // 785-bp foreign insertion that held 3 % of a genome's candidates took 21 %
+    // of its chromosomal signatures, because every one of its positions is a
+    // candidate and every one passes the margin while the core's mostly do not.
+    // An equal share for every supplied window (tried first) concentrated the
+    // other way: a window whose supply is one 74-bp cluster of
+    // substitution-overlapping k-mers got the same dozen picks as a window with
+    // candidates throughout, 12 to 17 signatures within one read length, where
+    // the candidate share had given it 2 to 4. A read from a close relative
+    // carrying the two coincident errors that make this genome's k-mers look
+    // like its own hits every signature whose k-mer covers both sites, so a
+    // dozen in one cluster is a single-read call: four false rows on the
+    // 120-genome sweep that had none. Taking a window's share as its next
+    // usable candidates (tried second) put the share at consecutive positions
+    // (18 such rows). Capping the candidate share at a common level is the old
+    // allocation for a reference below its quota, and a flat one for a
+    // reference at it. The picks move either way, since a run is laid over a
+    // window's candidates where a slot was laid over the whole list: on the
+    // 8-phage index at -c500 the four phages that take their whole pool are
+    // unchanged and the other four keep 1 to 101 of 500 (1 834 of 2 835
+    // signatures change); on the 120-genome index 7 of 119 references are
+    // unchanged and 24 % of the old signatures are kept. No row of either
+    // 280-mixture sweep changes, nor the abundance error.
+    if (!active.empty() && picks.size() < quota) {
+        // Each window's candidate share, then the water level: the largest cap L
+        // with sum(min(candShare, L)) <= quota, and the remainder as one more to
+        // the first windows (in position order) still above L. The sum reaches
+        // the quota whenever the candidate shares do, which they always do (they
+        // are rounded up), so a reference falls short of the quota only when its
+        // windows run out of usable candidates, never through rounding.
+        std::vector<size_t> candShare(windows, 0);
+        size_t maxShare = 1;
+        for (size_t w : active) {
+            const size_t nw = wBegin[w + 1] - wBegin[w];
+            candShare[w] = std::max<size_t>(1, static_cast<size_t>(
+                (static_cast<unsigned __int128>(nw) * quota + total - 1) / total));
+            maxShare = std::max(maxShare, candShare[w]);
+        }
+        auto sumAt = [&](size_t L) {
+            size_t s = 0;
+            for (size_t w : active) s += std::min(candShare[w], L);
+            return s;
+        };
+        size_t lo = 1, hi = maxShare;                     // largest L with sumAt(L) <= quota
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo + 1) / 2;
+            if (sumAt(mid) <= quota) lo = mid; else hi = mid - 1;
+        }
+        const size_t level = lo;
+        size_t remainder = quota - std::min(quota, sumAt(level));
+        std::vector<size_t> share(windows, 0);
+        for (size_t w : active) {
+            share[w] = std::min(candShare[w], level);
+            if (remainder && candShare[w] > level) { ++share[w]; --remainder; }
+        }
+        for (size_t sub = 1, more = true; more && picks.size() < quota; sub++) {
+            more = false;
+            for (size_t w : active) {
+                if (picks.size() >= quota) break;
+                if (sub >= share[w]) continue;
+                more = true;
+                const size_t wb = wBegin[w], nw = wBegin[w + 1] - wb;
+                const size_t a = wb + sub * nw / share[w];
+                const size_t b = wb + (sub + 1) * nw / share[w];
+                if (b <= firstPick[w] || a >= b) continue;          // pass 1's run, or an empty one
+                takeIn(w, std::max(a, firstPick[w] + 1), b);
+            }
         }
     }
 
-    return SketchStat{static_cast<size_t>(count), safeCount};
+    // Position order, as the candidates are, so two builds of the same index
+    // are comparable line by line.
+    std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.index < b.index; });
+    size_t safeCount = 0;
+    for (const Pick& p : picks) {
+        const Cand& c = cands[p.index];
+        safeCount += p.safe;
+        // `out` is this reference's private buffer, so no lock is needed. No
+        // claim filter across references either: a candidate is a k-mer the
+        // solid filter does not contain, and a Bloom filter has no false
+        // negatives, so a k-mer in two references, or twice in one, is a
+        // candidate for neither (see GroupScanner for why the filter went).
+        out << p.seq << "\t" << refId << "\t" << baseId
+            << "\t" << cfg.numRef << "\t" << contigToken[c.run] << "\t" << c.pos << "\n";
+    }
+    return SketchStat{picks.size(), safeCount};
 }
 
 /**

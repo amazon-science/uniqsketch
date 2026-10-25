@@ -42,6 +42,9 @@ static const char USAGE_MESSAGE[] =
     "      --solid\t\tonly use solid k-mers in reads\n"
     "      --tree=DIR\thierarchical query using a --tree index directory\n"
     "      --tree-prune=N\tmin coarse-level hits to keep a sub-tree in play (with --tree) [1]\n"
+    "      --tree-breadth=F\tmin breadth of a call: distinct signatures hit, as a fraction of\n"
+    "\t\t\twhat its hit count would spread over if the genome were present;\n"
+    "\t\t\tbelow it the hits sit in one locus and the call is withheld (with --tree) [0.5]\n"
     "      --no-group-signatures\tleaf level uses globally unique signatures only (with --tree)\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\tversion information and exit\n"
@@ -49,7 +52,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:g:l:r:o:h:a:s:b:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE, OPT_NOGROUPSIGS };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE, OPT_TREEBREADTH, OPT_NOGROUPSIGS };
 
 // --sensitive / --very-sensitive / --solid are getopt flag entries, which store
 // through a pointer at parse time and so cannot target a struct member. They write
@@ -73,6 +76,7 @@ static const struct option longopts[] = {
     {"solid",          no_argument, &g_solid, 1},
     {"tree",           required_argument, nullptr, OPT_TREE},
     {"tree-prune",     required_argument, nullptr, OPT_TREEPRUNE},
+    {"tree-breadth",   required_argument, nullptr, OPT_TREEBREADTH},
     {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
     {"help",           no_argument, nullptr, OPT_HELP},
     {"version",        no_argument, nullptr, OPT_VERSION},
@@ -85,10 +89,10 @@ static const struct option longopts[] = {
  * The coarsest level sketch is queried first; cluster representatives that clear the
  * hit/read thresholds mark their descendant leaves as candidates. Each finer level is
  * then queried with its sketch restricted to signatures of references that are still
- * candidates, so the search narrows down the tree. The final (leaf) level sketch
- * (cfg.ref) is queried restricted to the surviving candidate leaves and its result is
- * written. This applies the candidate narrowing that the flat port computed but never
- * used, so the tree actually focuses the query on promising sub-trees.
+ * candidates, so the search narrows down the tree. At the leaf level a leaf is in
+ * play if the narrowing kept it or if its own signatures, global or within-group,
+ * carry evidence of their own (a member need not resemble its representative; see
+ * the leaf-level block), and its result is written.
  */
 static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                          const std::vector<std::string>& sampleFiles, bool readCutoffGiven) {
@@ -299,12 +303,30 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     std::unordered_set<std::string> candidates;
     for (const TreeNode& node : tree)
         if (node.isLeaf) candidates.insert(getBaseId(node.filePath));
+    // Leaves covered, at any level, by a representative with evidence of its
+    // own, whether or not the narrowing had already dropped them. A member
+    // carries its ancestors' signatures at some levels and not others (on the
+    // 5 493-genome E. coli tree a leaf's level-0 node could be hit on 83 % of
+    // its signatures and its level-1 node on none), so the narrowing, which
+    // needs survival at every level, loses genomes the coarse levels did see.
+    // The leaf level uses this as the mask's notion of "may be present".
+    std::unordered_set<std::string> everInPlay;
+    // Leaves covered, at some level, by a representative whose evidence stands
+    // on its own: the reporting hit threshold, on two or more reads. This is
+    // what lets a leaf join on a single read (see the leaf level). everInPlay
+    // is too wide for that: one hit on one of a representative's thousands of
+    // signatures is a stray that nearly every lineage collects from a few
+    // million error-carrying reads of the dominant genome (on the 1 000-genome
+    // sweep all four false single-read rows had such an ancestor; on the
+    // 5 493-genome sweep 41 of 43), so gating on it changed nothing.
+    std::unordered_set<std::string> lineageAttested;
+    const size_t attestReads = std::max<size_t>(static_cast<size_t>(cfg.readCutoff), 1);
     std::vector<FamilyCall> familyCalls;         // coarse detections, for level-appropriate reporting
 
-    // Walk the levels coarse to fine over the tallies. Only references that still
-    // cover a candidate leaf are scored at a level; the others' tallies are
-    // discarded, exactly as their signatures used to be left out of that level's
-    // pass, so a leaf whose family was pruned cannot resurface on its own hits.
+    // Walk the levels coarse to fine over the tallies. At a coarse level only
+    // references that still cover a candidate leaf are scored; the others'
+    // tallies are discarded, as their signatures used to be left out of that
+    // level's pass. The leaf level adds back any leaf with evidence of its own.
     for (size_t li = 0; li < levels.size(); li++) {
         Level& L = levels[li];
         const unsigned level = L.level;
@@ -312,20 +334,189 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         const size_t n = L.ref.size();
 
         std::vector<bool> scored(n, false);
-        {
+        std::vector<bool> present;                      // leaf level: what the within-group mask treats as present
+        if (!isLeaf) {
             const auto& lm = levelMap[level];
             for (unsigned i = 0; i < n; i++) {
-                bool inPlay = false;
-                if (isLeaf) {
-                    inPlay = candidates.count(L.ref[i]) > 0;
-                } else {
-                    auto it = lm.find(L.ref[i]);
-                    if (it != lm.end())
-                        for (const auto& lf : it->second)
-                            if (candidates.count(lf)) { inPlay = true; break; }
-                }
-                scored[i] = inPlay;
+                auto it = lm.find(L.ref[i]);
+                if (it == lm.end()) continue;
+                for (const auto& lf : it->second)
+                    if (candidates.count(lf)) { scored[i] = true; break; }
+                // Evidence at this level, narrowed or not (the tallies cover every
+                // representative; `scored` only decides which are reported from).
+                unsigned c = tally.count[L.targetBase + i];
+                if (cfg.solid && c) ++c;
+                const size_t r = tally.reads[L.targetBase + i].size();
+                if (c >= static_cast<unsigned>(cfg.treePruneHit) && r > 0)
+                    for (const auto& lf : it->second) everInPlay.insert(lf);
+                if (c >= static_cast<unsigned>(cfg.sketchHit) && r > attestReads)
+                    for (const auto& lf : it->second) lineageAttested.insert(lf);
             }
+        } else {
+            // A leaf is in play if the narrowing kept it, or if its own signatures,
+            // global or within-group, clear the floor. The set serves twice: it is
+            // what the leaf level scores and reports, and it is what the
+            // within-group mask below checks a signature's carriers against.
+            //
+            // The narrowing alone assumed two things that hold on a hundred
+            // genomes and fail on thousands (docs/v2.0-validation.md,
+            // "Scalability"). First, that a member carries its ancestors'
+            // signatures: a node's signatures are its representative's k-mers
+            // absent outside the node, and in a dense set those are the
+            // representative's private accessory sequence, so a member's reads
+            // hit none of them and the member was pruned with its own signatures
+            // never consulted (44 % of 5 493 E. coli leaves had such an ancestor;
+            // a 90 % main vanished from the output). Hence the rescue by own
+            // evidence. Second, that a genome present in the sample is a scored
+            // candidate: a leaf with no global signatures has no line in the leaf
+            // sketch, so it could not be named here, was never scored, and never
+            // counted as the carrier of a within-group signature; its reads went
+            // into its relatives' signatures (222 802 of 223 003 false hits in
+            // that benchmark). Hence the names from leaves.tsv: such a leaf is in
+            // play when its lineage is, which is the only evidence it can leave,
+            // and then blocks the signatures it carries.
+            //
+            // A carrier in play by lineage alone, with no hit on its own
+            // signatures, still blocks. Treating it as absent (tried first) let a
+            // 0.01 % contaminant's few reads, too few to hit its own signatures,
+            // land on the within-group signatures of its siblings and produce 49
+            // false single-read rows on the 120-genome sweep that had none. And
+            // for the mask, lineage means evidence at any level (everInPlay), not
+            // survival at all of them: a genome with no global signatures that was
+            // pruned at one level is otherwise invisible, and on the 5 493-genome
+            // index a 99.99 % main in that position put 976 hits into 20
+            // within-group signatures of the 0.01 % contaminant, 10 of which it
+            // carries verbatim, inflating that contaminant's count fifty-fold.
+            std::vector<std::string> leafName = loadTreeLeaves(treeLeavesPath(treeDir));
+            if (leafName.size() != n) {
+                if (!leafName.empty())
+                    std::cerr << "Tree query: " << treeLeavesPath(treeDir) << " lists " << leafName.size()
+                              << " leaves, the leaf sketch " << n << "; ignoring it\n";
+                leafName = L.ref;
+                for (const GroupSignature& s : groupSigs)
+                    if (s.refId < n && leafName[s.refId].empty()) leafName[s.refId] = s.refName;
+            }
+            // The floor for joining by own evidence is the reporting threshold, not
+            // the pruning floor. A leaf below it cannot be reported, so bringing it
+            // in gains nothing, and as a carrier it would withhold its relatives'
+            // within-group signatures: with the pruning floor (tried first), 268 of
+            // 300 rescues on the 120-genome sweep were one read on one signature,
+            // the single-error noise the strict margin keeps below threshold, and
+            // each cost a present genome up to 7 % of its hits. Every genuine
+            // rescue seen on the 5 493-genome index had 20 to 14 006 hits.
+            // And a single read counts only for a leaf whose lineage is attested.
+            // One read is evidence on a strict-margin index because a read from
+            // another organism needs two coincident errors to hit a signature;
+            // across thousands of close genomes the pairs of k-mers two
+            // substitutions apart are numerous enough that such reads do occur,
+            // in runs of 10 to 38 consecutive k-mers from one read of the
+            // dominant genome. On the 5 493-genome sweep they made 43 false
+            // strain rows, every one a single read, 35 of them leaves joining by
+            // own evidence and 39 with no ancestor in common with the sample's
+            // main; every true single-read row belonged to a family whose node
+            // had evidence of its own (48 to 52 858 reads). So a leaf covered at
+            // some level by a representative that cleared the reporting hit
+            // threshold on two or more reads (lineageAttested) joins at
+            // --rcutoff, and a leaf whose lineage has no such support needs two
+            // reads of its own. Two variants were tried first. Two reads of
+            // every rescue removed the 35 but cost real resolution, because the
+            // rescue is judged on the leaf's global signatures and the
+            // within-group ones nobody else carries, not on everything it is
+            // later scored with: a strain whose global signatures all sit on a
+            // 65-kb plasmid had one read there and 29 on its within-group
+            // signatures, and the 1 000-genome sweep lost a close contaminant's
+            // strain rows at 0.01 % (29 to 23) and 0.1 % (46 to 38), the
+            // 5 493-genome sweep at 1 % (40 to 28). Gating on everInPlay instead
+            // (one hit on a covering representative) removed 2 of the 43: a
+            // stray hit on an ancestor's thousands of signatures is as common as
+            // the stray run on the leaf's.
+            const unsigned floor = static_cast<unsigned>(cfg.sketchHit);
+            const size_t readFloor = static_cast<size_t>(cfg.readCutoff);
+            const size_t unattestedFloor = std::max<size_t>(readFloor, 1);
+            auto leafReadFloor = [&](unsigned i) {
+                return (!leafName[i].empty() && lineageAttested.count(leafName[i]) > 0) ? readFloor : unattestedFloor;
+            };
+            size_t narrowed = 0, unseen = 0, rescuedGlobal = 0, rescuedGroup = 0, unnamed = 0;
+            size_t rescuedOneRead = 0;                   // rescues on a single read, lineage attested
+            for (unsigned i = 0; i < n; i++) {
+                const unsigned t = L.targetBase + i;
+                const bool inLineage = !leafName[i].empty() && candidates.count(leafName[i]) > 0;
+                const bool ownGlobal = tally.count[t] >= floor && tally.reads[t].size() > leafReadFloor(i);
+                scored[i] = inLineage || ownGlobal;
+                if (inLineage) {
+                    ++narrowed;
+                    if (L.sig[i].empty()) ++unseen;         // cannot be reported; blocks what it carries
+                } else if (ownGlobal) {
+                    ++rescuedGlobal;
+                    if (tally.reads[t].size() == 1) ++rescuedOneRead;
+                } else if (leafName[i].empty()) {
+                    // Nothing is known about this leaf, not even its name; it may be
+                    // present. Keep it in play so that the signatures it carries
+                    // are withheld.
+                    scored[i] = true;
+                    ++unnamed;
+                }
+            }
+            // Rescue by within-group evidence: only the signatures with no carrier
+            // at all count. Those are k-mers unique in the whole index that the
+            // global selection did not draw (a quarter of the within-group set on
+            // the 120-genome index), so a hit on one is evidence for its leaf
+            // alone. A hit on a carried signature is evidence that the leaf *or a
+            // carrier* is present, and the carrier is exactly the genome the
+            // narrowing may have missed: counting such hits (tried first) put a
+            // 0.01 % contaminant's reads on the within-group signatures of eight
+            // unrelated leaves it carried, and reported them as strains; counting
+            // them when no carrier was in play (tried second) did the same, since
+            // a contaminant at that abundance leaves nothing else to be in play
+            // by. The mask below judges the same hits the same way once the leaf
+            // is in play, so this keeps the two decisions consistent.
+            std::vector<unsigned> grpCount(n, 0);
+            std::vector<std::unordered_set<std::string>> grpReads(n);
+            for (unsigned g = 0; g < groupSigs.size(); g++) {
+                const GroupSignature& s = groupSigs[g];
+                if (groupDropped[g] || s.refId >= n || scored[s.refId] || !s.carriers.empty()) continue;
+                unsigned t = groupBase + g;
+                if (tally.count[t] == 0) continue;
+                grpCount[s.refId] += tally.count[t];
+                grpReads[s.refId].insert(tally.reads[t].begin(), tally.reads[t].end());
+            }
+            std::vector<size_t> grpRead(n, 0);
+            for (unsigned i = 0; i < n; i++) grpRead[i] = grpReads[i].size();
+            for (unsigned i = 0; i < n; i++) {
+                if (!scored[i] && grpCount[i] >= floor && grpRead[i] > leafReadFloor(i)) {
+                    scored[i] = true;
+                    ++rescuedGroup;
+                    if (grpRead[i] == 1) ++rescuedOneRead;
+                }
+            }
+            // The mask's set: in play, or, for a leaf with no global signatures,
+            // covered at some level by a representative with evidence. A leaf that
+            // has global signatures and is present hits them (they are spread
+            // along its genome), so its absence from `scored` means absence;
+            // only the signature-less leaf leaves no trace of its own, and that is
+            // the leak this closes. Extending the lineage rule to every leaf (tried
+            // first) made all 20 members of a present main's level-0 node block,
+            // and cost a 0.01 % sibling 175-388 of its within-group signatures on
+            // the 120-genome sweep.
+            present.assign(n, false);
+            size_t presentByLineage = 0;
+            for (unsigned i = 0; i < n; i++) {
+                present[i] = scored[i] ||
+                             (L.sig[i].empty() && !leafName[i].empty() && everInPlay.count(leafName[i]) > 0);
+                if (present[i] && !scored[i]) ++presentByLineage;
+            }
+            std::cerr << "Tree query: leaf level: " << narrowed << " leaves in play after narrowing ("
+                      << unseen << " with no global signatures), " << rescuedGlobal
+                      << " more by hits on their own global signatures, " << rescuedGroup
+                      << " by hits on their within-group signatures (" << rescuedOneRead
+                      << " of these on one read, their lineage attested at a coarse level); "
+                      << presentByLineage
+                      << " signature-less leaves treated as present carriers on coarse-level evidence";
+            if (unnamed) {
+                std::cerr << ", " << unnamed << " unnamed and kept in play (no "
+                          << treeLeavesPath(treeDir) << "; rebuild the index to name them)";
+            }
+            std::cerr << "\n";
         }
 
         std::vector<unsigned> levelCount(n, 0);
@@ -339,12 +530,12 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         for (unsigned s = L.slotBegin; s < L.slotEnd; s++)
             if (scored[slotRef[s]]) *slotCounter[s] += tally.slotCount[s];
 
-        // Within-group signatures join the leaf level for candidate leaves, each
-        // admitted only if none of the genomes carrying it is itself a candidate.
-        // The candidate set is the permissive one the coarse levels left, so a
-        // carrier with any trace of evidence blocks the signature; the cost is a
-        // smaller supplementary set in samples that contain the carrier, never a
-        // hit attributed to the wrong genome.
+        // Within-group signatures join the leaf level for leaves in play, each
+        // admitted only if none of the genomes carrying it may be present: in
+        // play itself, or covered at some level by a representative with
+        // evidence. A carrier with any trace of evidence blocks the signature;
+        // the cost is a smaller supplementary set in samples that contain the
+        // carrier, never a hit attributed to the wrong genome.
         if (isLeaf && !groupSigs.empty()) {
             size_t used = 0, blocked = 0, idle = 0;
             std::unordered_set<unsigned> leavesUsing;
@@ -354,7 +545,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 if (s.refId >= n || !scored[s.refId]) { ++idle; continue; }
                 bool carrierPresent = false;
                 for (unsigned c : s.carriers)
-                    if (c < n && scored[c]) { carrierPresent = true; break; }
+                    if (c < n && present[c]) { carrierPresent = true; break; }
                 if (carrierPresent) { ++blocked; continue; }
                 if (groupDropped[g] || !admitted.insert(s.seq).second) continue;
                 unsigned t = groupBase + g;
@@ -368,9 +559,9 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 leavesUsing.insert(s.refId);
             }
             std::cerr << "Tree query: within-group signatures: " << used << " in use for "
-                      << leavesUsing.size() << " candidate leaves, " << blocked
-                      << " withheld (a carrier is a candidate), " << idle
-                      << " belong to non-candidates\n";
+                      << leavesUsing.size() << " leaves, " << blocked
+                      << " withheld (a carrier may be present), " << idle
+                      << " belong to leaves not in play\n";
         }
 
         // Adjust for the first occurrence the --solid filter swallowed.
@@ -472,6 +663,7 @@ int main(int argc, char* const argv[]) {
         case 'b': arg >> cfg.bits;            break;
         case OPT_TREE: arg >> treeDir;         break;
         case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
+        case OPT_TREEBREADTH: arg >> cfg.treeBreadth; break;
         case OPT_NOGROUPSIGS: cfg.noGroupSignatures = true; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;

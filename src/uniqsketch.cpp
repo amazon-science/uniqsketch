@@ -311,6 +311,10 @@ int main(int argc, char** argv) {
             if (node.isLeaf) uniqueRefs.insert(node.filePath);
         }
         refFiles.assign(uniqueRefs.begin(), uniqueRefs.end());
+        // The leaf numbering, for leaves the sketches cannot name (see
+        // treeLeavesPath). Written before any sketch so that it is there even if
+        // the build stops later.
+        writeTreeLeaves(treeLeavesPath(cfg.outdir), refFiles);
         std::cerr << "Building sketch from " << refFiles.size() << " tree leaf references\n";
 
         // Build a coarse-level sketch for each internal level. Each level gets its
