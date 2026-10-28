@@ -1,2 +1,2 @@
-ref	abundance	count	reads	sigs_hit	sigs_total	resolution
-expected_ref_test_1	1	3	1	2	2	strain
+ref	abundance	count	reads	sigs_hit	sigs_total	resolution	members
+expected_ref_test_1	1	3	1	2	2	strain	-

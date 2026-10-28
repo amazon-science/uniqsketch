@@ -799,16 +799,32 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         size_t sigsHit;
         size_t sigsTotal;
         bool isFamily;
+        std::string members;   // family rows: the leaves the node covers
     };
     std::vector<Row> rows;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
         if (leafReported[i]) {
             rows.push_back({sketchRef[i], sketchCount[i], refRead[i].size(),
-                            leafSigsHit[i], refSigCount[i].size(), false});
+                            leafSigsHit[i], refSigCount[i].size(), false, "-"});
         }
     }
+    // A family row is named after the node, which is named after its cluster
+    // representative, so a sample holding only some other member of the group is
+    // reported under a name it does not contain. The members are known here;
+    // listing them saves a lookup in tree_index.tsv at exactly the moment the
+    // reader is trying to work out what was found. Capped so that a node of
+    // several hundred leaves cannot swamp the row; the count stays exact.
     for (const FamilyCall* f : reportedFamilies) {
-        rows.push_back({f->name, f->count, f->reads, f->sigsHit, f->sigsTotal, true});
+        std::vector<std::string> mem(f->coveredLeaves.begin(), f->coveredLeaves.end());
+        std::sort(mem.begin(), mem.end());
+        const size_t cap = 8;
+        std::string list;
+        for (size_t j = 0; j < mem.size() && j < cap; j++) {
+            if (j) list += "|";
+            list += mem[j];
+        }
+        if (mem.size() > cap) list += "|+" + std::to_string(mem.size() - cap) + " more";
+        rows.push_back({f->name, f->count, f->reads, f->sigsHit, f->sigsTotal, true, list});
     }
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.count > b.count; });
@@ -823,7 +839,7 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     // resolved references (`strain`) from group calls (`family`), so a family
     // row can never be mistaken for a strain call downstream.
     std::ofstream outFile(cfg.out);
-    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
+    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\tmembers\n";
     if (densitySum > 0.0) {
         for (const Row& r : rows) {
             double abundance = hitsPerSignature(r.count, r.sigsTotal) / densitySum;
@@ -831,7 +847,8 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
                 outFile << r.name << "\t" << abundance << "\t" << r.count
                         << "\t" << r.reads << "\t" << r.sigsHit
                         << "\t" << r.sigsTotal
-                        << "\t" << (r.isFamily ? "family" : "strain") << "\n";
+                        << "\t" << (r.isFamily ? "family" : "strain")
+                        << "\t" << r.members << "\n";
             }
         }
     }
@@ -929,7 +946,7 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     // emit `family` rows (see generateTreeQueryResult). Columns are appended so
     // parsers of the original three are unaffected.
     std::ofstream outFile(cfg.out);
-    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\n";
+    outFile << "ref\tabundance\tcount\treads\tsigs_hit\tsigs_total\tresolution\tmembers\n";
     if (densitySum > 0.0) {
         for (unsigned i = 0; i < sketchCount.size(); i++) {
             unsigned idx = sketchIndex[i];
@@ -942,7 +959,7 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
                             << "\t" << refRead[idx].size()
                             << "\t" << refSigsHit[idx]
                             << "\t" << refSigCount[idx].size()
-                            << "\tstrain\n";
+                            << "\tstrain\t-\n";
                 }
             }
         }
