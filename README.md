@@ -403,6 +403,11 @@ thresholds:
 | `-s, --rcutoff=N` | 2 (0 with `--tree` on a strict-margin index) | needs **more than** N distinct matching reads |
 | `-a, --acutoff=F` | 0.0 | needs relative abundance **greater than** F |
 
+Note for anyone carrying an `-a` threshold over from 1.x: abundance changed definition
+in 2.0 (hits per signature, not raw count). The two agree only when every reference holds
+the same number of signatures, which `--strict-margin` on close references makes the
+exception rather than the rule. Re-measure the threshold rather than assuming it.
+
 The first two are the ones that matter in practice. `--hit` guards against a
 reference being called on a handful of stray k-mer matches, and `--rcutoff` guards
 against many hits that all came from a single read — which is what a chimeric or
