@@ -1154,7 +1154,18 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
     // gap, invisible to any check that sorted the file first.
     std::vector<std::ostringstream> perRef(uniqStats.size());
 
+    // A reference that ends the build with no signatures can never be reported by
+    // any query, at any threshold. The candidate scan already warns when the pool
+    // itself is empty (an identical reference, or a file yielding no k-mers), but a
+    // reference whose pool is non-empty and is then consumed entirely by the
+    // entropy, homopolymer and margin filters used to pass in silence. On an
+    // internal 40-reference set 14 references held no signatures and only 7 said
+    // so; the 7 that did not had pools of 56 to 560 candidates, and one of them was
+    // the dominant vector of a sample the screen then reported nothing for.
     size_t totalSel = 0, totalSafe = 0;
+    std::vector<size_t> refSelected(uniqStats.size(), 0);
+    std::vector<size_t> refCandidates(uniqStats.size(), 0);
+    std::vector<std::string> refPath(uniqStats.size());
     #pragma omp parallel for schedule(dynamic) reduction(+:totalSel, totalSafe)
     for (unsigned i = 0; i < uniqStats.size(); i++) {
         std::istringstream uniqstm(uniqStats[i]);
@@ -1162,6 +1173,9 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
         size_t sketchCount, sketchRefId;
         uniqstm >> sketchPath >> sketchCount >> sketchRefId;
         SketchStat st = getUniqSet(cfg, sketchPath, sketchRefId, perRef[i], dbFilter);
+        refSelected[i] = st.selected;
+        refCandidates[i] = sketchCount;
+        refPath[i] = sketchPath;
         totalSel += st.selected;
         totalSafe += st.safe;
     }
@@ -1178,6 +1192,27 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
                       << 100.0 * static_cast<double>(totalSafe) / totalSel << "%)";
         }
         std::cout << "\n";
+    }
+
+    size_t noSignature = 0;
+    for (unsigned i = 0; i < refSelected.size(); i++) {
+        if (refSelected[i] != 0) continue;
+        noSignature++;
+        // Pools that were empty to begin with were already named by the candidate
+        // scan; naming them twice would bury the ones nobody has heard about.
+        if (refCandidates[i] == 0) continue;
+        std::cerr << "Warning: " << getBaseId(refPath[i]) << ": no signatures selected from "
+                  << refCandidates[i] << " unique k-mer(s) (entropy, homopolymer or margin "
+                     "filter consumed the pool); it can never be reported\n";
+    }
+    if (noSignature != 0) {
+        std::cerr << noSignature << " of " << refSelected.size()
+                  << " references hold no signatures and can never be reported";
+        if (cfg.strictMargin || cfg.minMargin >= 2) {
+            std::cerr << "; a lower --min-margin, dropping --strict-margin or a --tree index"
+                         " (which adds within-group signatures and family-level calls) would reach them";
+        }
+        std::cerr << "\n";
     }
 }
 
