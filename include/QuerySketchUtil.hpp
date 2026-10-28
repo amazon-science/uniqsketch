@@ -61,7 +61,7 @@ struct QuerySketchConfig {
     double abundanceCutoff = 0.0;                       // min abundance to report, exclusive (-a)
 
     // Reporting thresholds, flat query
-    double breadth = 0.0;                               // --breadth: min observed/expected signatures hit (0 = off)
+    double breadth = 0.5;                               // --breadth: min observed/expected signatures hit (0 = off)
 
     // Tree query
     int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
@@ -905,8 +905,13 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     // few reads is not penalised for covering few signatures: at low counts the
     // expectation is the count itself and the ratio stays near 1 however little
     // evidence there is. Withheld references are named on stderr.
-    // Off by default (--breadth=0): a floor changes which rows a flat query
-    // reports, and the validation sweeps are what justify a non-zero default.
+    // The default is the tree query's 0.5, measured on the flat sweeps before it
+    // moved off 0: on the 120-genome and 8-phage 280-mixture sets a 0.5 floor
+    // withheld no row at all (560 outputs byte-identical), and on the SRR061226
+    // gut metagenome, which holds no Escherichia, it withholds the one false strain
+    // row the flat query reported (119 of 2613 signatures hit, breadth 0.061, the
+    // 785-bp insertion the tree query already withholds). A sample whose coverage
+    // is confined to one locus by design (an amplicon) needs --breadth=0.
     struct Withheld { std::string name; unsigned count; size_t reads, sigsHit, sigsTotal; double ratio; };
     std::vector<Withheld> withheld;
     std::vector<char> reportedRef(sketchCount.size(), 0);

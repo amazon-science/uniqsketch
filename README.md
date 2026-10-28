@@ -383,7 +383,8 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --solid           only use solid k-mers in reads
       --breadth=F       min breadth of a call: distinct signatures hit, as a fraction of
                         what its hit count would spread over if the genome were present;
-                        below it the hits sit in one locus and the call is withheld [0=off]
+                        below it the hits sit in one locus and the call is withheld
+                        (flat query; --tree-breadth governs --tree) [0.5; 0=off]
       --tree=DIR        hierarchical query using a --tree index directory
       --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
       --tree-breadth=F  min breadth of a call: distinct signatures hit, as a fraction of
@@ -398,7 +399,7 @@ Reads may be paired or single-end. Pass both `--r1` and `--r2` for paired data; 
 `--r1` alone for single-end. `--ref` takes the sketch file produced by `uniqsketch`
 (the `-o` output), and `k` is read from that file rather than supplied again.
 
-**How a reference gets called.** A reference is reported only if it clears all three
+**How a reference gets called.** A reference is reported only if it clears all four
 thresholds:
 
 | flag | default | meaning |
@@ -406,6 +407,7 @@ thresholds:
 | `-h, --hit=N` | 10 | needs **at least** N signature k-mer hits |
 | `-s, --rcutoff=N` | 2 (0 with `--tree` on a strict-margin index) | needs **more than** N distinct matching reads |
 | `-a, --acutoff=F` | 0.0 | needs relative abundance **greater than** F |
+| `--breadth=F` (`--tree-breadth=F` with `--tree`) | 0.5 | needs its hits spread over **at least** F of the signatures the count would reach if the genome were present (**Breadth**, below) |
 
 Note for anyone carrying an `-a` threshold over from 1.x: abundance changed definition
 in 2.0 (hits per signature, not raw count). The two agree only when every reference holds
@@ -547,7 +549,19 @@ no different from one locus by this measure. Family rows are protected against
 mobile sequence by the build instead (see the repeat exclusion under
 [uniqsketch](#uniqsketch-1)).
 
-The same test is available to flat queries as `--breadth=F`, off by default. It is worth turning on wherever a reference may be wrong or oddly rendered in a single window: a circular genome linearized at an origin its relatives do not share, an assembly whose consensus is wrong at a cos junction, a mobile element. Each of those can make a reference's whole apparent signal come from a handful of its signatures — breadth 0.02 and 0.28 on two real cases — where a genuine call, including one carried by sixteen reads, scores 0.66 or better.
+The same test applies to flat queries as `--breadth=F`, also 0.5 by default. What it
+catches there is a reference that is wrong or oddly rendered in a single window: a
+circular genome linearized at an origin its relatives do not share (see `--circular`),
+an assembly whose consensus is wrong at a cos junction, a mobile element. Each of
+those can make a reference's whole apparent signal come from a handful of its
+signatures — breadth 0.02 and 0.28 on two real phage QC cases — where a genuine call,
+including one carried by sixteen reads, scores 0.66 or better. Measured before the
+default moved off 0: on the 120-genome *E. coli* and 8-phage 280-mixture flat sweeps a
+0.5 floor withheld no row (every output byte-identical), and on the gut metagenome
+above, which the flat query otherwise reports a false *E. coli* strain for on 119 of
+2 613 signatures (breadth 0.061), it withholds that row and the table is empty. A
+sample whose coverage is confined to one locus by design, an amplicon for instance,
+will be withheld too; pass `--breadth=0` for those.
 
 ### comparesketch
 ```
