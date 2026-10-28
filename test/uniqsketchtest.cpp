@@ -35,7 +35,7 @@ static std::vector<std::string> candidateLines(const std::string& candPath) {
     bool ok = readCandidates(candPath, cand);
     assert(ok);
     std::vector<std::string> contigs;
-    scanFasta(cand.refPath, [&](const std::string&, std::string& seq) { contigs.push_back(std::move(seq)); });
+    scanFasta(cand.refPath, [&](const std::string&, std::string& seq, size_t) { contigs.push_back(std::move(seq)); });
     assert(contigs.size() == cand.runs.size());
     std::vector<std::string> lines;
     for (size_t r = 0; r < cand.runs.size(); r++) {
@@ -59,7 +59,7 @@ static void candidatesFromText(const std::string& textPath, const std::string& r
         posByContig[contig].push_back(pos);
     }
     CandidateWriter w(candPath, k, refPath);
-    scanFasta(refPath, [&](const std::string& header, const std::string& seq) {
+    scanFasta(refPath, [&](const std::string& header, const std::string& seq, size_t) {
         w.beginContig(header, seq.size());
         for (uint32_t p : posByContig[header]) w.add(p);
         w.endContig();

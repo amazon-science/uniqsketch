@@ -55,6 +55,7 @@ struct UniqSketchConfig {
     unsigned minMargin = 1;                             // min Hamming distance to other references (1 = off)
     unsigned maxHomopolymer = 0;                        // max homopolymer run in a signature (0 = off)
     bool strictMargin = false;                          // --min-margin is a hard requirement (no fallback)
+    bool circular = false;                              // --circular: references are circular molecules
 
     // Derived Bloom-filter bit sizes.
     size_t m1() const { return static_cast<size_t>(bits) * dbfSize; }
@@ -87,7 +88,7 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  * line inside a record is skipped.
  */
 template <typename Fn>
-inline void scanFasta(const std::string& fPath, Fn fn) {
+inline void scanFasta(const std::string& fPath, Fn fn, unsigned padK = 0) {
     GzLineReader refFile(fPath);          // plain or gzip
     std::string line;
     bool good = refFile.getline(line);
@@ -100,12 +101,27 @@ inline void scanFasta(const std::string& fPath, Fn fn) {
             faSeq += line;
             good = refFile.getline(line);
         }
-        fn(header, faSeq);
+        // A circular molecule rendered linearly loses the k-1 k-mers that span
+        // its end-to-start join: they are in the genome but not in the file.
+        // Appending the first k-1 bases restores exactly those k-mers and no
+        // others, so a contig of length L yields L k-mers, which is what a
+        // circular sequence of length L has. Their start positions are all <= L,
+        // so the candidate positions stay in the file's own coordinate frame and
+        // nothing downstream needs to translate them. The true length is passed
+        // separately so the padding cannot leak into a genome length.
+        const size_t trueLen = faSeq.size();
+        if (padK != 0 && trueLen != 0) faSeq += faSeq.substr(0, std::min<size_t>(padK, trueLen));
+        fn(header, faSeq, trueLen);
         if (line.size() > 1) {
             header = line.substr(1);
             std::replace(header.begin(), header.end(), ' ', '_');
         }
     }
+}
+
+/** Wrap padding for a build: k-1 bases with --circular, none without. */
+inline unsigned wrapPad(const UniqSketchConfig& cfg) {
+    return cfg.circular && cfg.kmerLen > 1 ? cfg.kmerLen - 1 : 0;
 }
 
 /** Candidate file of a reference: <outdir>/<basename without extension>.cand. */
@@ -251,7 +267,7 @@ inline bool readCandidates(const std::string& path, CandidateSet& out) {
  * @param sbFilter  Solid Bloom filter for tracking repeat k-mers.
  */
 void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter& dbFilter, BloomFilter& sbFilter) {
-    scanFasta(fPath, [&](const std::string&, const std::string& faSeq) {
+    scanFasta(fPath, [&](const std::string&, const std::string& faSeq, size_t) {
         ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
         while (itr != itr.end()) {
             if (!dbFilter.insert_make_change(*itr)) {
@@ -259,7 +275,7 @@ void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter
             }
             ++itr;
         }
-    });
+    }, wrapPad(cfg));
 }
 
 /**
@@ -276,8 +292,11 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
     const std::string candPath = candidatePath(cfg.outdir, fPath);
     CandidateWriter cand(candPath, cfg.kmerLen, fPath);
     size_t countUnique = 0, countAll = 0;
-    scanFasta(fPath, [&](const std::string& header, const std::string& faSeq) {
-        cand.beginContig(header, faSeq.size());
+    scanFasta(fPath, [&](const std::string& header, const std::string& faSeq, size_t trueLen) {
+        // The contig length recorded is the genome's, not the padded sequence's,
+        // so a wrap pad can never be mistaken for sequence by a reader of the
+        // candidate file or by the window layout in getUniqSet.
+        cand.beginContig(header, trueLen);
         ntHashIterator itr(faSeq, cfg.nhash2, cfg.kmerLen);
         while (itr != itr.end()) {
             ++countAll;
@@ -288,7 +307,7 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
             ++itr;
         }
         cand.endContig();
-    });
+    }, wrapPad(cfg));
     // A reference that contributes nothing is almost always an input problem
     // (not FASTA, empty, sequences shorter than k) or a duplicate of another
     // reference. Either way it gets no signatures and cannot be detected, which
@@ -375,7 +394,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
                         cfg.nhash1, cfg.kmerLen);
     for (size_t fi = 0; fi < files.size(); ++fi) {
         const bool isRep = (fi == 0);
-        scanFasta(files[fi], [&](const std::string&, const std::string& faSeq) {
+        scanFasta(files[fi], [&](const std::string&, const std::string& faSeq, size_t) {
             ntHashIterator itr(faSeq, std::max(cfg.nhash1, cfg.nhash2), cfg.kmerLen);
             while (itr != itr.end()) {
                 if (isRep && !repSeen.insert_make_change(*itr)) {
@@ -388,7 +407,7 @@ void loadBFfaGroup(const UniqSketchConfig& cfg, const std::vector<std::string>& 
                 }
                 ++itr;
             }
-        });
+        }, wrapPad(cfg));
     }
 }
 
@@ -485,11 +504,11 @@ private:
         }
         for (size_t fi = 0; fi < files.size(); ++fi) {
             const bool isRep = (fi == 0);
-            scanFasta(files[fi], [&](const std::string&, std::string& faSeq) {
+            scanFasta(files[fi], [&](const std::string&, std::string& faSeq, size_t) {
                 pendingBases_ += faSeq.size();
                 contigs_.push_back(std::move(faSeq));
                 if (pendingBases_ >= flushBases_) flush(isRep, seen.get(), repSeen.get(), dbFilter, sbFilter);
-            });
+            }, wrapPad(cfg_));
             if (isRep || fi + 1 == files.size()) flush(isRep, seen.get(), repSeen.get(), dbFilter, sbFilter);
         }
     }
@@ -827,13 +846,15 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     // the candidates were written is refused rather than mis-read.
     std::vector<std::string> contigs;
     std::vector<std::string> names;
-    scanFasta(cand.refPath, [&](const std::string& header, std::string& seq) {
+    std::vector<size_t> trueLens;
+    scanFasta(cand.refPath, [&](const std::string& header, std::string& seq, size_t trueLen) {
         names.push_back(header);
+        trueLens.push_back(trueLen);
         contigs.push_back(std::move(seq));
-    });
+    }, wrapPad(cfg));
     bool same = contigs.size() == cand.runs.size();
     for (size_t r = 0; same && r < cand.runs.size(); r++)
-        same = contigs[r].size() == cand.runs[r].seqLen && names[r] == cand.runs[r].name;
+        same = trueLens[r] == cand.runs[r].seqLen && names[r] == cand.runs[r].name;
     if (!same) {
         std::cerr << "Error: " << cand.refPath << " does not match the candidates in " << fPath
                   << " (changed since the build started?)\n";

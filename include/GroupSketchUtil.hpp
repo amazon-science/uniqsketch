@@ -135,7 +135,7 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
     #pragma omp parallel for schedule(dynamic)
     for (unsigned g = 0; g < refFiles.size(); g++) {
         std::vector<bool> mark(sigs.size(), false);
-        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq) {
+        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
             if (seq.size() < cfg.kmerLen) return;
             ntHashIterator itr(seq, 1, cfg.kmerLen);
             while (itr != itr.end()) {
@@ -147,7 +147,7 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
                 }
                 ++itr;
             }
-        });
+        }, wrapPad(cfg));
         hit[g] = std::move(mark);
     }
     for (unsigned g = 0; g < refFiles.size(); g++)
