@@ -60,6 +60,9 @@ struct QuerySketchConfig {
     int readCutoff = 2;                                 // min distinct supporting reads, exclusive (-s)
     double abundanceCutoff = 0.0;                       // min abundance to report, exclusive (-a)
 
+    // Reporting thresholds, flat query
+    double breadth = 0.0;                               // --breadth: min observed/expected signatures hit (0 = off)
+
     // Tree query
     int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
     bool noGroupSignatures = false;                     // --no-group-signatures: leaf level uses global signatures only
@@ -868,13 +871,48 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
     std::sort(sketchIndex.begin(), sketchIndex.end(),
               [&](unsigned i, unsigned j) { return sketchCount[i] > sketchCount[j]; });
 
-    auto reported = [&](unsigned i) {
+    auto clearsThresholds = [&](unsigned i) {
         return refRead[i].size() > static_cast<size_t>(cfg.readCutoff) &&
                sketchCount[i] >= static_cast<unsigned>(cfg.sketchHit);
     };
 
+    // A reference that clears the hit and read thresholds is still only a call if
+    // its hits are spread over its signatures. When they sit on a handful of them
+    // the evidence is one locus of the genome, not the genome: a window the
+    // reference alone appears to carry because another reference is linearized at
+    // a different origin, a divergent assembly window, a mobile element. Such a
+    // locus can collect hundreds of thousands of hits from a sample that does not
+    // hold the genome at all, and neither the count nor the read total shows it.
+    // breadthRatio compares the distinct signatures hit against the number the
+    // count would have spread over were the genome present, so a call carried by
+    // few reads is not penalised for covering few signatures: at low counts the
+    // expectation is the count itself and the ratio stays near 1 however little
+    // evidence there is. Withheld references are named on stderr.
+    // Off by default (--breadth=0): a floor changes which rows a flat query
+    // reports, and the validation sweeps are what justify a non-zero default.
+    struct Withheld { std::string name; unsigned count; size_t reads, sigsHit, sigsTotal; double ratio; };
+    std::vector<Withheld> withheld;
+    std::vector<char> reportedRef(sketchCount.size(), 0);
+    std::vector<size_t> refSigsHit(sketchCount.size(), 0);
+    for (unsigned i = 0; i < sketchCount.size(); i++) {
+        if (!clearsThresholds(i)) continue;
+        refSigsHit[i] = countSigsHit(refSigCount[i]);
+        if (cfg.breadth > 0.0) {
+            const double ratio = breadthRatio(sketchCount[i], refSigsHit[i], refSigCount[i].size());
+            if (ratio < cfg.breadth) {
+                withheld.push_back({sketchRef[i], sketchCount[i], refRead[i].size(),
+                                    refSigsHit[i], refSigCount[i].size(), ratio});
+                continue;
+            }
+        }
+        reportedRef[i] = 1;
+    }
+    auto reported = [&](unsigned i) { return reportedRef[i] != 0; };
+
     // Abundance is each reference's hits per signature relative to all reported
-    // references; see hitsPerSignature.
+    // references; see hitsPerSignature. A withheld reference is left out, as the
+    // tree writer leaves out a withheld leaf, so the column still sums to 1 over
+    // the rows that reach the file.
     double densitySum = 0.0;
     for (unsigned i = 0; i < sketchCount.size(); i++) {
         if (reported(i)) densitySum += hitsPerSignature(sketchCount[i], refSigCount[i].size());
@@ -902,7 +940,7 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
                     outFile << sketchRef[idx] << "\t" << abundance
                             << "\t" << sketchCount[idx]
                             << "\t" << refRead[idx].size()
-                            << "\t" << countSigsHit(refSigCount[idx])
+                            << "\t" << refSigsHit[idx]
                             << "\t" << refSigCount[idx].size()
                             << "\tstrain\n";
                 }
@@ -910,6 +948,16 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
         }
     }
     outFile.close();
+
+    if (!withheld.empty()) {
+        std::cerr << withheld.size() << " call(s) withheld, hits confined to a few signatures "
+                     "(breadth below " << cfg.breadth << "; --breadth=0 to report them):\n";
+        for (const Withheld& w : withheld) {
+            std::cerr << "  " << w.name << "\tcount " << w.count << "\treads " << w.reads
+                      << "\tsigs_hit " << w.sigsHit << "/" << w.sigsTotal
+                      << "\tbreadth " << std::setprecision(3) << w.ratio << "\n";
+        }
+    }
 
     writeSignatureLog(cfg, sketchRef, refSigCount, refRead);
     writeReadLog(cfg, sketchRef, refRead);

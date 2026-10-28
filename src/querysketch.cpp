@@ -40,6 +40,9 @@ static const char USAGE_MESSAGE[] =
     "      --sensitive\tsets sensitivity parameter h=10\n"
     "      --very-sensitive\tsets sensitivity parameter h=5\n"
     "      --solid\t\tonly use solid k-mers in reads\n"
+    "      --breadth=F\tmin breadth of a call: distinct signatures hit, as a fraction of\n"
+    "\t\t\twhat its hit count would spread over if the genome were present;\n"
+    "\t\t\tbelow it the hits sit in one locus and the call is withheld [0=off]\n"
     "      --tree=DIR\thierarchical query using a --tree index directory\n"
     "      --tree-prune=N\tmin coarse-level hits to keep a sub-tree in play (with --tree) [1]\n"
     "      --tree-breadth=F\tmin breadth of a call: distinct signatures hit, as a fraction of\n"
@@ -52,7 +55,7 @@ static const char USAGE_MESSAGE[] =
 
 static const char shortopts[] = "t:g:l:r:o:h:a:s:b:";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_TREE, OPT_TREEPRUNE, OPT_TREEBREADTH, OPT_NOGROUPSIGS };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_BREADTH, OPT_TREE, OPT_TREEPRUNE, OPT_TREEBREADTH, OPT_NOGROUPSIGS };
 
 // --sensitive / --very-sensitive / --solid are getopt flag entries, which store
 // through a pointer at parse time and so cannot target a struct member. They write
@@ -74,6 +77,7 @@ static const struct option longopts[] = {
     {"sensitive",      no_argument, &g_sketchHit, 10},
     {"very-sensitive", no_argument, &g_sketchHit, 5},
     {"solid",          no_argument, &g_solid, 1},
+    {"breadth",        required_argument, nullptr, OPT_BREADTH},
     {"tree",           required_argument, nullptr, OPT_TREE},
     {"tree-prune",     required_argument, nullptr, OPT_TREEPRUNE},
     {"tree-breadth",   required_argument, nullptr, OPT_TREEBREADTH},
@@ -661,6 +665,7 @@ int main(int argc, char* const argv[]) {
         case 'a': arg >> cfg.abundanceCutoff; break;
         case 's': arg >> cfg.readCutoff; readCutoffGiven = true; break;
         case 'b': arg >> cfg.bits;            break;
+        case OPT_BREADTH: arg >> cfg.breadth; break;
         case OPT_TREE: arg >> treeDir;         break;
         case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
         case OPT_TREEBREADTH: arg >> cfg.treeBreadth; break;
