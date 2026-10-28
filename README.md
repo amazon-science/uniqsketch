@@ -225,6 +225,7 @@ A list of files containing file names in each row can be passed with @ prefix.
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
       --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree]
+      --circular        references are circular: also take the k-1 k-mers spanning each contig's end-to-start join
       --no-group-signatures  do not build within-group leaf signatures (with --tree)
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
@@ -380,6 +381,9 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --sensitive       sets sensitivity parameter h=10
       --very-sensitive  sets sensitivity parameter h=5
       --solid           only use solid k-mers in reads
+      --breadth=F       min breadth of a call: distinct signatures hit, as a fraction of
+                        what its hit count would spread over if the genome were present;
+                        below it the hits sit in one locus and the call is withheld [0=off]
       --tree=DIR        hierarchical query using a --tree index directory
       --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
       --tree-breadth=F  min breadth of a call: distinct signatures hit, as a fraction of
@@ -542,6 +546,8 @@ representative's, a member carries only part of them, and a present member looks
 no different from one locus by this measure. Family rows are protected against
 mobile sequence by the build instead (see the repeat exclusion under
 [uniqsketch](#uniqsketch-1)).
+
+The same test is available to flat queries as `--breadth=F`, off by default. It is worth turning on wherever a reference may be wrong or oddly rendered in a single window: a circular genome linearized at an origin its relatives do not share, an assembly whose consensus is wrong at a cos junction, a mobile element. Each of those can make a reference's whole apparent signal come from a handful of its signatures — breadth 0.02 and 0.28 on two real cases — where a genuine call, including one carried by sixteen reads, scores 0.66 or better.
 
 ### comparesketch
 ```
