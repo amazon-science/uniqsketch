@@ -56,6 +56,11 @@ struct UniqSketchConfig {
     unsigned maxHomopolymer = 0;                        // max homopolymer run in a signature (0 = off)
     bool strictMargin = false;                          // --min-margin is a hard requirement (no fallback)
     bool circular = false;                              // --circular: references are circular molecules
+    // Build context, for messages only (set by uniqsketch.cpp): whether this sketch
+    // is part of a --tree build, and which coarse level it is for ("tree level N";
+    // empty for the leaf sketch and for a flat build).
+    bool treeBuild = false;
+    std::string levelLabel;
 
     // Derived Bloom-filter bit sizes.
     size_t m1() const { return static_cast<size_t>(bits) * dbfSize; }
@@ -1215,18 +1220,42 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
         std::cout << "\n";
     }
 
-    size_t noSignature = 0;
+    // What "no signatures" means depends on the build. In a flat index the
+    // reference can never be reported. In a tree index the leaf sketch is not the
+    // only way to a leaf: family rows and within-group signatures still reach it,
+    // so the leaf-level message says what is missing, not that it is lost. A coarse
+    // level's representatives get one summary line and no advice: a representative
+    // without level signatures just has no family row at that level, and the
+    // candidate scan has already named the empty pools.
+    size_t noSignature = 0, consumed = 0;
+    const size_t namedMax = 20;   // per-reference lines before "and N more"
+    const bool coarse = !cfg.levelLabel.empty();
     for (unsigned i = 0; i < refSelected.size(); i++) {
         if (refSelected[i] != 0) continue;
         noSignature++;
         // Pools that were empty to begin with were already named by the candidate
         // scan; naming them twice would bury the ones nobody has heard about.
-        if (refCandidates[i] == 0) continue;
+        if (refCandidates[i] == 0 || coarse) continue;
+        if (++consumed > namedMax) continue;
         std::cerr << "Warning: " << getBaseId(refPath[i]) << ": no signatures selected from "
                   << refCandidates[i] << " unique k-mer(s) (entropy, homopolymer or margin "
-                     "filter consumed the pool); it can never be reported\n";
+                     "filter consumed the pool)"
+                  << (cfg.treeBuild ? "; it has no leaf signatures of its own\n"
+                                    : "; it can never be reported\n");
     }
-    if (noSignature != 0) {
+    if (consumed > namedMax) {
+        std::cerr << "Warning: ... and " << consumed - namedMax
+                  << " more references whose candidate pool the filters consumed\n";
+    }
+    if (noSignature == 0) return;
+    if (coarse) {
+        std::cerr << cfg.levelLabel << ": " << noSignature << " of " << refSelected.size()
+                  << " representatives hold no signatures at this level (no family row there)\n";
+    } else if (cfg.treeBuild) {
+        std::cerr << noSignature << " of " << refSelected.size()
+                  << " references hold no leaf signatures; they are reachable only through"
+                     " within-group signatures and family rows\n";
+    } else {
         std::cerr << noSignature << " of " << refSelected.size()
                   << " references hold no signatures and can never be reported";
         if (cfg.strictMargin || cfg.minMargin >= 2) {

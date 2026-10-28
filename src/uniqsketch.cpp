@@ -330,10 +330,12 @@ int main(int argc, char** argv) {
             getCardinality(universeKmers, universeDistinct, universeSolid,
                            cfg.kmerLen, cfg.threads, refFiles);
         }
+        cfg.treeBuild = true;   // messages: a leaf without leaf signatures is not lost
         for (const auto& [level, groups] : levelGroups) {
             if (groups.empty()) continue;
 
             UniqSketchConfig lvl = cfg;
+            lvl.levelLabel = "Tree level " + std::to_string(level);
             lvl.outdir = cfg.outdir + "/level_" + std::to_string(level);
             lvl.outfile = cfg.outdir + "/sketch_level_" + std::to_string(level) + ".tsv";
             lvl.refstat = lvl.outdir + "/db_uniq_count.tsv";
