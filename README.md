@@ -393,8 +393,8 @@ license. The same license applies to the archived releases on Zenodo.
 If you use UniqSketch, please cite:
 
 > Mohamadi H, Turner KH, Schmieder R, Hurwitz BL. UniqSketch: sensitive and
-> resource-efficient strain-level detection in metagenomes. *Genome Biology* (2026,
-> in press).
+> resource-efficient strain-level detection in metagenomes. *Genome Biology* (2026).
+> https://doi.org/10.1186/s13059-026-04325-2
 
 The source code is archived on Zenodo at
 [10.5281/zenodo.23046441](https://doi.org/10.5281/zenodo.23046441). That is the concept
