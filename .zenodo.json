@@ -13,7 +13,8 @@
   "keywords": ["metagenomics", "strain detection", "k-mer", "Bloom filter", "bioinformatics"],
   "related_identifiers": [
     {"identifier": "https://github.com/amazon-science/uniqsketch", "relation": "isSupplementTo", "scheme": "url"},
-    {"identifier": "10.5281/zenodo.19319588", "relation": "isSupplementedBy", "scheme": "doi"}
+    {"identifier": "10.5281/zenodo.19319588", "relation": "isSupplementedBy", "scheme": "doi"},
+    {"identifier": "10.1186/s13059-026-04325-2", "relation": "isDescribedBy", "scheme": "doi"}
   ],
   "language": "eng"
 }
