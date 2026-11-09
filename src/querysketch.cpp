@@ -401,6 +401,15 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 for (const GroupSignature& s : groupSigs)
                     if (s.refId < n && leafName[s.refId].empty()) leafName[s.refId] = s.refName;
             }
+            // The reporter is handed L.ref, which loadSketch fills from the leaf
+            // sketch, so a leaf with no global signatures has no name there. Such a
+            // leaf is still reported when its within-group signatures carry the
+            // sample (928 E. coli, a strain with 0 global and 72 within-group
+            // signatures, 8 reads): the row came out with an empty name, and the
+            // family-row suppression, which looks a resolved leaf up by name,
+            // missed it and reported the leaf's family alongside. Name it here.
+            for (unsigned i = 0; i < n; i++)
+                if (L.ref[i].empty()) L.ref[i] = leafName[i];
             // The floor for joining by own evidence is the reporting threshold, not
             // the pruning floor. A leaf below it cannot be reported, so bringing it
             // in gains nothing, and as a carrier it would withhold its relatives'
