@@ -127,10 +127,10 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
 
 ```
-ref         abundance   count   reads   sigs_hit   sigs_total   resolution
-ref_1       0.7862      3033    2871    100        100          strain
-ref_2       0.1993      769     751     98         100          strain
-ref_3       0.01426     55      7       27         100          strain
+ref         abundance   count   reads   sigs_hit   sigs_total   resolution   members
+ref_1       0.7862      3033    2871    100        100          strain       -
+ref_2       0.1993      769     751     98         100          strain       -
+ref_3       0.01426     55      7       27         100          strain       -
 ```
 
 Reading this table:
@@ -149,6 +149,9 @@ Reading this table:
   at least once, out of how many it has.
 * `resolution` is `strain` for an individually resolved reference. With a `--tree`
   index it may also be `family` — see [querysketch](#querysketch-1) below.
+* `members` is `-` on a strain row. On a family row it lists every reference the
+  family covers, `|`-separated and complete, so whether a given strain is covered
+  by the call can be read from this file alone.
 
 The first three columns are unchanged from earlier versions; the rest are appended,
 so existing parsers keep working.
@@ -460,7 +463,8 @@ resolve. Each row's `resolution` column says which:
 * `family` — a group of near-identical references that the coarse level detected
   confidently but none of whose members could be told apart at the leaf level. The
   `ref` column carries the group's node name from the index's `tree_index.tsv`
-  (e.g. `cluster_L1_AWS_Ec377`), where that file lists the members it stands for.
+  (e.g. `cluster_L1_AWS_Ec377`); the `members` column lists the references it
+  stands for.
 
 Family rows exist because the coarse level is far more sensitive than the leaf
 level for near-identical strains. A cluster representative competes only with

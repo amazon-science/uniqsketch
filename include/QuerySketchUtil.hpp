@@ -812,18 +812,21 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     // representative, so a sample holding only some other member of the group is
     // reported under a name it does not contain. The members are known here;
     // listing them saves a lookup in tree_index.tsv at exactly the moment the
-    // reader is trying to work out what was found. Capped so that a node of
-    // several hundred leaves cannot swamp the row; the count stays exact.
+    // reader is trying to work out what was found. The list is complete: it was
+    // first capped at eight names with an overflow count, and on a 928-genome
+    // E. coli set 34 of 55 family rows were truncated (families of 11 to 94),
+    // which defeated the one thing the column is for, deciding from the output
+    // alone whether a given strain is covered by the call. It is the last column,
+    // so a long list disturbs nothing before it; the largest node on 5 493
+    // E. coli has 557 leaves, about 15 kB.
     for (const FamilyCall* f : reportedFamilies) {
         std::vector<std::string> mem(f->coveredLeaves.begin(), f->coveredLeaves.end());
         std::sort(mem.begin(), mem.end());
-        const size_t cap = 8;
         std::string list;
-        for (size_t j = 0; j < mem.size() && j < cap; j++) {
+        for (size_t j = 0; j < mem.size(); j++) {
             if (j) list += "|";
             list += mem[j];
         }
-        if (mem.size() > cap) list += "|+" + std::to_string(mem.size() - cap) + " more";
         rows.push_back({f->name, f->count, f->reads, f->sigsHit, f->sigsTotal, true, list});
     }
     std::sort(rows.begin(), rows.end(),
