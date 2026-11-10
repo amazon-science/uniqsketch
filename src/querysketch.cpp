@@ -340,8 +340,10 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
 
         std::vector<bool> scored(n, false);
         std::vector<bool> present;                      // leaf level: what the within-group mask treats as present
+        size_t rejoined = 0;                            // coarse level: nodes scored on their own evidence after being pruned above
         if (!isLeaf) {
             const auto& lm = levelMap[level];
+            const auto& nodeName = levelNodeName[level];
             for (unsigned i = 0; i < n; i++) {
                 auto it = lm.find(L.ref[i]);
                 if (it == lm.end()) continue;
@@ -356,6 +358,37 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                     for (const auto& lf : it->second) everInPlay.insert(lf);
                 if (c >= static_cast<unsigned>(cfg.sketchHit) && r > attestReads)
                     for (const auto& lf : it->second) lineageAttested.insert(lf);
+                // A node whose leaves were all pruned at a coarser level is scored
+                // anyway when its own representative clears the reporting threshold
+                // on two or more reads. The narrowing assumes a member carries its
+                // ancestors' signatures, and a node's signatures are its
+                // representative's k-mers absent outside the node, in a dense set
+                // its private accessory sequence; on the 5 493-genome E. coli index
+                // 10x of K-12 MG1655, alone in the sample, hit none of the 2 413
+                // level-0 signatures of the 896-leaf node that holds it, the whole
+                // lineage was gone at the top level, and the query reported nothing
+                // at all. The leaf level's rescue by own evidence (07eed42) cannot
+                // reach a leaf that has no signatures, and a cluster of K-12
+                // derivatives one to three substitutions apart has none at margin 2
+                // (928-genome mock communities: five such strains invisible in all
+                // 18 of their occurrences, including at 10x). The evidence is in
+                // hand: the tallies cover every representative at every level, and
+                // everInPlay already reads them past the narrowing. Such a node is
+                // reported as a family row, under the same suppression as any other
+                // (no row when a member is resolved; the finest nested call wins).
+                // The candidate set is not touched, so strain rows and the carrier
+                // mask are exactly as before; only family rows can be added. Two
+                // reads, not the reporting read floor: a node pruned above has no
+                // corroboration from its ancestors, and a single read with two
+                // coincident errors reproduces runs of 10 to 38 consecutive
+                // signature k-mers of an unrelated genome (the 5 493-genome sweep's
+                // false strain rows were all of that kind), so the standard is the
+                // one lineageAttested uses for a single-read leaf.
+                if (!scored[i] && c >= static_cast<unsigned>(cfg.sketchHit) && r > attestReads &&
+                    nodeName.count(L.ref[i]) > 0) {
+                    scored[i] = true;
+                    ++rejoined;
+                }
             }
         } else {
             // A leaf is in play if the narrowing kept it, or if its own signatures,
@@ -645,7 +678,10 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
             }
         }
         std::cerr << "Tree query: level " << level << " -> "
-                  << candidates.size() << " candidate leaves\n";
+                  << candidates.size() << " candidate leaves";
+        if (rejoined)
+            std::cerr << "; " << rejoined << " node(s) pruned at a coarser level scored on their own evidence";
+        std::cerr << "\n";
     }
 }
 

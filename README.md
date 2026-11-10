@@ -480,7 +480,21 @@ member at 0.01% that could not be resolved was reported as its family at
 reported as that family in 13 of the 28 mixtures where it could not be resolved,
 at 0.006–0.013%. A family row is never emitted when any of its members is reported
 as a strain, a group is reported once (at the finest level that detected it), and
-a group is not reported when one of its sub-groups is.
+a group is not reported when one of its sub-groups is. A group whose lineage the
+walk dropped at a coarser level is still reported when its own representative
+clears the hit threshold on two or more reads: a node's signatures are its
+representative's k-mers absent outside the node, which a member need not carry,
+so a member's reads can miss every signature of one ancestor and hit most of
+another's. The stderr line for the level says how many such nodes rejoined.
+
+What no query can report is a reference that carries no signature at any level:
+none of its own, none within its group, and none of any ancestor's. On 5 493
+*E. coli* genomes 56 references are in that position, 42 of them the K-12 core
+(MG1655, BW25113 and their derivatives), whose every k-mer is shared with another
+K-12 genome and whose nodes' signatures are private to the representatives. A
+sample that is only such a genome yields an empty table. This is a property of
+the index, not of the query, and it is open (see `docs/v2.0-validation.md`, "Dense
+lineages").
 
 `--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
 sub-tree stays in play if its representative gathers at least N hits and one read
