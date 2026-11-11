@@ -121,7 +121,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
-* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level), `build_params.tsv` (how signatures were selected; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), and `groups/g<i>/` with each group's candidate files.
+* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level), `build_params.tsv` (how signatures were selected; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
 
 ### querysketch
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
@@ -494,7 +494,9 @@ none of its own, none within its group, and none of any ancestor's. On 5 493
 K-12 genome and whose nodes' signatures are private to the representatives. A
 sample that is only such a genome yields an empty table. This is a property of
 the index, not of the query, and it is open (see `docs/v2.0-validation.md`, "Dense
-lineages").
+lineages"). The build measures it: `<outdir>/reachability.tsv` gives every
+reference's status (`own`, `group`, `family`, `none`) and the stderr summary names
+the `none` references, so what an index cannot see is known before the first query.
 
 `--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
 sub-tree stays in play if its representative gathers at least N hits and one read

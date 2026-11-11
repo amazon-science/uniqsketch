@@ -408,4 +408,184 @@ inline std::vector<GroupSignature> loadGroupSketch(const std::string& path) {
     return out;
 }
 
+/**
+ * What each leaf of a tree index can be reported through, and which leaves no
+ * query can report at all.
+ *
+ * A leaf is reported as a strain through its own signatures (the leaf sketch) or
+ * its within-group signatures, and as a member of a family through the signatures
+ * of an ancestor node that its genome carries. A node's signatures are its
+ * representative's k-mers absent from every genome outside the node, which in a
+ * dense set is often the representative's private sequence, so a member may carry
+ * none of them (on 5 493 E. coli genomes, 2 408 leaves had at least one such
+ * ancestor). A leaf with no signatures of its own, none within its group and none
+ * of any ancestor's carried cannot be reported by any query at any threshold: a
+ * sample that is only that genome yields an empty table. 56 of the 5 493 were in
+ * that position, 42 of them the K-12 core (MG1655, BW25113 and their derivatives),
+ * whose lineage the clustering had split across nodes so that nothing of the core
+ * was unique to any node.
+ *
+ * One pass over every genome against a hash-keyed view of all level signatures,
+ * confirming the sequence on a probe hit as findCarriers does. Writes
+ * <outdir>/ancestor_signatures.tsv, one row per (leaf, ancestor node) with the
+ * node's signature count and how many the leaf carries, and
+ * <outdir>/reachability.tsv, one row per leaf with its own and within-group
+ * counts, its ancestors, and a status: own, group, family or none. The stderr
+ * summary names the leaves with status none (the first 20).
+ *
+ * @param levels  Tree levels whose sketch files exist (sketch_level_<L>.tsv).
+ */
+inline std::string ancestorSignaturesPath(const std::string& outdir) {
+    return outdir + "/ancestor_signatures.tsv";
+}
+inline std::string reachabilityPath(const std::string& outdir) {
+    return outdir + "/reachability.tsv";
+}
+inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<TreeNode>& tree,
+                               const std::vector<std::string>& refFiles,
+                               const std::vector<unsigned>& levels) {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    const size_t numRef = refFiles.size();
+
+    // Own and within-group signatures per leaf, counted from the files as written.
+    auto countByRef = [&](const std::string& path) {
+        std::vector<size_t> n(numRef, 0);
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t a = line.find('\t');
+            if (a == std::string::npos) continue;
+            size_t b = line.find('\t', a + 1);
+            unsigned long id = std::strtoul(line.c_str() + a + 1, nullptr, 10);
+            if (b != std::string::npos && id < numRef) n[id]++;
+        }
+        return n;
+    };
+    const std::vector<size_t> leafSigs = countByRef(cfg.outfile);
+    const std::vector<size_t> groupSigs = countByRef(groupSketchPath(cfg.outdir));
+
+    // The partition of the leaves at every level, and each leaf's entry there.
+    std::vector<std::vector<LevelEntry>> entries;                      // per level, in `levels` order
+    std::vector<std::unordered_map<std::string, unsigned>> repEntry;   // per level: rep basename -> entry
+    std::vector<std::vector<int>> leafEntry;                           // per level: refId -> entry, -1 if none
+    {
+        std::unordered_map<std::string, unsigned> leafId;
+        for (unsigned g = 0; g < numRef; g++) leafId[getBaseId(refFiles[g])] = g;
+        std::map<unsigned, std::vector<LevelEntry>> byLevel;
+        for (auto& [lvl, ents] : treeLevelPartition(tree)) byLevel[lvl] = std::move(ents);
+        for (unsigned lvl : levels) {
+            entries.push_back(byLevel.count(lvl) ? byLevel[lvl] : std::vector<LevelEntry>());
+            std::unordered_map<std::string, unsigned> re;
+            std::vector<int> le(numRef, -1);
+            for (unsigned e = 0; e < entries.back().size(); e++) {
+                re[getBaseId(entries.back()[e].repPath)] = e;
+                for (const std::string& p : entries.back()[e].leafPaths) {
+                    auto it = leafId.find(getBaseId(p));
+                    if (it != leafId.end()) le[it->second] = static_cast<int>(e);
+                }
+            }
+            repEntry.push_back(std::move(re));
+            leafEntry.push_back(std::move(le));
+        }
+    }
+
+    // Every level signature: sequence, level index, entry index; and per (level,
+    // entry) the number of signatures.
+    std::vector<std::string> sigSeq;
+    std::vector<unsigned> sigLevel, sigEntry;
+    std::vector<std::vector<size_t>> nodeTotal(levels.size());
+    for (size_t li = 0; li < levels.size(); li++) {
+        nodeTotal[li].assign(entries[li].size(), 0);
+        std::ifstream in(cfg.outdir + "/sketch_level_" + std::to_string(levels[li]) + ".tsv");
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t a = line.find('\t');
+            if (a == std::string::npos) continue;
+            size_t b = line.find('\t', a + 1);
+            if (b == std::string::npos) continue;
+            size_t c = line.find('\t', b + 1);
+            if (c == std::string::npos) continue;
+            auto it = repEntry[li].find(line.substr(b + 1, c - b - 1));
+            if (it == repEntry[li].end()) continue;
+            sigSeq.push_back(line.substr(0, a));
+            sigLevel.push_back(static_cast<unsigned>(li));
+            sigEntry.push_back(it->second);
+            nodeTotal[li][it->second]++;
+        }
+    }
+    std::unordered_map<uint64_t, std::vector<unsigned>> index;
+    index.reserve(sigSeq.size());
+    for (unsigned i = 0; i < sigSeq.size(); i++)
+        index[NTC64(sigSeq[i].c_str(), cfg.kmerLen)].push_back(i);
+
+    // One pass per genome: distinct signatures of each ancestor that the genome carries.
+    std::vector<std::vector<size_t>> carried(numRef, std::vector<size_t>(levels.size(), 0));
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned g = 0; g < numRef; g++) {
+        std::vector<bool> seen(sigSeq.size(), false);
+        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
+            if (seq.size() < cfg.kmerLen) return;
+            ntHashIterator itr(seq, 1, cfg.kmerLen);
+            while (itr != itr.end()) {
+                auto it = index.find((*itr)[0]);
+                if (it != index.end()) {
+                    const char* kp = seq.c_str() + itr.get_pos();
+                    for (unsigned idx : it->second) {
+                        if (seen[idx] || !kmerMatches(kp, sigSeq[idx])) continue;
+                        seen[idx] = true;
+                        const unsigned li = sigLevel[idx];
+                        if (leafEntry[li][g] == static_cast<int>(sigEntry[idx])) carried[g][li]++;
+                    }
+                }
+                ++itr;
+            }
+        }, wrapPad(cfg));
+    }
+
+    // Tables and summary.
+    std::ofstream anc(ancestorSignaturesPath(cfg.outdir));
+    anc << "leaf\tlevel\tnode\tnode_signatures\tcarried\n";
+    std::ofstream reach(reachabilityPath(cfg.outdir));
+    reach << "ref_id\tname\tleaf_signatures\tgroup_signatures\tancestors\tstatus\n";
+    size_t own = 0, group = 0, family = 0, none = 0;
+    std::vector<std::string> unreachable;
+    for (unsigned g = 0; g < numRef; g++) {
+        const std::string name = getBaseId(refFiles[g]);
+        std::string ancestors;
+        size_t familySigs = 0;
+        for (size_t li = 0; li < levels.size(); li++) {
+            const int e = leafEntry[li][g];
+            if (!ancestors.empty()) ancestors += ";";
+            ancestors += "L" + std::to_string(levels[li]) + ":";
+            if (e < 0 || !entries[li][e].isNode) { ancestors += "-"; continue; }
+            const LevelEntry& ent = entries[li][e];
+            ancestors += ent.name + ":" + std::to_string(carried[g][li]) + "/" + std::to_string(nodeTotal[li][e]);
+            familySigs += carried[g][li];
+            anc << name << "\t" << levels[li] << "\t" << ent.name << "\t" << nodeTotal[li][e]
+                << "\t" << carried[g][li] << "\n";
+        }
+        const char* status;
+        if (leafSigs[g] > 0) { status = "own"; ++own; }
+        else if (groupSigs[g] > 0) { status = "group"; ++group; }
+        else if (familySigs > 0) { status = "family"; ++family; }
+        else { status = "none"; ++none; unreachable.push_back(name); }
+        reach << g << "\t" << name << "\t" << leafSigs[g] << "\t" << groupSigs[g] << "\t"
+              << ancestors << "\t" << status << "\n";
+    }
+    std::cerr << "Reachability: " << own << " references have leaf signatures, " << group
+              << " only within-group signatures, " << family
+              << " only a family row (an ancestor's signatures carried), " << none
+              << " nothing at any level";
+    if (none) {
+        std::cerr << " and cannot be reported by any query:";
+        const size_t show = std::min<size_t>(unreachable.size(), 20);
+        for (size_t i = 0; i < show; i++) std::cerr << (i ? ", " : " ") << unreachable[i];
+        if (unreachable.size() > show) std::cerr << " and " << unreachable.size() - show << " more";
+    }
+    std::cerr << " (" << reachabilityPath(cfg.outdir) << ")\n";
+    std::cerr << "Reachability scan time (s): " << std::setprecision(1) << std::fixed
+              << std::chrono::duration<double>(Clock::now() - t0).count() << "\n";
+}
+
 #endif // GROUPSKETCHUTIL_HPP_

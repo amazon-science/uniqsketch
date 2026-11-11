@@ -409,6 +409,15 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "Within-group signatures: skipped (--no-group-signatures)\n";
         }
+        // What each leaf can be reported through, and which leaves nothing can
+        // report (reportReachability). Only the levels whose sketch was built.
+        std::vector<unsigned> builtLevels;
+        for (const auto& [level, entries] : treeLevelPartition(tree)) {
+            (void)entries;
+            std::ifstream probe(cfg.outdir + "/sketch_level_" + std::to_string(level) + ".tsv");
+            if (probe.good()) builtLevels.push_back(level);
+        }
+        reportReachability(cfg, tree, refFiles, builtLevels);
     }
 
 #ifdef _OPENMP
