@@ -32,10 +32,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
+        # Retried: on 11 Nov 2026 all four jobs of a run failed here because the
+        # runner could not resolve archive.ubuntu.com for ten minutes (run
+        # 43045040713); nothing of ours had executed. Three attempts a minute
+        # apart cover a transient mirror or DNS outage without hiding a real one.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake zlib1g-dev clang libomp-dev
+          for attempt in 1 2 3; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends \
+                 build-essential cmake zlib1g-dev clang libomp-dev; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in 60 s"
+            sleep 60
+          done
+          exit 1
 
       - name: Select compiler
         run: |
