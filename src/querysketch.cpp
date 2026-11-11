@@ -113,6 +113,14 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     // hit by single-error reads of any abundant relative, and there the cutoff
     // must stay. The index records which case applies; an explicit --rcutoff wins.
     TreeBuildParams bp = loadTreeBuildParams(treeBuildParamsPath(treeDir));
+    // Per leaf and ancestor node, the node signatures the leaf's genome carries
+    // (ancestor_signatures.tsv). Lets a family row stand beside a resolved member
+    // when the member cannot account for the node's hits; see
+    // generateTreeQueryResult. Empty for an index without the table.
+    const auto ancestorCarried = loadAncestorSignatures(ancestorSignaturesPath(treeDir));
+    if (ancestorCarried.empty())
+        std::cerr << "Tree query: index has no ancestor_signatures.tsv; a resolved member always "
+                     "suppresses its family row (rebuild with the current uniqsketch to lift that)\n";
     // The two filter layouts select different signatures from the same pool, so
     // an index is meant to be queried by a binary built with the layout that
     // built it. The sketch is read verbatim either way; this is a warning only.
@@ -674,6 +682,15 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 fc.sigsHit = countSigsHit(L.sig[i]);
                 fc.sigsTotal = L.sig[i].size();
                 fc.coveredLeaves = it->second;
+                if (!ancestorCarried.empty()) {
+                    const std::string key = ancestorKey(fc.name, level);
+                    for (const std::string& lf : fc.coveredLeaves) {
+                        auto li = ancestorCarried.find(lf);
+                        if (li == ancestorCarried.end()) continue;
+                        auto ni = li->second.find(key);
+                        if (ni != li->second.end()) fc.memberCarried[lf] = ni->second;
+                    }
+                }
                 familyCalls.push_back(std::move(fc));
             }
         }

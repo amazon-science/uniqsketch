@@ -67,6 +67,11 @@ struct QuerySketchConfig {
     int treePruneHit = 1;                               // min coarse-level hits to keep a sub-tree in play
     bool noGroupSignatures = false;                     // --no-group-signatures: leaf level uses global signatures only
     double treeBreadth = 0.5;                           // --tree-breadth: min observed/expected signatures hit (0 = off)
+    // A family row beside a resolved member: kept when the node's distinct signatures
+    // hit exceed what its resolved members carry by more than this fraction of the
+    // node's signatures, and at least this many (see generateTreeQueryResult).
+    double familyExcess = 0.10;
+    size_t familyExcessMin = 50;
 };
 
 using SketchHash = std::unordered_map<std::string, unsigned>;
@@ -576,6 +581,10 @@ struct FamilyCall {
     size_t sigsHit;                                     // distinct signatures observed at least once
     size_t sigsTotal;                                   // signatures the representative carries at that level
     std::unordered_set<std::string> coveredLeaves;      // leaves descended from this node
+    // Per member, how many of this node's signatures at this level its genome
+    // carries (ancestor_signatures.tsv, written by the build since 3a5b600).
+    // Empty for an index without the table.
+    std::unordered_map<std::string, size_t> memberCarried;
 };
 
 /**
@@ -751,17 +760,52 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     // gives its node a low-breadth pattern that cannot be told from one locus.
     // The repeat exclusion in the group scan is what guards family rows against
     // mobile sequence.
+    //
+    // One exception to "a resolved member suppresses the family". A member can
+    // hit only the node signatures its genome carries, and the build records
+    // that number per (member, node, level) in ancestor_signatures.tsv. When the
+    // node's distinct signatures hit exceed what its resolved members carry, put
+    // together, by more than familyExcess of the node's signatures (and by at
+    // least familyExcessMin), something in the sample beyond the resolved members
+    // hit the node, and the family row says so. The case: a 928-genome E. coli
+    // mock community with 7A (a K-12 derivative with no signatures of its own at
+    // margin 2) at 10x beside MC4100, resolved as a strain on 69 signatures of
+    // its own; MC4100 carries 216 of the 1 498 signatures of their 87-leaf node
+    // and 7A's reads hit most of the rest, yet the row was suppressed and 7A was
+    // reported nowhere. The margins keep the rule away from two sources of
+    // excess that are not a hidden member: a few node signatures hit through
+    // sequencing errors (a read of a 90 % main with two coincident errors
+    // reproduces runs of 10 to 38 consecutive signature k-mers now and then), and
+    // an unresolved sibling at the detection floor (at 0.1x it hits about 7 % of
+    // the signatures it carries), which stays reported as it is today, not at
+    // all. At 0.5x and above a hidden member hits 30 % or more. A member with no
+    // row in the table (an index built before 3a5b600, or a name mismatch) keeps
+    // the old rule: resolved means suppressed.
     std::vector<const FamilyCall*> reportedFamilies;
+    struct BesideResolved { std::string name; size_t sigsHit, sigsTotal, explained; };
+    std::vector<BesideResolved> besideResolved;
     for (const FamilyCall& f : families) {
         if (f.count < static_cast<unsigned>(cfg.sketchHit) ||
             f.reads <= static_cast<size_t>(cfg.readCutoff)) {
             continue;
         }
-        bool anyLeafResolved = false;
+        bool anyLeafResolved = false, carriedKnown = true;
+        size_t explained = 0;
         for (const std::string& leaf : f.coveredLeaves) {
-            if (reportedLeaves.count(leaf)) { anyLeafResolved = true; break; }
+            if (!reportedLeaves.count(leaf)) continue;
+            anyLeafResolved = true;
+            auto it = f.memberCarried.find(leaf);
+            if (it == f.memberCarried.end()) { carriedKnown = false; break; }
+            explained += it->second;
         }
-        if (!anyLeafResolved) reportedFamilies.push_back(&f);
+        if (!anyLeafResolved) { reportedFamilies.push_back(&f); continue; }
+        if (!carriedKnown) continue;
+        const size_t margin = std::max<size_t>(cfg.familyExcessMin,
+            static_cast<size_t>(std::ceil(cfg.familyExcess * static_cast<double>(f.sigsTotal))));
+        if (f.sigsHit > explained + margin) {
+            reportedFamilies.push_back(&f);
+            besideResolved.push_back({f.name, f.sigsHit, f.sigsTotal, explained});
+        }
     }
 
     // One row per group. A node spanning several levels is scored at each of
@@ -857,13 +901,24 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     }
     outFile.close();
 
-    if (!reportedFamilies.empty()) {
-        std::cerr << "Tree query: " << reportedFamilies.size()
+    if (reportedFamilies.size() > besideResolved.size()) {
+        std::cerr << "Tree query: " << reportedFamilies.size() - besideResolved.size()
                   << " family-level call(s) reported where no leaf could be resolved:";
         for (const FamilyCall* f : reportedFamilies) {
-            std::cerr << " " << f->name << "(" << f->coveredLeaves.size() << " members)";
+            bool beside = false;
+            for (const BesideResolved& b : besideResolved) if (b.name == f->name) beside = true;
+            if (!beside) std::cerr << " " << f->name << "(" << f->coveredLeaves.size() << " members)";
         }
         std::cerr << "\n";
+    }
+    if (!besideResolved.empty()) {
+        std::cerr << "Tree query: " << besideResolved.size()
+                  << " family-level call(s) reported beside a resolved member, whose carried signatures "
+                     "do not account for the node's hits:\n";
+        for (const BesideResolved& b : besideResolved) {
+            std::cerr << "  " << b.name << "\tsigs_hit " << b.sigsHit << "/" << b.sigsTotal
+                      << "\tresolved members carry at most " << b.explained << "\n";
+        }
     }
     if (!withheld.empty()) {
         std::cerr << "Tree query: " << withheld.size() << " strain call(s) withheld, hits confined to a few signatures "

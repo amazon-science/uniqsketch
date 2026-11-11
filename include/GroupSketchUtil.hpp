@@ -438,6 +438,33 @@ inline std::vector<GroupSignature> loadGroupSketch(const std::string& path) {
 inline std::string ancestorSignaturesPath(const std::string& outdir) {
     return outdir + "/ancestor_signatures.tsv";
 }
+/** Key of a node at a level in the ancestor-signature table: "<node>@<level>". A node
+ *  spanning several levels has a different signature draw at each. */
+inline std::string ancestorKey(const std::string& node, unsigned level) {
+    return node + "@" + std::to_string(level);
+}
+/**
+ * Load ancestor_signatures.tsv: leaf -> (node@level -> signatures of that node the leaf
+ * genome carries). Empty when the file is absent (an index built before the table).
+ */
+inline std::unordered_map<std::string, std::unordered_map<std::string, size_t>>
+loadAncestorSignatures(const std::string& path) {
+    std::unordered_map<std::string, std::unordered_map<std::string, size_t>> out;
+    std::ifstream in(path);
+    if (!in.good()) return out;
+    std::string line;
+    std::getline(in, line);   // header
+    while (std::getline(in, line)) {
+        std::vector<std::string> f;
+        size_t b = 0;
+        for (size_t e; (e = line.find('\t', b)) != std::string::npos; b = e + 1) f.push_back(line.substr(b, e - b));
+        f.push_back(line.substr(b));
+        if (f.size() < 5) continue;
+        out[f[0]][ancestorKey(f[2], static_cast<unsigned>(std::strtoul(f[1].c_str(), nullptr, 10)))] =
+            std::strtoul(f[4].c_str(), nullptr, 10);
+    }
+    return out;
+}
 inline std::string reachabilityPath(const std::string& outdir) {
     return outdir + "/reachability.tsv";
 }

@@ -478,9 +478,17 @@ or more of these is here, at about this level". On the 8-genome test set a close
 member at 0.01% that could not be resolved was reported as its family at
 0.009–0.012%; on 120 *E. coli* genomes, a member of a 4-strain family at 0.01% was
 reported as that family in 13 of the 28 mixtures where it could not be resolved,
-at 0.006–0.013%. A family row is never emitted when any of its members is reported
-as a strain, a group is reported once (at the finest level that detected it), and
-a group is not reported when one of its sub-groups is. A group whose lineage the
+at 0.006–0.013%. A family row is not emitted when a member reported as a strain can
+account for the group's evidence: the build records how many of a node's signatures
+each member's genome carries (`<outdir>/ancestor_signatures.tsv`), and the row is
+dropped unless the node's distinct signatures hit exceed what its resolved members
+carry by more than 10% of the node's signatures (and at least 50). A member hidden
+behind a resolved sibling therefore still surfaces as a family row when its reads hit
+signatures the sibling does not have; a sibling at the detection floor does not
+(at 0.1x it hits about 7% of what it carries). Indexes built before the table keep
+the plain rule: a resolved member suppresses the row. A group is reported once (at
+the finest level that detected it), and a group is not reported when one of its
+sub-groups is. A group whose lineage the
 walk dropped at a coarser level is still reported when its own representative
 clears the hit threshold on two or more reads: a node's signatures are its
 representative's k-mers absent outside the node, which a member need not carry,
