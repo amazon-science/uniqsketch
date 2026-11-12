@@ -15,6 +15,7 @@
 #include "CompareSketchUtil.hpp"
 #include "TreeSketchUtil.hpp"
 #include "GroupSketchUtil.hpp"
+#include "NodeCarrierUtil.hpp"
 #include "ClusterUtil.hpp"
 
 int main() {

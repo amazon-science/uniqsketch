@@ -133,6 +133,17 @@ inline unsigned wrapPad(const UniqSketchConfig& cfg) {
 inline std::string candidatePath(const std::string& outdir, const std::string& refPath) {
     return outdir + "/" + getBaseId(refPath) + ".cand";
 }
+/**
+ * A tree node's carried candidates (NodeCarrierUtil.hpp), beside its candidate
+ * file: <outdir>/<basename>.carried. One extension, so getBaseId names the same
+ * reference from either file.
+ */
+inline std::string carriedCandidatePath(const std::string& candPath) {
+    const std::string ext = ".cand";
+    if (candPath.size() >= ext.size() && candPath.compare(candPath.size() - ext.size(), ext.size(), ext) == 0)
+        return candPath.substr(0, candPath.size() - ext.size()) + ".carried";
+    return candPath + ".carried";
+}
 
 /**
  * Per-reference candidate file: the reference's unique k-mers, as positions in
@@ -1192,13 +1203,31 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
     std::vector<size_t> refSelected(uniqStats.size(), 0);
     std::vector<size_t> refCandidates(uniqStats.size(), 0);
     std::vector<std::string> refPath(uniqStats.size());
-    #pragma omp parallel for schedule(dynamic) reduction(+:totalSel, totalSafe)
+    // Node signatures with carriers (NodeCarrierUtil.hpp): a tree node whose unique
+    // candidates leave its quota short draws the rest from its carried pool, a
+    // second candidate file beside the first, with the same selection on the
+    // shortfall as its quota. The unique signatures are exactly those selected
+    // without the pool; the carried ones follow them in the reference's block.
+    const size_t quota = static_cast<size_t>(std::max(cfg.sketchnum, 1));
+    size_t totalFill = 0, refsFilled = 0, refsShort = 0;
+    #pragma omp parallel for schedule(dynamic) reduction(+:totalSel, totalSafe, totalFill, refsFilled, refsShort)
     for (unsigned i = 0; i < uniqStats.size(); i++) {
         std::istringstream uniqstm(uniqStats[i]);
         std::string sketchPath;
         size_t sketchCount, sketchRefId;
         uniqstm >> sketchPath >> sketchCount >> sketchRefId;
         SketchStat st = getUniqSet(cfg, sketchPath, sketchRefId, perRef[i], dbFilter);
+        const std::string carriedPath = carriedCandidatePath(sketchPath);
+        if (st.selected < quota && fileExists(carriedPath)) {
+            UniqSketchConfig fill = cfg;
+            fill.sketchnum = static_cast<int>(quota - st.selected);
+            SketchStat ft = getUniqSet(fill, carriedPath, sketchRefId, perRef[i], dbFilter);
+            st.selected += ft.selected;
+            st.safe += ft.safe;
+            totalFill += ft.selected;
+            refsFilled += ft.selected > 0;
+            refsShort += st.selected < quota;
+        }
         refSelected[i] = st.selected;
         refCandidates[i] = sketchCount;
         refPath[i] = sketchPath;
@@ -1209,6 +1238,13 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
     std::ofstream out(cfg.outfile);
     for (const auto& buf : perRef) out << buf.str();
     out.close();
+
+    if (totalFill || refsShort) {
+        std::cout << "Node carriers: " << totalFill << " signatures from carried candidates fill "
+                  << refsFilled << " representative(s) below quota";
+        if (refsShort) std::cout << " (" << refsShort << " still below it)";
+        std::cout << "\n";
+    }
 
     if (cfg.minMargin >= 2) {
         std::cout << "Signatures satisfying margin >= " << cfg.minMargin << ": "

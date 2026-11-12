@@ -11,6 +11,7 @@
 
 #include "TreeSketchUtil.hpp"
 #include "GroupSketchUtil.hpp"
+#include "NodeCarrierUtil.hpp"
 
 // Deterministic pseudo-random DNA (varied, so its k-mers are mostly distinct).
 static std::string randDNA(size_t n, uint64_t seed) {
@@ -357,6 +358,223 @@ void testBuildHierarchicalTree() {
     std::cerr << "PASSED: Test buildHierarchicalTree\n";
 }
 
+// Node signatures with carriers (NodeCarrierUtil.hpp), on a node whose core is
+// carried outside it. A is the representative, with a 60-bp repeat of [500, 560)
+// appended; the members are A with one substitution (A1), A without [100, 250)
+// (A2), and A without [100, 250), [300, 330) and [350, 380) (A3, A4). B is
+// unrelated plus A's [100, 400), so A's k-mers starting in [100, 380) are carried
+// outside the node and are never plain candidates; C is unrelated. Of the carried
+// k-mers, the carried pool holds those at least half the members (3 of 5) carry:
+// [250, 280) (all five) and [280, 330) (A, A1, A2), and not [100, 250) or
+// [330, 380) (A and A1 only). The repeat's k-mers occur twice in A and are
+// excluded whatever their carriage; the junction k-mers it creates are plain.
+void testNodeCarriers() {
+    std::cerr << "START: Test node signatures with carriers... \t";
+    const unsigned k = 21;
+    std::string base = randDNA(1200, 2026);
+    // A deletion's junction must not recreate the k-mer that overlapped the deleted
+    // region by one base (a[349] a[380..400) is a[379..400) when a[349] == a[379]),
+    // so the bases on either side of each deletion are made to differ.
+    for (auto [i, j] : {std::pair<int, int>{99, 249}, {100, 250}, {299, 329}, {300, 330}, {349, 379}, {350, 380}})
+        if (base[i] == base[j]) base[j] = (base[j] == 'A') ? 'C' : 'A';
+    std::string a = base + base.substr(500, 60);
+    std::string a1 = a; a1[600] = (a[600] == 'A') ? 'C' : 'A';
+    std::string a2 = a.substr(0, 100) + a.substr(250, 100) + a.substr(380);
+    std::string a3 = a.substr(0, 100) + a.substr(250, 50) + a.substr(330, 20) + a.substr(380);
+    std::string b = randDNA(1200, 7171) + a.substr(100, 300);
+    std::string c = randDNA(1200, 3131);
+    writeFasta("nc_A.fa", a); writeFasta("nc_A1.fa", a1); writeFasta("nc_A2.fa", a2);
+    writeFasta("nc_A3.fa", a3); writeFasta("nc_A4.fa", a3);
+    writeFasta("nc_B.fa", b); writeFasta("nc_C.fa", c);
+    std::vector<std::string> refs = {"nc_A.fa", "nc_A1.fa", "nc_A2.fa", "nc_A3.fa", "nc_A4.fa", "nc_B.fa", "nc_C.fa"};
+    std::vector<std::vector<std::string>> groups = {{refs[0], refs[1], refs[2], refs[3], refs[4]}, {refs[5]}, {refs[6]}};
+
+    UniqSketchConfig cfg;
+    cfg.kmerLen = k;
+    cfg.threads = 4;
+    cfg.minMargin = 2;
+    cfg.strictMargin = true;
+    cfg.sketchnum = 5000;
+    size_t total = 0;
+    getCardinality(total, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, refs);
+    assert(resolveBloomSizes(total, cfg.dbfSize, cfg.sbfSize));
+
+    // Carriage: the number of genomes containing a k-mer, exact here (no counter
+    // is shared at this load), and once per genome however often it occurs there.
+    assert(defaultNodeCarriers(8) == 0 && defaultNodeCarriers(120) == 12 && defaultNodeCarriers(5493) == 50);
+    CarriageCounter cc(cfg.dbfSize);
+    countCarriage(cfg, refs, cc);
+    auto carriage = [&](const std::string& kmer) {
+        ntHashIterator itr(kmer, CarriageCounter::HASHES, k);
+        return cc.count(*itr);
+    };
+    assert(carriage(a.substr(260, k)) == 6);    // all five members and B
+    assert(carriage(a.substr(300, k)) == 4);    // A, A1, A2 and B
+    assert(carriage(a.substr(150, k)) == 3);    // A, A1 and B
+    assert(carriage(a.substr(700, k)) == 5);    // the node only
+    assert(carriage(a.substr(590, k)) == 4);    // spans A1's substitution
+    assert(carriage(a.substr(510, k)) == 5);    // the repeat: once per genome
+    assert(carriage(c.substr(10, k)) == 1);
+    assert(carriage(randDNA(k, 4444)) == 0);
+
+    // Candidates. A has 1240 k-mers: 80 positions hold the 40 repeated k-mers,
+    // 280 (starting in [100, 380)) are carried by B. Plain: 1240 - 80 - 280 = 880,
+    // in candidate files and a stat file byte for byte those of the plain scan,
+    // whatever the cap. The carried pool, a second file, holds with a cap of 1
+    // the 80 starting in [250, 330); with a cap of 0 there is no second file.
+    auto level = [&](const std::string& dir) {
+        UniqSketchConfig lvl = cfg;
+        lvl.outdir = dir;
+        lvl.outfile = dir + "/sketch_level_0.tsv";
+        lvl.refstat = dir + "/db_uniq_count.tsv";
+        lvl.numRef = groups.size();
+        mkdir(dir.c_str(), 0777);
+        return lvl;
+    };
+    auto contents = [](const std::string& p) { std::ifstream in(p); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+    auto candidates = [](const std::string& p) { CandidateSet c; return readCandidates(p, c) ? c.total : 0; };
+    auto counts = [](const std::string& statFile) {   // the stat file's counts, in its order
+        std::vector<std::pair<int, int>> n;
+        std::ifstream in(statFile);
+        std::string path; int cnt, id;
+        while (in >> path >> cnt >> id) n.push_back({cnt, id});
+        return n;
+    };
+    UniqSketchConfig plain = level("nc_plain"), cap0 = level("nc_cap0"), cap1 = level("nc_cap1");
+    BloomFilter dbfPlain(plain.m1(), plain.nhash1, plain.kmerLen);
+    identifyGroupUniqKmers(plain, groups, dbfPlain);
+    {
+        BloomFilter dbf(cap0.m1(), cap0.nhash1, cap0.kmerLen);
+        identifyGroupUniqKmersCarried(cap0, groups, dbf, cc, 0);
+    }
+    BloomFilter dbf1(cap1.m1(), cap1.nhash1, cap1.kmerLen);
+    identifyGroupUniqKmersCarried(cap1, groups, dbf1, cc, 1);
+    assert(candidates(candidatePath(plain.outdir, refs[0])) == 880);
+    for (const std::string& r : {refs[0], refs[5], refs[6]}) {
+        assert(contents(candidatePath(plain.outdir, r)) == contents(candidatePath(cap0.outdir, r)));
+        assert(contents(candidatePath(plain.outdir, r)) == contents(candidatePath(cap1.outdir, r)));
+        assert(!fileExists(carriedCandidatePath(candidatePath(cap0.outdir, r))));
+    }
+    assert(counts(plain.refstat).size() == 3 && counts(cap0.refstat) == counts(plain.refstat) &&
+           counts(cap1.refstat) == counts(plain.refstat));
+    assert(candidates(carriedCandidatePath(candidatePath(cap1.outdir, refs[0]))) == 80);
+    assert(!fileExists(carriedCandidatePath(candidatePath(cap1.outdir, refs[5]))));   // singles: no pool
+
+    // Selection: the node-unique signatures are those of the plain build, byte for
+    // byte; the carried pool only fills what they leave of the quota. Each
+    // signature's position is in the sketch, so the sets are compared by it.
+    auto positions = [&](const std::string& sketch, const std::string& ref, bool carriedOnly) {
+        std::set<unsigned> pos;
+        std::ifstream in(sketch);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::vector<std::string> f;
+            size_t p = 0, q;
+            while ((q = line.find('\t', p)) != std::string::npos) { f.push_back(line.substr(p, q - p)); p = q + 1; }
+            f.push_back(line.substr(p));
+            assert(f.size() >= 6);
+            if (f[2] != ref) continue;
+            if (carriedOnly && (f.size() < 7 || f[6] == "-")) continue;
+            pos.insert(static_cast<unsigned>(std::stoul(f[5])));
+        }
+        return pos;
+    };
+    const std::string A = getBaseId(refs[0]);
+    for (int quota : {5000, 900, 700, 600}) {
+        plain.sketchnum = cap1.sketchnum = quota;
+        buildSketch(plain, plain.refstat, dbfPlain);
+        buildSketch(cap1, cap1.refstat, dbf1);
+        std::set<unsigned> pPlain = positions(plain.outfile, A, false), pCap1 = positions(cap1.outfile, A, false);
+        assert(pPlain.size() <= static_cast<size_t>(quota));
+        for (unsigned p : pPlain) assert(pCap1.count(p) > 0);                     // the plain selection is kept
+        size_t fill = 0;
+        for (unsigned p : pCap1) if (!pPlain.count(p)) { ++fill; assert(p >= 250 && p < 330); }
+        assert(pCap1.size() == pPlain.size() + fill);
+        // Of the 80 carried candidates two fail the strict margin: the k-mers at 280
+        // and 329 are one substitution from the junction k-mers A3's deletions
+        // create (a[280..300) a[330] and a[299] a[330..350)). A shortfall of 78 or
+        // more takes the whole usable pool; a smaller one is filled to the quota, or
+        // one short of it when a selection run holds only an unusable candidate.
+        const size_t shortfall = static_cast<size_t>(quota) - pPlain.size();
+        if (shortfall == 0) assert(fill == 0 && pCap1 == pPlain);
+        else if (shortfall >= 78) assert(fill == 78);
+        else assert(fill <= shortfall && fill + 1 >= shortfall);
+        // The other references have no carried pool and are unchanged.
+        for (const std::string& r : {refs[5], refs[6]})
+            assert(positions(plain.outfile, getBaseId(r), false) == positions(cap1.outfile, getBaseId(r), false));
+    }
+
+    // The carriers of the selected signatures as the level sketch's seventh column
+    // (the sketch from the last build, quota 800, has none; rebuild at 5000): B's
+    // leaf id for every filled signature, `-` for every node-unique one.
+    plain.sketchnum = cap1.sketchnum = 5000;
+    buildSketch(cap1, cap1.refstat, dbf1);
+    std::vector<TreeNode> t;
+    auto leaf = [&](unsigned id, const std::string& p, int parent) {
+        TreeNode x; x.id = id; x.name = getBaseId(p); x.filePath = p; x.level = 1; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+    };
+    for (unsigned i = 0; i < 5; i++) leaf(i, refs[i], 7);
+    leaf(5, refs[5], -1); leaf(6, refs[6], -1);
+    TreeNode N; N.id = 7; N.name = "N"; N.filePath = refs[0]; N.level = 0; N.parentId = -1; N.isLeaf = false; N.children = {0, 1, 2, 3, 4}; t.push_back(N);
+    UniqSketchConfig top = cfg;
+    top.outdir = "nc_cap1";
+    top.outfile = "nc_cap1/sketch_uniq.tsv";       // no leaf sketch here: the report counts none
+    reportReachability(top, t, refs, {0}, true);
+    size_t rows = 0, carried = 0, inWindow = 0;
+    {
+        std::ifstream in(cap1.outfile);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::vector<std::string> f;
+            size_t p = 0, q;
+            while ((q = line.find('\t', p)) != std::string::npos) { f.push_back(line.substr(p, q - p)); p = q + 1; }
+            f.push_back(line.substr(p));
+            assert(f.size() == 7);
+            ++rows;
+            if (f[2] != A) { assert(f[6] == "-"); continue; }
+            const unsigned pos = static_cast<unsigned>(std::stoul(f[5]));
+            const bool window = pos >= 250 && pos < 330;
+            inWindow += window;
+            if (f[6] != "-") { ++carried; assert(window && f[6] == "5"); }
+            else assert(!window);
+        }
+    }
+    assert(rows > 0 && carried == 78 && carried == inWindow);
+    auto back = loadLevelCarriers(cap1.outfile);
+    assert(back.size() == carried);
+    for (const auto& kv : back) assert(kv.second == std::vector<unsigned>({5}));
+    assert(loadLevelCarriers(plain.outfile).empty());             // no seventh column
+
+    // Signature loci, as the query counts them for the exclusion test: the level
+    // sketch of the cap-1 build has A's signatures in position order, node-unique
+    // ones over the genome and the filled ones in [250, 330), so with a gap of 500
+    // all of A's signatures on the one contig are one locus; with a gap of 0 each
+    // signature is its own locus. Within-group positions are merged in: one on
+    // another contig adds a locus, one next to an existing signature does not. A
+    // reference with no signatures has none.
+    {
+        std::vector<std::tuple<unsigned, std::string, unsigned>> none;
+        std::vector<unsigned> l = countSignatureLoci(cap1.outfile, 3, none, 500);
+        assert(l.size() == 3 && l[0] == 1 && l[1] == 1 && l[2] == 1);
+        l = countSignatureLoci(cap1.outfile, 3, none, 0);
+        std::set<unsigned> pA = positions(cap1.outfile, A, false);
+        assert(l[0] == pA.size());
+        std::vector<std::tuple<unsigned, std::string, unsigned>> extra = {
+            {0, "seq", *pA.begin() + 1},          // beside a signature of A: same locus
+            {0, "plasmid", 10},                   // another contig: a locus of its own
+            {1, "seq", 5}, {1, "seq", 2000},      // B: 2 000 bases apart with a 500 gap
+            {7, "seq", 1}};                       // out of range: ignored
+        l = countSignatureLoci(cap1.outfile, 3, extra, 500);
+        assert(l[0] == 2 && l[1] == 2 && l[2] == 1);
+        l = countSignatureLoci("nc_cap1/no_such_sketch.tsv", 2, none, 500);
+        assert(l.size() == 2 && l[0] == 0 && l[1] == 0);
+    }
+
+    for (const std::string& r : refs) std::remove(r.c_str());
+    system("rm -rf nc_plain nc_cap0 nc_cap1");
+    std::cerr << "PASSED: Test node signatures with carriers (" << rows << " level signatures, " << carried << " carried)\n";
+}
+
 int main() {
     testLoadTree();
     testBuildParamsRoundTrip();
@@ -365,6 +583,7 @@ int main() {
     testTreeLevelPartition();
     testGroupSignatures();
     testBuildGroupSketch();
+    testNodeCarriers();
     testBuildHierarchicalTree();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;

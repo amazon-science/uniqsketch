@@ -349,6 +349,7 @@ struct TreeBuildParams {
     bool strictMargin = false;
     unsigned maxHomopolymer = 0;
     bool circular = false;
+    unsigned nodeCarriers = 0;   // node signatures may be carried by up to this many outside genomes (NodeCarrierUtil.hpp)
     bool groupSignatures = false; // within-group leaf signatures built (sketch_group.tsv)
     std::string thresholds;      // comma-separated, coarsest first
     std::string bloomFilter;     // filter layout the index was built with (see bloomFilterName)
@@ -384,6 +385,7 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "strict_margin\t" << (p.strictMargin ? 1 : 0) << "\n"
         << "max_homopolymer\t" << p.maxHomopolymer << "\n"
         << "circular\t" << (p.circular ? 1 : 0) << "\n"
+        << "node_carriers\t" << p.nodeCarriers << "\n"
         << "group_signatures\t" << (p.groupSignatures ? 1 : 0) << "\n"
         << "tree\t" << p.thresholds << "\n"
         << "bloom_filter\t" << p.bloomFilter << "\n";
@@ -450,6 +452,7 @@ inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
             else if (key == "strict_margin") p.strictMargin = (val == "1");
             else if (key == "max_homopolymer") p.maxHomopolymer = static_cast<unsigned>(std::stoul(val));
             else if (key == "circular") p.circular = (val == "1");
+            else if (key == "node_carriers") p.nodeCarriers = static_cast<unsigned>(std::stoul(val));
             else if (key == "group_signatures") p.groupSignatures = (val == "1");
             else if (key == "tree") p.thresholds = val;
             else if (key == "bloom_filter") p.bloomFilter = val;

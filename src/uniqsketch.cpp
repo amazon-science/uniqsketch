@@ -12,6 +12,7 @@
 #include "ClusterUtil.hpp"
 #include "TreeSketchUtil.hpp"
 #include "GroupSketchUtil.hpp"
+#include "NodeCarrierUtil.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -48,6 +49,9 @@ static const char USAGE_MESSAGE[] =
     "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree]\n"
     "      --circular\treferences are circular: also take the k-1 k-mers spanning each contig's end-to-start join\n"
     "      --no-group-signatures\tdo not build within-group leaf signatures (with --tree; see README)\n"
+    "      --node-carriers=N\tfill a tree node's signature quota, when its node-unique k-mers leave it short,\n"
+    "\t\t\tfrom k-mers carried by up to N genomes outside the node (recorded; the query\n"
+    "\t\t\tsets them aside when a carrier is present) [min(50, leaves/10); 0=off]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -57,7 +61,7 @@ static const char USAGE_MESSAGE[] =
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
-       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR };
+       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -83,6 +87,7 @@ static const struct option longopts[] = {
     {"strict-margin",  no_argument,       nullptr, OPT_STRICTMARGIN},
     {"circular",       no_argument,       nullptr, OPT_CIRCULAR},
     {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
+    {"node-carriers",  required_argument, nullptr, OPT_NODECARRIERS},
     {"sensitive",      no_argument, &g_sketchnum, 100},
     {"very-sensitive", no_argument, &g_sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -102,6 +107,7 @@ int main(int argc, char** argv) {
     std::vector<TreeNode> tree;            // the hierarchy, when --tree is used
     bool marginGiven = false;       // --min-margin passed explicitly (tree default otherwise)
     bool groupSignatures = true;    // within-group leaf signatures for a tree index (--no-group-signatures)
+    int nodeCarriers = -1;          // --node-carriers (-1: min(50, leaves/10) once the leaf count is known)
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -139,6 +145,7 @@ int main(int argc, char** argv) {
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
         case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
         case OPT_NOGROUPSIGS: groupSignatures = false; break;
+        case OPT_NODECARRIERS: arg >> nodeCarriers; break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -302,6 +309,8 @@ int main(int argc, char** argv) {
         bp.maxHomopolymer = cfg.maxHomopolymer;
         bp.circular = cfg.circular;
         bp.groupSignatures = groupSignatures;
+        if (nodeCarriers < 0) nodeCarriers = static_cast<int>(defaultNodeCarriers(refFiles.size()));
+        bp.nodeCarriers = static_cast<unsigned>(nodeCarriers);
         bp.bloomFilter = bloomFilterName();
         for (size_t i = 0; i < treeThresholds.size(); i++) {
             if (i) bp.thresholds += ",";
@@ -331,6 +340,23 @@ int main(int argc, char** argv) {
                            cfg.kmerLen, cfg.threads, refFiles);
         }
         cfg.treeBuild = true;   // messages: a leaf without leaf signatures is not lost
+        // Per-genome carriage of every k-mer, for the nodes' carried pools
+        // (NodeCarrierUtil.hpp): one pass over all genomes, sized by the index's
+        // distinct k-mers. Freed once the levels are built.
+        std::unique_ptr<CarriageCounter> carriage;
+        if (nodeCarriers > 0 && !levelGroups.empty()) {
+#ifdef _OPENMP
+            double tc = omp_get_wtime();
+#endif
+            carriage.reset(new CarriageCounter(universeDistinct));
+            countCarriage(cfg, refFiles, *carriage);
+            std::cerr << "Node carriers: cap " << nodeCarriers << ", carriage counted over "
+                      << refFiles.size() << " genomes (" << carriage->bytes() / (1 << 20) << " MB)";
+#ifdef _OPENMP
+            std::cerr << " in " << std::setprecision(1) << std::fixed << omp_get_wtime() - tc << " s";
+#endif
+            std::cerr << "\n";
+        }
         for (const auto& [level, groups] : levelGroups) {
             if (groups.empty()) continue;
 
@@ -349,7 +375,9 @@ int main(int argc, char** argv) {
                 double t0 = omp_get_wtime();
 #endif
                 BloomFilter levelDbf(lvl.m1(), lvl.nhash1, lvl.kmerLen);
-                identifyGroupUniqKmers(lvl, groups, levelDbf);
+                if (carriage) identifyGroupUniqKmersCarried(lvl, groups, levelDbf, *carriage,
+                                                            static_cast<unsigned>(nodeCarriers));
+                else identifyGroupUniqKmers(lvl, groups, levelDbf);
 #ifdef _OPENMP
                 double t1 = omp_get_wtime();
 #endif
@@ -366,6 +394,7 @@ int main(int argc, char** argv) {
                           << " (no k-mer content)\n";
             }
         }
+        carriage.reset();
     }
 
     // Optional clustering: merge nearly identical references
@@ -417,7 +446,7 @@ int main(int argc, char** argv) {
             std::ifstream probe(cfg.outdir + "/sketch_level_" + std::to_string(level) + ".tsv");
             if (probe.good()) builtLevels.push_back(level);
         }
-        reportReachability(cfg, tree, refFiles, builtLevels);
+        reportReachability(cfg, tree, refFiles, builtLevels, nodeCarriers > 0);
     }
 
 #ifdef _OPENMP

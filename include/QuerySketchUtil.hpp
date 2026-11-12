@@ -72,6 +72,12 @@ struct QuerySketchConfig {
     // node's signatures, and at least this many (see generateTreeQueryResult).
     double familyExcess = 0.10;
     size_t familyExcessMin = 50;
+    // A carrier of a node's carried signatures (NodeCarrierUtil.hpp) that shows no
+    // hit of its own is excluded only when its own signature loci would have
+    // collected at least this many reads at the coverage the node's hits imply;
+    // otherwise it may be present and the signatures it carries are set aside.
+    double carrierExcludeReads = 8.0;
+    unsigned locusGap = 500;                            // bases between signatures of different loci
 };
 
 using SketchHash = std::unordered_map<std::string, unsigned>;

@@ -121,7 +121,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
-* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level), `build_params.tsv` (how signatures were selected; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
+* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level: the six signature columns, then `carriers`, the leaf ids of the genomes outside the node that contain the k-mer or `-`; the column is absent when the index was built with `--node-carriers=0`), `build_params.tsv` (how signatures were selected, `node_carriers` included; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
 
 ### querysketch
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
@@ -230,6 +230,9 @@ A list of files containing file names in each row can be passed with @ prefix.
       --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree]
       --circular        references are circular: also take the k-1 k-mers spanning each contig's end-to-start join
       --no-group-signatures  do not build within-group leaf signatures (with --tree)
+      --node-carriers=N fill a tree node's signature quota, when its node-unique k-mers leave it short,
+                        from k-mers carried by up to N genomes outside the node (recorded; the query
+                        sets them aside when a carrier is present) [min(50, leaves/10); 0=off]
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
@@ -351,6 +354,37 @@ evidence but never remove any. Building it costs about 20 % more time on the
 builds run as one parallel job list, so many small groups keep the machine busy)
 and about 150 MB more candidate scratch under `<outdir>/groups/`. Query time is
 unchanged.
+
+**Node signatures with carriers.** The same idea, one level up, for the nodes. A
+node's signatures are its representative's k-mers that no genome outside the node
+carries, and in a dense reference set a lineage is often split across nodes (the
+thresholds count unique k-mers, so a few insertions put a close relative over one).
+Then nothing of the lineage's core is unique to any one node, what is left is the
+representative's private sequence, and the other members carry none of it: on
+5 493 *E. coli* genomes the 102-leaf K-12 node (MG1655, BW25113 and their
+derivatives) had 1 407 candidates, 100 of its 102 members carried none of the
+signatures drawn from them, 56 references carried no signature of any kind at any
+level, and 10x of pure MG1655 gave an empty table. So beside each node's pool of
+node-unique k-mers the build writes a second pool: the representative's k-mers that
+occur once in it, are carried by at least half the node's members (one of them not
+the representative) and by at most `--node-carriers` genomes outside the node
+(default `min(50, leaves/10)`: 50 on a thousand genomes or more, 12 on 120, 0 on
+8). The node's signatures are selected from the first pool exactly as before; only
+when they fall short of `-c` is the remainder selected from the second, under the
+same margin, entropy and spread rules, and each such signature is recorded with
+its carriers in the level sketch's seventh column. Filling a shortfall rather than
+widening every pool is deliberate: every unreachable reference of the 5 493-genome
+index sits under nodes that end below quota (the strict margin consumes most of a
+dense lineage's core: on 120 genomes one node's 297 000 carried candidates yielded
+3 200 signatures), while a node already at quota from its own k-mers gains nothing
+from signatures that stop counting whenever one of a few outside genomes is present.
+`querysketch --tree` counts a carried signature for its node only when every one of
+its carriers is absent, see [querysketch](#querysketch-1). The counting pass over the
+genomes costs 32 to 64 bytes of memory per distinct k-mer of the index (2 GB on 120
+genomes, 16 GB on 5 493) and, with the member scans and the second selection, about
+60 % more build time (83 → 133 s on 120 genomes, 43 → 78 min on 5 493);
+`--node-carriers=0` turns the whole thing off and produces today's index byte for
+byte.
 
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output
@@ -495,16 +529,40 @@ representative's k-mers absent outside the node, which a member need not carry,
 so a member's reads can miss every signature of one ancestor and hit most of
 another's. The stderr line for the level says how many such nodes rejoined.
 
-What no query can report is a reference that carries no signature at any level:
-none of its own, none within its group, and none of any ancestor's. On 5 493
-*E. coli* genomes 56 references are in that position, 42 of them the K-12 core
-(MG1655, BW25113 and their derivatives), whose every k-mer is shared with another
-K-12 genome and whose nodes' signatures are private to the representatives. A
-sample that is only such a genome yields an empty table. This is a property of
-the index, not of the query, and it is open (see `docs/v2.0-validation.md`, "Dense
-lineages"). The build measures it: `<outdir>/reachability.tsv` gives every
-reference's status (`own`, `group`, `family`, `none`) and the stderr summary names
-the `none` references, so what an index cannot see is known before the first query.
+**Node signatures with carriers.** A node whose node-unique k-mers fall short of
+`-c` is filled by the build with k-mers its members share with a few genomes
+outside the node, each recorded with those carriers (see
+[uniqsketch](#uniqsketch-1)). A hit on such a signature says that the node or one
+of its carriers is present, and before the walk the query settles every one of
+them. It counts for its node only when every carrier is absent. A carrier is
+*present* when anything of its own was hit: a leaf signature, a within-group
+signature none of whose carriers may be present, or a representative covering it
+at some level that does not also cover the node and clears the reporting
+threshold on two or more reads (a common ancestor says nothing about which of the
+two is there). An unseen carrier is *excluded* when, at the coverage the node's hits
+imply for it, its own signature loci would have collected eight or more reads; the
+test counts loci, not signatures, because a strain one to three substitutions from
+its relatives has all its signatures at those sites and is seen only when a read
+covers one of them without error (one such strain on the 5 493-genome index had
+146 signatures in three sites, 15 494 hits from 304 reads at 99 % abundance and
+none at 1 %). An unseen carrier that cannot be excluded *may be present* and
+blocks what it carries; one with no signatures of any kind cannot be tested and
+is treated as absent unless its lineage attests it, the same residual as for
+within-group signatures. A signature that is blocked is set aside, hits and all,
+and leaves the node's signature set for this sample, so the node is judged on the
+signatures that can speak for it; the ambiguous evidence is not lost, because the
+parent node, which contains the node and its sibling carriers alike, sees the
+same reads on its own signatures, and that is the row reported. On 5 493 *E. coli*
+genomes this brings the K-12 core (MG1655, BW25113 and their derivatives, 42
+references whose every k-mer is shared with another K-12 genome) within reach of a
+family row: 10x of pure MG1655 or of a K-12 derivative, an empty table before, is
+the 345-member level-1 family row, and 56 references that carried no signature at
+any level now carry one (`docs/v2.0-validation.md`, "Dense lineages"). The build
+measures what remains: `<outdir>/reachability.tsv` gives every reference's status
+(`own`, `group`, `family`, `none`) and the stderr summary names the `none`
+references, so what an index cannot see is known before the first query; the
+query's stderr says how many carried signatures were in use, how many were set
+aside and why.
 
 `--tree-prune=N` controls how eagerly sub-trees are dropped during the walk. A
 sub-tree stays in play if its representative gathers at least N hits and one read

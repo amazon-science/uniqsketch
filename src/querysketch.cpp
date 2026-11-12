@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <deque>
+#include <map>
 #include <numeric>
+#include <set>
 #include <unordered_map>
 
 #include "ntHashIterator.hpp"
@@ -10,6 +12,7 @@
 #include "QuerySketchUtil.hpp"
 #include "TreeSketchUtil.hpp"
 #include "GroupSketchUtil.hpp"
+#include "NodeCarrierUtil.hpp"
 #include "FileUtil.hpp"
 
 #ifdef _OPENMP
@@ -206,11 +209,15 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     // The level files are independent; parse them side by side (each on a copy
     // of the config, since loadSketch records k in it).
     std::vector<SketchHash> levelHash(levelSketches.size());
+    // Carriers of the coarse-level signatures (NodeCarrierUtil.hpp): the seventh
+    // column of a level sketch, absent from an index built without node carriers.
+    std::vector<std::unordered_map<std::string, std::vector<unsigned>>> levelCarriers(levelSketches.size());
     #pragma omp parallel for schedule(dynamic) num_threads(static_cast<int>(std::min<size_t>(levelSketches.size(), cfg.threads)))
     for (size_t li = 0; li < levelSketches.size(); li++) {
         QuerySketchConfig local = cfg;
         levels[li].level = levelSketches[li].first;
         loadSketch(local, levelSketches[li].second, levelHash[li], levels[li].ref, levels[li].sig);
+        if (li + 1 < levelSketches.size()) levelCarriers[li] = loadLevelCarriers(levelSketches[li].second);
     }
     {
         // k, as loadSketch would have recorded it: the length of the first signature.
@@ -220,12 +227,30 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         cfg.kmerLen = static_cast<unsigned>(first.find_first_of(" \t"));
     }
 
+    // Node signatures with carriers: a coarse-level signature that genomes outside
+    // its node also carry is its own target, so that after the pass it is added to
+    // its node only when no carrier is present (see the admission before the
+    // walk). An index without carriers has none of these and behaves as before.
+    struct CarriedSig {
+        size_t level;                 // index into `levels`
+        unsigned ref;                 // the node's position at that level
+        const std::string* seq;       // key in L.sig[ref], owned by the map
+        std::vector<unsigned> carriers;
+    };
+    std::vector<CarriedSig> carriedSigs;
     for (size_t li = 0; li < levelSketches.size(); li++) {
         Level& L = levels[li];
         SketchHash& hash = levelHash[li];
         L.targetBase = index.numTargets;
         index.numTargets += static_cast<unsigned>(L.ref.size());
         L.slotBegin = static_cast<unsigned>(slotCounter.size());
+        auto& carriers = levelCarriers[li];
+        auto carriedBy = [&](const std::string& seq, unsigned ref, const std::string* key) {
+            auto c = carriers.find(seq);
+            if (c == carriers.end()) return false;
+            carriedSigs.push_back({li, ref, key, std::move(c->second)});
+            return true;
+        };
         // Each signature's slot is its counter in its reference's map, whose key
         // also gives the index its sequence. When every line of the sketch is a
         // distinct k-mer (always, unless a file was edited by hand) the maps hold
@@ -237,6 +262,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         if (mapped == hash.size()) {
             for (unsigned i = 0; i < L.ref.size(); i++) {
                 for (auto& kv : L.sig[i]) {
+                    if (carriedBy(kv.first, i, &kv.first)) continue;
                     index.add(kv.first, L.targetBase + i, static_cast<unsigned>(slotCounter.size()));
                     slotCounter.push_back(&kv.second);
                     slotRef.push_back(i);
@@ -246,6 +272,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
             for (const auto& [seq, refId] : hash) {
                 auto it = L.sig[refId].find(seq);
                 if (it != L.sig[refId].end()) {
+                    if (carriedBy(it->first, refId, &it->first)) continue;
                     index.add(it->first, L.targetBase + refId, static_cast<unsigned>(slotCounter.size()));
                     slotCounter.push_back(&it->second);
                     slotRef.push_back(refId);
@@ -256,6 +283,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
             }
         }
         L.slotEnd = static_cast<unsigned>(slotCounter.size());
+        carriers = {};
         // The index and the level's maps hold the sequences now; the leaf level's
         // map stays a little longer, to screen the group signatures against.
         if (li + 1 < levelSketches.size()) hash = SketchHash();
@@ -285,6 +313,9 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         }
         index.numTargets += static_cast<unsigned>(groupSigs.size());
     }
+    const unsigned carriedBase = index.numTargets;
+    for (unsigned j = 0; j < carriedSigs.size(); j++) index.add(*carriedSigs[j].seq, carriedBase + j, NO_SLOT);
+    index.numTargets += static_cast<unsigned>(carriedSigs.size());
     levelHash.clear();
     index.finalize();
 
@@ -335,6 +366,208 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     std::unordered_set<std::string> lineageAttested;
     const size_t attestReads = std::max<size_t>(static_cast<size_t>(cfg.readCutoff), 1);
     std::vector<FamilyCall> familyCalls;         // coarse detections, for level-appropriate reporting
+
+    // Carried node signatures (NodeCarrierUtil.hpp) are settled now, before the
+    // walk. A hit on one is evidence that the node or one of the signature's
+    // carriers is present. When every carrier is absent the signature joins its
+    // node: its hits go into the node's tally and its signature map, so the walk,
+    // the rejoin rule and the family row see them as ordinary evidence. When a
+    // carrier is present, or may be, the signature is set aside, hits or not, and
+    // leaves the node's signature set for this sample, so the node's breadth is
+    // judged on the signatures that can speak for it (kept in the total, the
+    // set-aside hits of a node whose set is mostly carried would read as misses
+    // at high coverage). A node whose carried signatures are set aside is still
+    // reached through its own node-unique ones; its parent, which contains the
+    // node and its sibling carriers alike, is where the ambiguous evidence lands
+    // (the parent's own signatures see the same reads), and that is the honest
+    // row: on the 5 493-genome E. coli index a strain at 1 % that is a sibling of a
+    // 21-leaf node and carries 1 715 of its 1 812 carried signatures put a family
+    // row on that node, which it is not in, when the rule below judged it absent
+    // on its own signatures alone.
+    //
+    // A carrier is *present* when anything of its own was hit: one of its leaf
+    // signatures, or one of its within-group signatures none of whose own carriers
+    // may be present (such a hit is evidence for it or for an unseen genome; the
+    // strain above had 42 on two reads while its 72 leaf signatures, packed into
+    // three sites, had none); or when a representative covering it at some level
+    // that does not also cover the node clears the reporting threshold on two or
+    // more reads, on everything hit under it, node-unique and carried alike (a
+    // common ancestor says nothing about which of the two is present; the K-12
+    // node's carriers are the K-12 relatives outside it, all under one parent).
+    // An unseen carrier is *excluded* when, at the coverage the node's hits imply
+    // for it (its hits per carried signature it carries), its own signature loci
+    // would have collected cfg.carrierExcludeReads reads or more: the number of
+    // loci, not of signatures, since a strain a few substitutions from its
+    // relatives has all its signatures at those sites and is seen only when a read
+    // covers one of them without error. An unseen carrier that cannot be excluded
+    // *may be present* and blocks what it carries. One with no signature of any
+    // kind is untestable and treated as absent unless its lineage attests it, the
+    // documented residual (as for within-group signatures). All of this is read
+    // from the tallies before any admission, so the outcome does not depend on
+    // the order the nodes are taken in. Measured on the 5 493-genome index: pure
+    // K-12 MG1655 or 4A at 10x, an empty table before, is the 345-leaf level-1
+    // family row (the K-12 level-3 node's carried candidates all fail the strict
+    // margin, and the level-2 node's carriers are K-12-like genomes in sibling
+    // nodes that the same reads light); the 1 %-sibling case above gives the
+    // 29-leaf level-2 row the strain belongs to.
+    if (!carriedSigs.empty()) {
+        const size_t leafIdx = levels.size() - 1;
+        const Level& leafL = levels[leafIdx];
+        const size_t nLeaves = leafL.ref.size();
+        const unsigned hitFloor = static_cast<unsigned>(cfg.sketchHit);
+        std::vector<std::string> leafName = loadTreeLeaves(treeLeavesPath(treeDir));
+        if (leafName.size() != nLeaves) leafName = leafL.ref;
+        // Per node, its carried signatures. A node's evidence for the tests below
+        // is everything hit under it, node-unique and carried alike, before any
+        // admission (the wide reading: a carrier whose own node is lit by any of
+        // its signatures counts as attested, which errs towards setting aside).
+        std::map<std::pair<size_t, unsigned>, std::vector<unsigned>> byNode;
+        for (unsigned j = 0; j < carriedSigs.size(); j++)
+            byNode[{carriedSigs[j].level, carriedSigs[j].ref}].push_back(j);
+        // Per coarse level: leaf name -> covering representative; which
+        // representatives have evidence at the reporting standard; and the leaves
+        // under a representative with any evidence at all (the everInPlay notion
+        // of the leaf level, for a carrier with no signatures of its own).
+        std::vector<std::unordered_map<std::string, unsigned>> cover(leafIdx);
+        std::vector<std::vector<char>> nodeEvidence(leafIdx);
+        std::unordered_set<std::string> lineageTrace;
+        for (size_t li = 0; li < leafIdx; li++) {
+            const Level& L = levels[li];
+            const auto& lm = levelMap[L.level];
+            nodeEvidence[li].assign(L.ref.size(), 0);
+            for (unsigned i = 0; i < L.ref.size(); i++) {
+                auto it = lm.find(L.ref[i]);
+                if (it != lm.end()) for (const auto& lf : it->second) cover[li][lf] = i;
+                unsigned c = tally.count[L.targetBase + i];
+                std::unordered_set<std::string> reads = tally.reads[L.targetBase + i];
+                auto bn = byNode.find({li, i});
+                if (bn != byNode.end())
+                    for (unsigned j : bn->second) {
+                        c += tally.count[carriedBase + j];
+                        reads.insert(tally.reads[carriedBase + j].begin(), tally.reads[carriedBase + j].end());
+                    }
+                if (cfg.solid && c) ++c;
+                nodeEvidence[li][i] = (c >= hitFloor && reads.size() > attestReads);
+                if (c >= static_cast<unsigned>(cfg.treePruneHit) && !reads.empty() && it != lm.end())
+                    for (const auto& lf : it->second) lineageTrace.insert(lf);
+            }
+        }
+        // Seen: a hit on a leaf signature; then a hit on a within-group signature
+        // none of whose carriers may be present, where a carrier may be present
+        // when it has a leaf hit or, having no signatures of its own to be hit,
+        // when its lineage has any trace (a 99 % main with no signature of any
+        // kind, 266 such leaves on the 5 493-genome index, carries the within-group
+        // signatures of a thousand leaves and would otherwise make them all seen).
+        // Own signatures, leaf and within-group, with their loci, for the
+        // exclusion test.
+        std::vector<char> leafSeen(nLeaves, 0), seen(nLeaves, 0), mayBe(nLeaves, 0);
+        std::vector<unsigned> ownSigs(nLeaves, 0);
+        for (unsigned c = 0; c < nLeaves; c++) {
+            leafSeen[c] = seen[c] = tally.count[leafL.targetBase + c] > 0;
+            ownSigs[c] = static_cast<unsigned>(leafL.sig[c].size());
+        }
+        for (unsigned g = 0; g < groupSigs.size(); g++)
+            if (!groupDropped[g] && groupSigs[g].refId < nLeaves) ownSigs[groupSigs[g].refId]++;
+        for (unsigned c = 0; c < nLeaves; c++)
+            mayBe[c] = leafSeen[c] || (ownSigs[c] == 0 && lineageTrace.count(leafName[c]) > 0);
+        std::vector<std::tuple<unsigned, std::string, unsigned>> groupPos;
+        groupPos.reserve(groupSigs.size());
+        for (unsigned g = 0; g < groupSigs.size(); g++) {
+            const GroupSignature& s = groupSigs[g];
+            if (groupDropped[g] || s.refId >= nLeaves) continue;
+            groupPos.emplace_back(s.refId, s.contig, s.pos);
+            if (seen[s.refId] || tally.count[groupBase + g] == 0) continue;
+            bool ambiguous = false;
+            for (unsigned c : s.carriers) if (c < nLeaves && mayBe[c]) { ambiguous = true; break; }
+            if (!ambiguous) seen[s.refId] = 1;
+        }
+        const std::vector<unsigned> loci = countSignatureLoci(cfg.ref, nLeaves, groupPos, cfg.locusGap);
+        groupPos = {};
+        size_t leavesLeafSeen = 0, leavesSeen = 0;
+        for (unsigned c = 0; c < nLeaves; c++) { leavesLeafSeen += leafSeen[c]; leavesSeen += seen[c]; }
+        auto present = [&](unsigned c, const std::string& nodeRep) {
+            if (seen[c]) return true;
+            for (size_t li = 0; li < leafIdx; li++) {
+                auto it = cover[li].find(leafName[c]);
+                if (it == cover[li].end()) continue;
+                auto nt = cover[li].find(nodeRep);
+                if (nt != cover[li].end() && nt->second == it->second) continue;   // common ancestor
+                if (nodeEvidence[li][it->second]) return true;
+            }
+            return false;
+        };
+        // Per node, per carrier: the signatures it carries and the hits on them,
+        // which give the coverage the carrier would have were it the one present.
+        enum Status : char { ABSENT, PRESENT, POSSIBLE };
+        size_t used = 0, hit = 0, asidePresent = 0, asidePossible = 0, asideHit = 0;
+        size_t carriersSeen = 0, carriersExcluded = 0, carriersPossible = 0, carriersUntestable = 0;
+        std::set<std::pair<size_t, unsigned>> nodesUsing;
+        for (const auto& [node, sigs] : byNode) {
+            Level& L = levels[node.first];
+            const std::string& nodeRep = L.ref[node.second];
+            std::unordered_map<unsigned, std::pair<unsigned, unsigned>> perCarrier;   // carrier -> (carried, hits)
+            bool anyHit = false;
+            for (unsigned j : sigs) {
+                const unsigned h = tally.count[carriedBase + j];
+                anyHit |= h > 0;
+                for (unsigned c : carriedSigs[j].carriers) {
+                    if (c >= nLeaves) continue;
+                    auto& e = perCarrier[c];
+                    e.first++;
+                    e.second += h;
+                }
+            }
+            std::unordered_map<unsigned, Status> status;
+            for (const auto& [c, e] : perCarrier) {
+                Status st;
+                if (present(c, nodeRep)) { st = PRESENT; ++carriersSeen; }
+                else if (ownSigs[c] == 0) { st = ABSENT; ++carriersUntestable; }
+                else if (!anyHit) { st = ABSENT; }     // nothing to explain; the node's signatures are idle
+                else {
+                    const double perSig = static_cast<double>(e.second) / static_cast<double>(e.first);
+                    const double expectedReads = perSig * static_cast<double>(loci[c]);
+                    if (expectedReads >= cfg.carrierExcludeReads) { st = ABSENT; ++carriersExcluded; }
+                    else { st = POSSIBLE; ++carriersPossible; }
+                }
+                status[c] = st;
+            }
+            for (unsigned j : sigs) {
+                const CarriedSig& s = carriedSigs[j];
+                const unsigned t = carriedBase + j;
+                Status worst = ABSENT;
+                for (unsigned c : s.carriers) {
+                    if (c >= nLeaves) continue;
+                    const Status st = status[c];
+                    if (st == PRESENT) { worst = PRESENT; break; }
+                    if (st == POSSIBLE) worst = POSSIBLE;
+                }
+                auto it = L.sig[s.ref].find(*s.seq);
+                if (worst != ABSENT) {
+                    if (worst == PRESENT) ++asidePresent; else ++asidePossible;
+                    asideHit += tally.count[t] > 0;
+                    if (it != L.sig[s.ref].end()) L.sig[s.ref].erase(it);   // s.seq is not read again
+                    continue;
+                }
+                ++used;
+                if (tally.count[t] == 0) continue;
+                ++hit;
+                const unsigned nt = L.targetBase + s.ref;
+                tally.count[nt] += tally.count[t];
+                tally.reads[nt].insert(tally.reads[t].begin(), tally.reads[t].end());
+                if (it != L.sig[s.ref].end()) it->second += tally.count[t];
+                nodesUsing.insert(node);
+            }
+        }
+        std::cerr << "Tree query: carried node signatures: " << carriedSigs.size() << " in the index, "
+                  << used << " in use (" << hit << " with hits, for " << nodesUsing.size() << " node(s)), "
+                  << asidePresent + asidePossible << " set aside with their hits (" << asideHit
+                  << " had hits): " << asidePresent << " for a carrier seen or attested by its lineage, "
+                  << asidePossible << " for a carrier that may be present; carriers of nodes with hits: "
+                  << carriersSeen << " seen, " << carriersExcluded << " excluded on their own loci, "
+                  << carriersPossible << " possible, " << carriersUntestable << " without signatures; "
+                  << leavesSeen << " of " << nLeaves << " leaves seen (" << leavesLeafSeen
+                  << " on their leaf signatures)\n";
+    }
 
     // Walk the levels coarse to fine over the tallies. At a coarse level only
     // references that still cover a candidate leaf are scored; the others'

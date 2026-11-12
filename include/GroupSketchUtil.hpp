@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -470,7 +471,7 @@ inline std::string reachabilityPath(const std::string& outdir) {
 }
 inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<TreeNode>& tree,
                                const std::vector<std::string>& refFiles,
-                               const std::vector<unsigned>& levels) {
+                               const std::vector<unsigned>& levels, bool writeCarriers = false) {
     using Clock = std::chrono::steady_clock;
     const auto t0 = Clock::now();
     const size_t numRef = refFiles.size();
@@ -522,11 +523,13 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
     std::vector<std::string> sigSeq;
     std::vector<unsigned> sigLevel, sigEntry;
     std::vector<std::vector<size_t>> nodeTotal(levels.size());
+    std::vector<std::vector<int>> lineSig(levels.size());   // per level: file line -> signature, -1 if none
     for (size_t li = 0; li < levels.size(); li++) {
         nodeTotal[li].assign(entries[li].size(), 0);
         std::ifstream in(cfg.outdir + "/sketch_level_" + std::to_string(levels[li]) + ".tsv");
         std::string line;
         while (std::getline(in, line)) {
+            lineSig[li].push_back(-1);
             size_t a = line.find('\t');
             if (a == std::string::npos) continue;
             size_t b = line.find('\t', a + 1);
@@ -535,6 +538,7 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
             if (c == std::string::npos) continue;
             auto it = repEntry[li].find(line.substr(b + 1, c - b - 1));
             if (it == repEntry[li].end()) continue;
+            lineSig[li].back() = static_cast<int>(sigSeq.size());
             sigSeq.push_back(line.substr(0, a));
             sigLevel.push_back(static_cast<unsigned>(li));
             sigEntry.push_back(it->second);
@@ -546,11 +550,15 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
     for (unsigned i = 0; i < sigSeq.size(); i++)
         index[NTC64(sigSeq[i].c_str(), cfg.kmerLen)].push_back(i);
 
-    // One pass per genome: distinct signatures of each ancestor that the genome carries.
+    // One pass per genome: distinct signatures of each ancestor that the genome carries,
+    // and, when asked, the genomes outside a signature's node that contain it (its
+    // carriers, NodeCarrierUtil.hpp), recorded in the level sketch afterwards.
     std::vector<std::vector<size_t>> carried(numRef, std::vector<size_t>(levels.size(), 0));
+    std::vector<std::vector<unsigned>> sigCarriers(writeCarriers ? sigSeq.size() : 0);
     #pragma omp parallel for schedule(dynamic)
     for (unsigned g = 0; g < numRef; g++) {
         std::vector<bool> seen(sigSeq.size(), false);
+        std::vector<unsigned> outside;                    // signatures of other nodes this genome carries
         scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
             if (seq.size() < cfg.kmerLen) return;
             ntHashIterator itr(seq, 1, cfg.kmerLen);
@@ -563,11 +571,50 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
                         seen[idx] = true;
                         const unsigned li = sigLevel[idx];
                         if (leafEntry[li][g] == static_cast<int>(sigEntry[idx])) carried[g][li]++;
+                        else if (writeCarriers) outside.push_back(idx);
                     }
                 }
                 ++itr;
             }
         }, wrapPad(cfg));
+        if (writeCarriers && !outside.empty()) {
+            #pragma omp critical(sigCarriers)
+            for (unsigned idx : outside) sigCarriers[idx].push_back(g);
+        }
+    }
+    if (writeCarriers) {
+        // Rewrite each level sketch with the carriers as a seventh column (comma-separated
+        // leaf ids, `-` for none), in leaf order so the file does not depend on scheduling.
+        size_t withCarriers = 0, carrierEntries = 0;
+        for (auto& v : sigCarriers) {
+            std::sort(v.begin(), v.end());
+            if (!v.empty()) { ++withCarriers; carrierEntries += v.size(); }
+        }
+        for (size_t li = 0; li < levels.size(); li++) {
+            const std::string path = cfg.outdir + "/sketch_level_" + std::to_string(levels[li]) + ".tsv";
+            const std::string tmp = path + ".carriers.tmp";
+            std::ifstream in(path);
+            std::ofstream out(tmp);
+            std::string line;
+            size_t ln = 0;
+            while (std::getline(in, line)) {
+                // keep the six documented fields; a seventh from an earlier pass is replaced
+                size_t p = 0;
+                for (int f = 0; f < 6 && p != std::string::npos; f++) p = line.find('\t', p + (f ? 1 : 0));
+                if (p != std::string::npos) line.erase(p);
+                out << line << "\t";
+                const int idx = ln < lineSig[li].size() ? lineSig[li][ln] : -1;
+                if (idx < 0 || sigCarriers[idx].empty()) out << "-";
+                else for (size_t i = 0; i < sigCarriers[idx].size(); i++) out << (i ? "," : "") << sigCarriers[idx][i];
+                out << "\n";
+                ++ln;
+            }
+            in.close(); out.close();
+            std::rename(tmp.c_str(), path.c_str());
+        }
+        std::cerr << "Node carriers: " << withCarriers << " of " << sigSeq.size()
+                  << " level signatures have carriers (" << carrierEntries << " carrier entries); "
+                     "recorded in the level sketches\n";
     }
 
     // Tables and summary.
