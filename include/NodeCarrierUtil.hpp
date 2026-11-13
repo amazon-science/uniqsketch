@@ -71,6 +71,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -235,13 +236,81 @@ inline void countCarriage(const UniqSketchConfig& cfg, const std::vector<std::st
 }
 
 /**
+ * A 64-bit hash -> uint32 table in one flat array: open addressing with linear
+ * probing, the slot chosen by multiplying the key into the capacity (the keys are
+ * ntHash values, uniform over 64 bits, so no further hashing), load kept at or below
+ * 0.6, an empty slot marked by the value UINT32_MAX (the values are dense indices).
+ *
+ * std::unordered_map held the same mapping first, and freeing it was the largest
+ * cost of the carried scan: a node is a malloc per entry, and freeing 7.5 G of them
+ * (the 5 493-genome index hashes that many representative k-mers over its four
+ * levels) ran on one thread at 85 ns each, 640 of the build's 2 080 extra seconds,
+ * with inserts at 465 ns and lookups at 48 ns on top. One array is one free, and a
+ * probe is one cache line (16 bytes per slot, 27 per k-mer at load 0.6, against 44).
+ *
+ * Reads are safe from any number of threads while no one writes; the member scans
+ * only read. Writing is one thread per table (a representative is hashed by one
+ * thread).
+ */
+class KmerTable {
+public:
+    static constexpr uint32_t EMPTY = UINT32_MAX;
+    /** Room for `expected` keys without growing. */
+    explicit KmerTable(size_t expected = 0) { reserve(expected); }
+    void reserve(size_t expected) {
+        size_t cap = std::max<size_t>(16, expected + expected * 2 / 3);   // load 0.6 when full
+        if (cap <= slots_.size()) return;
+        std::vector<Slot> old = std::move(slots_);
+        slots_.assign(cap, Slot{0, EMPTY});
+        size_ = 0;
+        for (const Slot& t : old)
+            if (t.val != EMPTY) *place(t.key) = t;
+    }
+    size_t size() const { return size_; }
+    size_t capacity() const { return slots_.size(); }
+    /** The value of `key`, or nullptr. */
+    const uint32_t* find(uint64_t key) const {
+        for (size_t i = slotOf(key);; i = (i + 1 == slots_.size()) ? 0 : i + 1) {
+            const Slot& t = slots_[i];
+            if (t.val == EMPTY) return nullptr;
+            if (t.key == key) return &t.val;
+        }
+    }
+    /**
+     * The value of `key`, inserted as `value` if the key was absent (`inserted` says
+     * which). The reference holds until the next insertion.
+     */
+    uint32_t& findOrInsert(uint64_t key, uint32_t value, bool& inserted) {
+        if ((size_ + 1) * 5 > slots_.size() * 3) reserve(slots_.size());   // past load 0.6: double
+        for (size_t i = slotOf(key);; i = (i + 1 == slots_.size()) ? 0 : i + 1) {
+            Slot& t = slots_[i];
+            if (t.val == EMPTY) { t.key = key; t.val = value; ++size_; inserted = true; return t.val; }
+            if (t.key == key) { inserted = false; return t.val; }
+        }
+    }
+private:
+    struct Slot { uint64_t key; uint32_t val; };
+    size_t slotOf(uint64_t key) const {
+        return static_cast<size_t>((static_cast<unsigned __int128>(key) * slots_.size()) >> 64);
+    }
+    Slot* place(uint64_t key) {   // first empty slot for a key known to be absent
+        size_t i = slotOf(key);
+        while (slots_[i].val != EMPTY) i = (i + 1 == slots_.size()) ? 0 : i + 1;
+        ++size_;
+        return &slots_[i];
+    }
+    std::vector<Slot> slots_;
+    size_t size_ = 0;
+};
+
+/**
  * The representative's k-mers of one node, with their multiplicity in the
  * representative and the number of members carrying each. Keyed by the canonical
  * ntHash value alone: at 4.6 M k-mers per genome a 64-bit collision is expected once in
  * about 10^6 nodes and would merge two counts, a deterministic error of one candidate.
  */
 struct NodeKmers {
-    std::unordered_map<uint64_t, uint32_t> index;   // hash -> position in the arrays below
+    KmerTable index;                                // hash -> position in the arrays below
     std::vector<uint16_t> repMult;                  // occurrences in the representative
     std::vector<std::atomic<uint16_t>> inNode;      // members (representative included) containing it
 };
@@ -281,9 +350,9 @@ inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, co
                     ++plain;
                     cand.add(static_cast<uint32_t>(itr.get_pos()));
                 } else {
-                    auto it = nk.index.find((*itr)[0]);
-                    if (it != nk.index.end() && nk.repMult[it->second] == 1) {
-                        const unsigned in = nk.inNode[it->second].load(std::memory_order_relaxed);
+                    const uint32_t* v = nk.index.find((*itr)[0]);
+                    if (v && nk.repMult[*v] == 1) {
+                        const unsigned in = nk.inNode[*v].load(std::memory_order_relaxed);
                         const unsigned total = cc.count(*itr);
                         if (in >= halfMembers && total >= in && total - in <= cap) {
                             ++carried;
@@ -328,8 +397,8 @@ inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, co
  * are hashed, the members are scanned once to count how many carry each (one flat list
  * of (group, member) jobs, so the 896-genome node does not leave the machine idle),
  * then the representative is scanned again with both rules. Groups are taken in
- * batches whose representatives' k-mers fit `budgetKmers`, since the hash costs about
- * 40 bytes per k-mer; every genome is scanned once per level whatever the batching.
+ * batches whose representatives' k-mers fit `budgetKmers`, since the table and counts cost about
+ * 30 bytes per k-mer (KmerTable); every genome is scanned once per level whatever the batching.
  */
 inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
                                           const std::vector<std::vector<std::string>>& groups,
@@ -339,6 +408,9 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
     for (const auto& g : groups) members += g.size();
     std::cout << "k-mer length: " << cfg.kmerLen << "\n"
               << "Groups: " << groups.size() << " over " << members << " genomes\n";
+    using Clock = std::chrono::steady_clock;
+    auto secs = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    auto t0 = Clock::now();
     BloomFilter sbFilter(cfg.m2(), cfg.nhash2, cfg.kmerLen);
     loadBFfaGroups(cfg, groups, dbFilter, sbFilter);
     std::vector<int> refCount(groups.size());
@@ -346,6 +418,9 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
     #pragma omp parallel for schedule(dynamic)
     for (unsigned i = 0; i < groups.size(); ++i)
         if (groups[i].size() == 1) checkRef(cfg, groups[i][0], i, sbFilter, refCount);
+    const double secFilters = secs(t0, Clock::now());
+    double secReps = 0, secMembers = 0, secScan = 0;
+    size_t repKmers = 0, memberGenomes = 0;
     // Nodes, in batches.
     std::vector<unsigned> nodes;
     for (unsigned i = 0; i < groups.size(); ++i) if (groups[i].size() >= 2) nodes.push_back(i);
@@ -360,22 +435,21 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
             kmers += sz;
         }
         // Representatives' k-mers, in parallel over the batch.
+        auto tb = Clock::now();
         std::vector<NodeKmers> nk(batch.size());
         #pragma omp parallel for schedule(dynamic)
         for (unsigned j = 0; j < batch.size(); j++) {
             NodeKmers& n = nk[j];
+            n.index.reserve(uncompressedSize(groups[batch[j]][0]));   // distinct k-mers <= bases <= file size
             std::vector<uint16_t> mult;
             scanFasta(groups[batch[j]][0], [&](const std::string&, const std::string& seq, size_t) {
                 if (seq.size() < cfg.kmerLen) return;
                 ntHashIterator itr(seq, 1, cfg.kmerLen);
                 while (itr != itr.end()) {
-                    auto it = n.index.find((*itr)[0]);
-                    if (it == n.index.end()) {
-                        n.index.emplace((*itr)[0], static_cast<uint32_t>(mult.size()));
-                        mult.push_back(1);
-                    } else if (mult[it->second] < UINT16_MAX) {
-                        mult[it->second]++;
-                    }
+                    bool inserted = false;
+                    const uint32_t v = n.index.findOrInsert((*itr)[0], static_cast<uint32_t>(mult.size()), inserted);
+                    if (inserted) mult.push_back(1);
+                    else if (mult[v] < UINT16_MAX) mult[v]++;
                     ++itr;
                 }
             }, wrapPad(cfg));
@@ -384,6 +458,9 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
             for (auto& a : in) a.store(0, std::memory_order_relaxed);
             n.inNode = std::move(in);
         }
+        for (const NodeKmers& n : nk) repKmers += n.repMult.size();
+        auto tm = Clock::now();
+        secReps += secs(tb, tm);
         // Members, one flat job list: each member marks the representative k-mers it
         // contains (once per member, however often it has them) and adds to the count.
         std::vector<std::pair<unsigned, unsigned>> jobs;   // (batch index, member index)
@@ -397,15 +474,18 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
                 if (seq.size() < cfg.kmerLen) return;
                 ntHashIterator itr(seq, 1, cfg.kmerLen);
                 while (itr != itr.end()) {
-                    auto it = n.index.find((*itr)[0]);
-                    if (it != n.index.end() && !seen[it->second]) {
-                        seen[it->second] = true;
-                        n.inNode[it->second].fetch_add(1, std::memory_order_relaxed);
+                    const uint32_t* v = n.index.find((*itr)[0]);
+                    if (v && !seen[*v]) {
+                        seen[*v] = true;
+                        n.inNode[*v].fetch_add(1, std::memory_order_relaxed);
                     }
                     ++itr;
                 }
             }, wrapPad(cfg));
         }
+        memberGenomes += jobs.size();
+        auto ts = Clock::now();
+        secMembers += secs(tm, ts);
         // The scan of each representative. The stat file records the plain count, as
         // identifyGroupUniqKmers does; the carried pool is found by its file.
         std::vector<std::pair<size_t, size_t>> res(batch.size());
@@ -420,7 +500,11 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
             totalCarried += res[j].second;
             if (res[j].second) ++nodesWithCarried;
         }
+        secScan += secs(ts, Clock::now());
     }
+    std::cerr << "Node carriers scan time (s): filters and singles " << std::setprecision(1) << std::fixed
+              << secFilters << ", representatives " << secReps << " (" << repKmers / 1000000 << " M k-mers hashed), members "
+              << secMembers << " (" << memberGenomes << " genomes), scan " << secScan << "\n";
     std::cout << "Node candidates: " << totalPlain << " unique to their node; " << totalCarried
               << " carried by at most " << cap << " outside genomes, held for " << nodesWithCarried
               << " of " << nodes.size() << " nodes to fill a quota their unique ones leave short\n";

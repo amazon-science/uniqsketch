@@ -382,9 +382,9 @@ from signatures that stop counting whenever one of a few outside genomes is pres
 its carriers is absent, see [querysketch](#querysketch-1). The counting pass over the
 genomes costs 32 to 64 bytes of memory per distinct k-mer of the index (2 GB on 120
 genomes, 16 GB on 5 493) and, with the member scans and the second selection, about
-60 % more build time (83 → 133 s on 120 genomes, 43 → 78 min on 5 493);
-`--node-carriers=0` turns the whole thing off and produces today's index byte for
-byte.
+40 % more build time (83 → 110 s on 120 genomes, 7.8 → 10.7 min on 1 000, 43 → 61 min
+on 5 493); `--node-carriers=0` turns the whole thing off and produces today's index
+byte for byte.
 
 The distinction from `--cluster` matters: clustering is used here only to *guide*
 the search, and the final scoring runs against the leaf sketch, so **the output

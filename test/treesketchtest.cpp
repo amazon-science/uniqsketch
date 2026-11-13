@@ -399,6 +399,30 @@ void testNodeCarriers() {
     getCardinality(total, cfg.dbfSize, cfg.sbfSize, cfg.kmerLen, cfg.threads, refs);
     assert(resolveBloomSizes(total, cfg.dbfSize, cfg.sbfSize));
 
+    // The flat hash -> index table the scans are built on: keys that land on the
+    // same slot probe on, a key of 0 is an ordinary key (the empty marker is the
+    // value), growth past load 0.6 keeps every entry, and an absent key is absent.
+    {
+        KmerTable t(4);                                   // capacity 16 at most: collisions are certain
+        const size_t cap = t.capacity();
+        std::vector<uint64_t> keys;
+        for (uint64_t k = 0; keys.size() < 2000; k += 0x9E3779B97F4A7C15ULL) keys.push_back(k);   // includes 0
+        for (uint32_t i = 0; i < keys.size(); i++) {
+            bool ins = false;
+            uint32_t& v = t.findOrInsert(keys[i], i, ins);
+            assert(ins && v == i);
+            assert(t.findOrInsert(keys[i], 999, ins) == i && !ins);        // present now: value untouched
+            assert(*t.find(keys[i]) == i);
+        }
+        assert(t.size() == keys.size() && t.capacity() > cap && t.size() * 5 <= t.capacity() * 3);
+        for (uint32_t i = 0; i < keys.size(); i++) assert(*t.find(keys[i]) == i);   // all survive the growths
+        assert(t.find(1) == nullptr && t.find(~uint64_t(0)) == nullptr);
+        bool ins = false;
+        assert(t.findOrInsert(0, 7, ins) == 0 && !ins);  // key 0 was the first key inserted
+        KmerTable e;                                      // nothing in it: every lookup misses, nothing probes forever
+        assert(e.find(0) == nullptr && e.find(42) == nullptr && e.size() == 0);
+    }
+
     // Carriage: the number of genomes containing a k-mer, exact here (no counter
     // is shared at this load), and once per genome however often it occurs there.
     assert(defaultNodeCarriers(8) == 0 && defaultNodeCarriers(120) == 12 && defaultNodeCarriers(5493) == 50);
