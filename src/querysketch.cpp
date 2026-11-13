@@ -401,10 +401,13 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     // relatives has all its signatures at those sites and is seen only when a read
     // covers one of them without error. An unseen carrier that cannot be excluded
     // *may be present* and blocks what it carries. One with no signature of any
-    // kind is untestable and treated as absent unless its lineage attests it, the
-    // documented residual (as for within-group signatures). All of this is read
-    // from the tallies before any admission, so the outcome does not depend on
-    // the order the nodes are taken in. Measured on the 5 493-genome index: pure
+    // kind cannot be seen or excluded: it is absent when a lineage of its own
+    // (a representative covering it and not the node) was silent, and may be
+    // present when that lineage has any trace or when it has no lineage apart
+    // from the node's, a signature-less leaf beside the node under one parent,
+    // for which nothing in the index can speak. All of this is read from the
+    // tallies before any admission, so the outcome does not depend on the order
+    // the nodes are taken in. Measured on the 5 493-genome index: pure
     // K-12 MG1655 or 4A at 10x, an empty table before, is the 345-leaf level-1
     // family row (the K-12 level-3 node's carried candidates all fail the strict
     // margin, and the level-2 node's carriers are K-12-like genomes in sibling
@@ -429,12 +432,13 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // under a representative with any evidence at all (the everInPlay notion
         // of the leaf level, for a carrier with no signatures of its own).
         std::vector<std::unordered_map<std::string, unsigned>> cover(leafIdx);
-        std::vector<std::vector<char>> nodeEvidence(leafIdx);
+        std::vector<std::vector<char>> nodeEvidence(leafIdx), nodeTrace(leafIdx);
         std::unordered_set<std::string> lineageTrace;
         for (size_t li = 0; li < leafIdx; li++) {
             const Level& L = levels[li];
             const auto& lm = levelMap[L.level];
             nodeEvidence[li].assign(L.ref.size(), 0);
+            nodeTrace[li].assign(L.ref.size(), 0);
             for (unsigned i = 0; i < L.ref.size(); i++) {
                 auto it = lm.find(L.ref[i]);
                 if (it != lm.end()) for (const auto& lf : it->second) cover[li][lf] = i;
@@ -448,7 +452,8 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                     }
                 if (cfg.solid && c) ++c;
                 nodeEvidence[li][i] = (c >= hitFloor && reads.size() > attestReads);
-                if (c >= static_cast<unsigned>(cfg.treePruneHit) && !reads.empty() && it != lm.end())
+                nodeTrace[li][i] = (c >= static_cast<unsigned>(cfg.treePruneHit) && !reads.empty());
+                if (nodeTrace[li][i] && it != lm.end())
                     for (const auto& lf : it->second) lineageTrace.insert(lf);
             }
         }
@@ -485,22 +490,41 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         groupPos = {};
         size_t leavesLeafSeen = 0, leavesSeen = 0;
         for (unsigned c = 0; c < nLeaves; c++) { leavesLeafSeen += leafSeen[c]; leavesSeen += seen[c]; }
-        auto present = [&](unsigned c, const std::string& nodeRep) {
-            if (seen[c]) return true;
+        // What a carrier's own lineage says about it, apart from the ancestors it
+        // shares with the node: ATTESTED when a representative covering it, and not
+        // the node, clears the reporting threshold on two or more reads; TRACE when
+        // one has any hit at the pruning floor; SILENT when it has such
+        // representatives and none was hit; NONE when every representative covering
+        // it also covers the node, so nothing in the index can speak for it alone.
+        enum Lineage : char { NONE, SILENT, TRACE, ATTESTED };
+        auto lineage = [&](unsigned c, const std::string& nodeRep) {
+            Lineage best = NONE;
             for (size_t li = 0; li < leafIdx; li++) {
                 auto it = cover[li].find(leafName[c]);
                 if (it == cover[li].end()) continue;
                 auto nt = cover[li].find(nodeRep);
                 if (nt != cover[li].end() && nt->second == it->second) continue;   // common ancestor
-                if (nodeEvidence[li][it->second]) return true;
+                if (nodeEvidence[li][it->second]) return ATTESTED;
+                if (nodeTrace[li][it->second]) best = TRACE;
+                else if (best == NONE) best = SILENT;
             }
-            return false;
+            return best;
         };
         // Per node, per carrier: the signatures it carries and the hits on them,
         // which give the coverage the carrier would have were it the one present.
+        // A carrier with no signature of any kind cannot be seen or excluded; it is
+        // absent when its own lineage was silent, and may be present when its
+        // lineage has a trace or when it has no lineage apart from the node's. The
+        // first version treated it as absent in both cases, and on the 928-genome
+        // mock community a signature-less strain at 10x, a direct child of the
+        // level-2 node its 20-leaf sibling node hangs off, put a 78-read family row
+        // on that sibling node, which it is not in, through the 45 filled
+        // signatures it carries; the parent's row, which covers it, was then
+        // suppressed as the coarser of two nested calls.
         enum Status : char { ABSENT, PRESENT, POSSIBLE };
         size_t used = 0, hit = 0, asidePresent = 0, asidePossible = 0, asideHit = 0;
-        size_t carriersSeen = 0, carriersExcluded = 0, carriersPossible = 0, carriersUntestable = 0;
+        size_t carriersSeen = 0, carriersExcluded = 0, carriersPossible = 0, carriersUntestable = 0,
+               carriersUntestablePossible = 0;
         std::set<std::pair<size_t, unsigned>> nodesUsing;
         for (const auto& [node, sigs] : byNode) {
             Level& L = levels[node.first];
@@ -520,10 +544,14 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
             std::unordered_map<unsigned, Status> status;
             for (const auto& [c, e] : perCarrier) {
                 Status st;
-                if (present(c, nodeRep)) { st = PRESENT; ++carriersSeen; }
-                else if (ownSigs[c] == 0) { st = ABSENT; ++carriersUntestable; }
+                const Lineage ln = seen[c] ? ATTESTED : lineage(c, nodeRep);
+                if (ln == ATTESTED) { st = PRESENT; carriersSeen += anyHit; }
                 else if (!anyHit) { st = ABSENT; }     // nothing to explain; the node's signatures are idle
-                else {
+                else if (ownSigs[c] == 0) {
+                    st = (ln == SILENT) ? ABSENT : POSSIBLE;
+                    ++carriersUntestable;
+                    carriersUntestablePossible += st == POSSIBLE;
+                } else {
                     const double perSig = static_cast<double>(e.second) / static_cast<double>(e.first);
                     const double expectedReads = perSig * static_cast<double>(loci[c]);
                     if (expectedReads >= cfg.carrierExcludeReads) { st = ABSENT; ++carriersExcluded; }
@@ -563,8 +591,9 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                   << asidePresent + asidePossible << " set aside with their hits (" << asideHit
                   << " had hits): " << asidePresent << " for a carrier seen or attested by its lineage, "
                   << asidePossible << " for a carrier that may be present; carriers of nodes with hits: "
-                  << carriersSeen << " seen, " << carriersExcluded << " excluded on their own loci, "
-                  << carriersPossible << " possible, " << carriersUntestable << " without signatures; "
+                  << carriersSeen << " seen or attested, " << carriersExcluded << " excluded on their own loci, "
+                  << carriersPossible << " possible, " << carriersUntestable << " without signatures ("
+                  << carriersUntestablePossible << " of them possible on their lineage); "
                   << leavesSeen << " of " << nLeaves << " leaves seen (" << leavesLeafSeen
                   << " on their leaf signatures)\n";
     }

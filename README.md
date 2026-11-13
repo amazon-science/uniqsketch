@@ -546,9 +546,15 @@ its relatives has all its signatures at those sites and is seen only when a read
 covers one of them without error (one such strain on the 5 493-genome index had
 146 signatures in three sites, 15 494 hits from 304 reads at 99 % abundance and
 none at 1 %). An unseen carrier that cannot be excluded *may be present* and
-blocks what it carries; one with no signatures of any kind cannot be tested and
-is treated as absent unless its lineage attests it, the same residual as for
-within-group signatures. A signature that is blocked is set aside, hits and all,
+blocks what it carries. One with no signatures of any kind cannot be seen or
+excluded: it is absent when a lineage of its own (a representative covering it
+but not the node) was silent, and may be present when that lineage shows any
+trace or when it has no lineage apart from the node's, a signature-less leaf
+beside the node under one parent, for which nothing in the index can speak (on
+a 928-genome mock community such a leaf at 10x had put a 78-read family row on
+its 20-leaf sibling node through the 45 filled signatures it carries; it now
+gets the parent's row, which covers it). A signature that is blocked is set
+aside, hits and all,
 and leaves the node's signature set for this sample, so the node is judged on the
 signatures that can speak for it; the ambiguous evidence is not lost, because the
 parent node, which contains the node and its sibling carriers alike, sees the
