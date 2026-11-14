@@ -46,6 +46,15 @@ A third utility, `comparesketch`, measures pairwise similarity within a referenc
 — useful for deciding which references are too close to separate and should be
 clustered before indexing.
 
+![The UniqSketch workflow: optional pre-clustering, indexing, querying](docs/img/us_workflow.png)
+
+*Pre-clustering is optional (`comparesketch` measures the pairwise distances,
+`uniqsketch --cluster=N` merges and picks representatives). Indexing keeps the k-mers
+seen once across the references, filters them for complexity and, with `--min-margin`,
+for distance from every other reference, then spreads `-c` of them along each genome.
+Querying looks every read k-mer up in the index, with the distinct/solid cascade only
+under `--solid`.*
+
 ## Installation
 
 ### conda installation (recommended)
