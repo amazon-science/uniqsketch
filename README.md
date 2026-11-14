@@ -46,6 +46,39 @@ A third utility, `comparesketch`, measures pairwise similarity within a referenc
 — useful for deciding which references are too close to separate and should be
 clustered before indexing.
 
+![The UniqSketch workflow: optional pre-clustering, indexing, querying](docs/img/us_workflow.png)
+
+*The flat workflow. Pre-clustering is optional (`comparesketch` measures the pairwise
+distances, `uniqsketch --cluster=N` merges and picks representatives). Indexing keeps
+the k-mers seen once across the references, filters them for complexity and, with
+`--min-margin`, for distance from every other reference, then spreads `-c` of them
+along each genome. Querying looks every read k-mer up in the index, with the
+distinct/solid cascade only under `--solid`.*
+
+### Tree index
+
+With `--tree`, `uniqsketch` builds a hierarchical index instead of a flat one. The
+references are clustered by the number of k-mers that separate them, at several
+thresholds, into nested groups; every group gets a sketch of its own (k-mers of its
+representative that no genome outside the group carries), and every reference keeps
+its leaf sketch. Two further signature sets cover what global uniqueness leaves out in
+a dense reference set: within-group signatures for the leaves (k-mers unique among a
+group's members but carried by other genomes of the index, each recorded with its
+carriers) and carried node signatures for groups whose own pool runs short. The query
+walks the tree from the coarsest level down, scoring a group's signatures before its
+members', and reports a reference as a strain when its own evidence suffices and as a
+*family* row (the group, with its members listed) when it does not. A signature that a
+present genome outside its group also carries is set aside for that sample, so
+sharing never credits the wrong genome. The details, with the measurements behind
+each rule, are under [uniqsketch](#uniqsketch-1) and [querysketch](#querysketch-1).
+
+![The tree index and its query](docs/img/tree_workflow.png)
+
+*The tree workflow, one coarse level shown; the default build has four, plus the
+within-group and carried signatures described below. Near-identical references share a
+group (L0₄) and are told apart within it, where their few distinguishing k-mers are
+not diluted by the rest of the index.*
+
 ## Installation
 
 ### conda installation (recommended)
