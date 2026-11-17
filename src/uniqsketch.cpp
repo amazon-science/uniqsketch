@@ -52,6 +52,8 @@ static const char USAGE_MESSAGE[] =
     "      --node-carriers=N\tfill a tree node's signature quota, when its node-unique k-mers leave it short,\n"
     "\t\t\tfrom k-mers carried by up to N genomes outside the node (recorded; the query\n"
     "\t\t\tsets them aside when a carrier is present) [min(50, leaves/10); 0=off]\n"
+    "      --node-representative=WHICH\tthe member a tree node's signatures come from: central (the one whose\n"
+    "\t\t\tnode-unique k-mers the other members carry) or largest [central]\n"
     "      --sensitive\tsets sensitivity parameter c to 100\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -61,7 +63,7 @@ static const char USAGE_MESSAGE[] =
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
-       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS };
+       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -88,6 +90,7 @@ static const struct option longopts[] = {
     {"circular",       no_argument,       nullptr, OPT_CIRCULAR},
     {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
     {"node-carriers",  required_argument, nullptr, OPT_NODECARRIERS},
+    {"node-representative", required_argument, nullptr, OPT_NODEREP},
     {"sensitive",      no_argument, &g_sketchnum, 100},
     {"very-sensitive", no_argument, &g_sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -108,6 +111,7 @@ int main(int argc, char** argv) {
     bool marginGiven = false;       // --min-margin passed explicitly (tree default otherwise)
     bool groupSignatures = true;    // within-group leaf signatures for a tree index (--no-group-signatures)
     int nodeCarriers = -1;          // --node-carriers (-1: min(50, leaves/10) once the leaf count is known)
+    bool centralRepresentative = true;   // --node-representative=central|largest
 
     bool die = false;
     for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
@@ -146,6 +150,14 @@ int main(int argc, char** argv) {
         case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
         case OPT_NOGROUPSIGS: groupSignatures = false; break;
         case OPT_NODECARRIERS: arg >> nodeCarriers; break;
+        case OPT_NODEREP: {
+            std::string which;
+            arg >> which;
+            if (which == "central") centralRepresentative = true;
+            else if (which == "largest") centralRepresentative = false;
+            else { std::cerr << "Error: --node-representative must be central or largest\n"; die = true; }
+            break;
+        }
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -270,8 +282,12 @@ int main(int argc, char** argv) {
         // other members, so identifyGroupUniqKmers can make the representative's
         // signatures unique against every genome outside the node rather than
         // against the other representatives only.
+        // The levels to build. Their groups are made from the tree when each level
+        // is reached, because the level scan may change which member a node's
+        // signatures come from (chooseNodeRepresentative), and a node that spans
+        // several levels must keep one representative for all of them.
         auto partition = treeLevelPartition(tree);
-        std::vector<std::pair<unsigned, std::vector<std::vector<std::string>>>> levelGroups;
+        std::vector<unsigned> levelsToBuild;
         for (size_t li = 0; li < partition.size(); li++) {
             const auto& [level, entries] = partition[li];
             bool nodes = false;
@@ -285,19 +301,24 @@ int main(int argc, char** argv) {
                           << partition[li + 1].first << ", skipped\n";
                 continue;
             }
-            std::vector<std::vector<std::string>> groups;
-            size_t clusters = 0;
-            for (const auto& e : entries) {
-                std::vector<std::string> g{e.repPath};
-                for (const auto& p : e.leafPaths)
-                    if (p != e.repPath) g.push_back(p);
-                groups.push_back(std::move(g));
-                clusters += e.isNode;
-            }
-            std::cerr << "Tree level " << level << ": " << groups.size() << " references ("
-                      << clusters << " clusters, " << groups.size() - clusters << " single)\n";
-            levelGroups.emplace_back(level, std::move(groups));
+            levelsToBuild.push_back(level);
         }
+        auto groupsAtLevel = [&](unsigned level, std::vector<std::string>& nodeNames, std::vector<char>& isNode) {
+            std::vector<std::vector<std::string>> groups;
+            nodeNames.clear(); isNode.clear();
+            for (const auto& [lvl, entries] : treeLevelPartition(tree)) {
+                if (lvl != level) continue;
+                for (const auto& e : entries) {
+                    std::vector<std::string> g{e.repPath};
+                    for (const auto& p : e.leafPaths)
+                        if (p != e.repPath) g.push_back(p);
+                    groups.push_back(std::move(g));
+                    nodeNames.push_back(e.name);
+                    isNode.push_back(e.isNode);
+                }
+            }
+            return groups;
+        };
 
         // Record how signatures were selected so querysketch can pick matching
         // reporting defaults (see TreeBuildParams).
@@ -311,6 +332,7 @@ int main(int argc, char** argv) {
         bp.groupSignatures = groupSignatures;
         if (nodeCarriers < 0) nodeCarriers = static_cast<int>(defaultNodeCarriers(refFiles.size()));
         bp.nodeCarriers = static_cast<unsigned>(nodeCarriers);
+        bp.centralRepresentative = centralRepresentative;
         bp.bloomFilter = bloomFilterName();
         for (size_t i = 0; i < treeThresholds.size(); i++) {
             if (i) bp.thresholds += ",";
@@ -335,7 +357,7 @@ int main(int argc, char** argv) {
         // leaf-level build below. The universe at every level is the full set of
         // leaves (grouped differently), so its k-mer cardinality is measured once.
         size_t universeKmers = 0, universeDistinct = 0, universeSolid = 0;
-        if (!levelGroups.empty()) {
+        if (!levelsToBuild.empty()) {
             getCardinality(universeKmers, universeDistinct, universeSolid,
                            cfg.kmerLen, cfg.threads, refFiles);
         }
@@ -344,7 +366,7 @@ int main(int argc, char** argv) {
         // (NodeCarrierUtil.hpp): one pass over all genomes, sized by the index's
         // distinct k-mers. Freed once the levels are built.
         std::unique_ptr<CarriageCounter> carriage;
-        if (nodeCarriers > 0 && !levelGroups.empty()) {
+        if (nodeCarriers > 0 && !levelsToBuild.empty()) {
 #ifdef _OPENMP
             double tc = omp_get_wtime();
 #endif
@@ -357,8 +379,45 @@ int main(int argc, char** argv) {
 #endif
             std::cerr << "\n";
         }
-        for (const auto& [level, groups] : levelGroups) {
+        // The members' sampled k-mers, for choosing each node's representative
+        // (chooseNodeRepresentative): one pass over all genomes, 1 in 64 k-mers,
+        // freed with the counter.
+        std::unique_ptr<GenomeSamples> samples;
+        if (centralRepresentative && !levelsToBuild.empty()) {
+#ifdef _OPENMP
+            double ts = omp_get_wtime();
+#endif
+            samples.reset(new GenomeSamples(sampleGenomes(cfg, refFiles)));
+            size_t sampled = 0;
+            for (const auto& kv : samples->byPath) sampled += kv.second.size();
+            std::cerr << "Node representatives: " << refFiles.size() << " genomes sampled, 1 in "
+                      << static_cast<unsigned>(samples->scale()) << " k-mers (" << sampled * 8 / (1 << 20) << " MB)";
+#ifdef _OPENMP
+            std::cerr << " in " << std::setprecision(1) << std::fixed << omp_get_wtime() - ts << " s";
+#endif
+            std::cerr << "\n";
+        }
+        std::unordered_map<std::string, size_t> treeIndexByName;
+        for (size_t i = 0; i < tree.size(); i++) treeIndexByName[tree[i].name] = i;
+        std::unordered_set<std::string> representativeDecided;   // node names whose representative is settled
+        size_t representativesMoved = 0;
+        // Per node, the choice made: <outdir>/node_representatives.tsv.
+        std::ofstream repTable;
+        if (samples) {
+            repTable.open(cfg.outdir + "/node_representatives.tsv");
+            repTable << "level\tnode\tleaves\ttree_genome\trepresentative\tmoved\trule\treached\tcarriage\tpool_unique\tpool_carried\tfill\n";
+        }
+        for (unsigned level : levelsToBuild) {
+            std::vector<std::string> nodeNames;
+            std::vector<char> isNode;
+            std::vector<std::vector<std::string>> groups = groupsAtLevel(level, nodeNames, isNode);
             if (groups.empty()) continue;
+            {
+                size_t clusters = 0;
+                for (char c : isNode) clusters += c;
+                std::cerr << "Tree level " << level << ": " << groups.size() << " references ("
+                          << clusters << " clusters, " << groups.size() - clusters << " single)\n";
+            }
 
             UniqSketchConfig lvl = cfg;
             lvl.levelLabel = "Tree level " + std::to_string(level);
@@ -375,9 +434,44 @@ int main(int argc, char** argv) {
                 double t0 = omp_get_wtime();
 #endif
                 BloomFilter levelDbf(lvl.m1(), lvl.nhash1, lvl.kmerLen);
-                if (carriage) identifyGroupUniqKmersCarried(lvl, groups, levelDbf, *carriage,
-                                                            static_cast<unsigned>(nodeCarriers));
-                else identifyGroupUniqKmers(lvl, groups, levelDbf);
+                if (carriage || samples) {
+                    std::vector<char> decide(groups.size(), 0);
+                    if (samples)
+                        for (size_t i = 0; i < groups.size(); i++)
+                            decide[i] = isNode[i] && !representativeDecided.count(nodeNames[i]);
+                    std::vector<RepresentativeChoice> choices;
+                    std::vector<std::string> reps = identifyGroupUniqKmersCarried(
+                        lvl, groups, levelDbf, carriage.get(), static_cast<unsigned>(nodeCarriers),
+                        samples.get(), samples ? &decide : nullptr, samples ? &choices : nullptr);
+                    // The chosen representatives into the tree: the node is named after the
+                    // genome its signatures come from, at every level it spans.
+                    for (size_t i = 0; i < groups.size(); i++) {
+                        if (!isNode[i]) continue;
+                        if (samples && decide[i]) {
+                            const RepresentativeChoice& ch = choices[i];
+                            repTable << level << "\t" << nodeNames[i] << "\t" << groups[i].size() << "\t"
+                                     << getBaseId(groups[i][0]) << "\t" << getBaseId(reps[i]) << "\t"
+                                     << (reps[i] != groups[i][0] ? 1 : 0) << "\t" << ch.ruleName() << "\t";
+                            if (ch.decided) repTable << std::setprecision(2) << std::fixed << ch.reached << "\t" << ch.carriage
+                                                     << "\t" << std::setprecision(0) << ch.poolUnique << "\t" << ch.poolCarried
+                                                     << "\t" << ch.fill << "\n";
+                            else repTable << "-\t-\t-\t-\t-\n";
+                        }
+                        representativeDecided.insert(nodeNames[i]);
+                        if (reps[i] == groups[i][0]) continue;
+                        auto it = treeIndexByName.find(nodeNames[i]);
+                        if (it == treeIndexByName.end()) continue;
+                        TreeNode& node = tree[it->second];
+                        node.filePath = reps[i];
+                        node.name = "cluster_L" + std::to_string(node.level) + "_" + getBaseId(reps[i]);
+                        treeIndexByName.erase(nodeNames[i]);
+                        treeIndexByName[node.name] = it->second;
+                        representativeDecided.insert(node.name);
+                        ++representativesMoved;
+                    }
+                } else {
+                    identifyGroupUniqKmers(lvl, groups, levelDbf);
+                }
 #ifdef _OPENMP
                 double t1 = omp_get_wtime();
 #endif
@@ -395,6 +489,13 @@ int main(int argc, char** argv) {
             }
         }
         carriage.reset();
+        samples.reset();
+        if (representativesMoved) {
+            writeTreeIndex(tree, treeFile);
+            std::cerr << "Node representatives: " << representativesMoved
+                      << " node(s) renamed after the member their signatures come from; "
+                      << treeFile << " rewritten\n";
+        }
     }
 
     // Optional clustering: merge nearly identical references

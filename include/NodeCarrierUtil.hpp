@@ -72,6 +72,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -237,9 +238,9 @@ inline void countCarriage(const UniqSketchConfig& cfg, const std::vector<std::st
 
 /**
  * A 64-bit hash -> uint32 table in one flat array: open addressing with linear
- * probing, the slot chosen by multiplying the key into the capacity (the keys are
- * ntHash values, uniform over 64 bits, so no further hashing), load kept at or below
- * 0.6, an empty slot marked by the value UINT32_MAX (the values are dense indices).
+ * probing, the slot chosen by multiplying the key (mixed with an odd constant, see
+ * slotOf) into the capacity, load kept at or below 0.6, an empty slot marked by the
+ * value UINT32_MAX (the values are dense indices).
  *
  * std::unordered_map held the same mapping first, and freeing it was the largest
  * cost of the carried scan: a node is a malloc per entry, and freeing 7.5 G of them
@@ -291,7 +292,14 @@ public:
 private:
     struct Slot { uint64_t key; uint32_t val; };
     size_t slotOf(uint64_t key) const {
-        return static_cast<size_t>((static_cast<unsigned __int128>(key) * slots_.size()) >> 64);
+        // Multiply by an odd constant first: the slot comes from the product's high
+        // bits, which then depend on every bit of the key. The keys are not always
+        // uniform over 64 bits; the sampled k-mers of chooseNodeRepresentative are
+        // the hashes whose top bits are zero, and multiplying those into the
+        // capacity directly put every key in the first 1/64 of the table (a 20-member
+        // node's choice took 6 s instead of 0.1).
+        const uint64_t mixed = key * 0x9E3779B97F4A7C15ULL;
+        return static_cast<size_t>((static_cast<unsigned __int128>(mixed) * slots_.size()) >> 64);
     }
     Slot* place(uint64_t key) {   // first empty slot for a key known to be absent
         size_t i = slotOf(key);
@@ -316,6 +324,264 @@ struct NodeKmers {
 };
 
 /**
+ * A genome's sampled k-mers: the canonical hashes whose top `shift`-complement bits
+ * are zero (1 in 2^(64 - shift); 1 in 64 at the default), one entry per occurrence,
+ * sorted so that a k-mer repeated in the genome is a run. The sample is the same
+ * k-mers in every genome (it is a property of the hash, not of the genome), so two
+ * genomes' samples intersect exactly where the genomes do. The other hashes of a
+ * sampled k-mer, for the filters, come back from the base hash (NTE64, as the
+ * iterator derives them). 8 bytes per sampled k-mer: a 5 Mb genome is 0.6 MB, 5 493
+ * of them 3.5 GB, held for the levels (sampleGenomes) and freed after them.
+ */
+struct GenomeSamples {
+    unsigned shift = 58;                                         // 1 in 2^(64 - shift) k-mers
+    std::unordered_map<std::string, std::vector<uint64_t>> byPath;
+    double scale() const { return static_cast<double>(uint64_t(1) << (64 - shift)); }
+};
+inline bool sampledHash(uint64_t h, unsigned shift) { return shift >= 64 || (h >> shift) == 0; }
+inline std::vector<uint64_t> sampleGenome(const UniqSketchConfig& cfg, const std::string& path, unsigned shift) {
+    std::vector<uint64_t> out;
+    scanFasta(path, [&](const std::string&, const std::string& seq, size_t) {
+        if (seq.size() < cfg.kmerLen) return;
+        ntHashIterator itr(seq, 1, cfg.kmerLen);
+        while (itr != itr.end()) {
+            if (sampledHash((*itr)[0], shift)) out.push_back((*itr)[0]);
+            ++itr;
+        }
+    }, wrapPad(cfg));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+inline GenomeSamples sampleGenomes(const UniqSketchConfig& cfg, const std::vector<std::string>& refFiles,
+                                   unsigned shift = 58) {
+    GenomeSamples gs;
+    gs.shift = shift;
+    std::vector<std::vector<uint64_t>> v(refFiles.size());
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned g = 0; g < refFiles.size(); g++) v[g] = sampleGenome(cfg, refFiles[g], shift);
+    for (unsigned g = 0; g < refFiles.size(); g++) gs.byPath.emplace(refFiles[g], std::move(v[g]));
+    return gs;
+}
+
+/** The result of chooseNodeRepresentative for one node. */
+struct RepresentativeChoice {
+    enum class Rule : char { None, Reached, Fill };
+    unsigned member = 0;            // index into the group (0 = the genome the tree named)
+    double reached = 0.0;           // members served by this member's signatures (saturated sum, see below)
+    double carriage = 0.0;          // mean over the members of the share of this member's node-unique k-mers they contain
+    double expectedCarried = 0.0;   // node-unique signatures of this member a random member would carry
+    double poolUnique = 0.0;        // node-unique candidates, estimate
+    double poolCarried = 0.0;       // carried candidates, estimate (reported, not scored)
+    double fill = 0.0;              // carried candidates that fit in what the node-unique pool leaves of the quota
+    bool decided = false;           // false: no member qualifies under either rule; keep the tree's genome
+    Rule rule = Rule::None;         // which rule chose the member
+    const char* ruleName() const { return rule == Rule::Reached ? "reached" : rule == Rule::Fill ? "fill" : "tree"; }
+};
+
+/**
+ * Which member a node's signatures should come from.
+ *
+ * The tree names a node after its largest member, and the largest member is the one
+ * with the most accessory sequence, which is what the others lack: its node-unique
+ * k-mers are its private plasmids and prophages, and a member's reads hit few of
+ * the signatures drawn from them (on 5 493 E. coli a member carried a median 20 % of
+ * its node's signatures, 31 % of (member, node) pairs carried none). A MinHash
+ * medoid was tried first and could not tell near-identical members apart: a 2 000-hash
+ * sketch resolves about 1/2 000 of a genome, the size of the private pools that
+ * decide this, so it degenerated into "the smallest genome" and picked a divergent
+ * member for 169 of 1 143 nodes.
+ *
+ * So the choice is made on the quantity that matters, measured on the members'
+ * sampled k-mers (the same 1 in 64 k-mers in every genome). For every member m: its
+ * sampled k-mers that occur once in it and are node-unique (not in the solid filter,
+ * exactly checkRef's rule) are its would-be signatures; for every other member i the
+ * share of them i contains, times the signatures m would get (the pool scaled up from
+ * the sample, capped at the quota), is the number of m's signatures i would carry.
+ * The score is the sum over the members of min(carried_i, S) / S with S = `saturation`
+ * (500): a member is served once it carries 500 of the node's signatures, and more
+ * add little, so a representative that gives 100 members 300 signatures each beats
+ * one that gives 20 members 1 800 (the saturation is what keeps the choice from
+ * favouring a sub-clade's private core over a core the whole node shares). Ties,
+ * which is every node whose members all carry 500 of any member's signatures, go to
+ * the higher mean carriage (the member with the least private sequence among its
+ * signatures: a family row's abundance is hits per signature, and signatures no
+ * member carries dilute it), then to the smaller genome, then the earlier member. A
+ * member whose node-unique pool is below `poolFloor` (200) is not scored, and a
+ * member no other member carries (a score below `minReached`, 0.1: no member would
+ * carry even 50 of its signatures) is not chosen through this rule.
+ *
+ * When no member qualifies, the members' node-unique k-mers are private to each of
+ * them and the node's shared identity is in the carried pool (k-mers shared with at
+ * most `cap` outside genomes), which fills what the node-unique selection leaves of
+ * the quota (identifyGroupUniqKmersCarried). The representative is then the member
+ * that leaves the fill the most room: the carried candidates that fit in
+ * quota - min(pool, quota), the largest, ties to the smaller node-unique pool, then
+ * the smaller genome; a member whose fit is below `poolFloor` is not chosen, and
+ * when none qualifies the node keeps the genome the tree named. On the 5 493-genome
+ * index 69 nodes fall to this rule, and in every one of them the member with the
+ * smaller node-unique pool is the one the others carry more of: a 5-leaf node whose
+ * tree genome had no node-unique k-mer kept its 1 233 filled signatures, carried by
+ * 87 to 100 % of the members, instead of being handed to a member with 1 944
+ * node-unique k-mers that no other member carries; another 5-leaf node went from
+ * its tree genome (4 688 node-unique signatures and 295 filled, the members carry
+ * 5 to 6 %) to the member with 998 and 2 094 (56 to 69 %).
+ *
+ * Under the first rule the carried pool is estimated and reported but not scored:
+ * whether a carried k-mer survives the strict margin cannot be told from its hash,
+ * and in the lineages where the carried pool is what the node has (a core shared
+ * with close relatives outside the node) most of it does not (the K-12 node of the
+ * 5 493-genome index: 833 carried candidates, 0 signatures). Scored against a
+ * node-unique pool the members carry, it would hand such nodes to a member whose
+ * signatures then do not exist; among members none of which is carried, the same
+ * uncertainty applies to all of them and the ranking by room stands.
+ */
+inline RepresentativeChoice chooseNodeRepresentative(const UniqSketchConfig& cfg,
+                                                     const std::vector<std::string>& group,
+                                                     const GenomeSamples& samples,
+                                                     const BloomFilter& sbFilter,
+                                                     const CarriageCounter* cc, unsigned cap,
+                                                     double saturation = 500.0, double poolFloor = 200.0,
+                                                     double minReached = 0.1) {
+    RepresentativeChoice best;
+    const unsigned n = static_cast<unsigned>(group.size());
+    if (n < 2) return best;
+    std::vector<const std::vector<uint64_t>*> sv(n, nullptr);
+    size_t total = 0;
+    for (unsigned m = 0; m < n; m++) {
+        auto it = samples.byPath.find(group[m]);
+        if (it == samples.byPath.end()) return best;          // no sample: keep the tree's genome
+        sv[m] = &it->second;
+        total += it->second.size();
+    }
+    // The node's sampled k-mers, each with its key and the number of members
+    // containing it; per member, the positions in its sample of the k-mers that
+    // occur once in it.
+    KmerTable table(total);
+    std::vector<uint64_t> keys;
+    std::vector<uint16_t> inNode;
+    keys.reserve(total);
+    inNode.reserve(total);
+    std::vector<std::vector<uint32_t>> own(n);
+    for (unsigned m = 0; m < n; m++) {
+        const std::vector<uint64_t>& v = *sv[m];
+        own[m].reserve(v.size());
+        for (size_t i = 0; i < v.size();) {
+            size_t j = i + 1;
+            while (j < v.size() && v[j] == v[i]) ++j;        // a run: the k-mer's occurrences in m
+            bool inserted = false;
+            const uint32_t idx = table.findOrInsert(v[i], static_cast<uint32_t>(inNode.size()), inserted);
+            if (inserted) { inNode.push_back(0); keys.push_back(v[i]); }
+            if (inNode[idx] < UINT16_MAX) inNode[idx]++;
+            if (j - i == 1) own[m].push_back(static_cast<uint32_t>(i));
+            i = j;
+        }
+    }
+    // Every k-mer classified once: 0 unusable, 1 node-unique, 2 carried.
+    const unsigned halfMembers = std::max<unsigned>(2, (n + 1) / 2);
+    const unsigned nh = std::max<unsigned>(cfg.nhash2, CarriageCounter::HASHES);
+    std::vector<int8_t> cls(inNode.size(), 0);
+    std::vector<uint64_t> hashes(std::max<unsigned>(nh, 1));
+    for (size_t idx = 0; idx < keys.size(); idx++) {
+        hashes[0] = keys[idx];
+        for (unsigned i = 1; i < nh; i++) hashes[i] = NTE64(keys[idx], cfg.kmerLen, i);
+        if (!sbFilter.contains(hashes.data())) cls[idx] = 1;
+        else if (cc && cap > 0) {
+            const unsigned in = inNode[idx];
+            const unsigned all = cc->count(hashes.data());
+            if (in >= halfMembers && all >= in && all - in <= cap) cls[idx] = 2;
+        }
+    }
+    // Which members contain each node-unique k-mer: one bit row per such k-mer.
+    std::vector<uint32_t> row(inNode.size(), UINT32_MAX);
+    size_t nUnique = 0;
+    for (size_t idx = 0; idx < cls.size(); idx++) if (cls[idx] == 1) row[idx] = static_cast<uint32_t>(nUnique++);
+    const size_t words = (n + 63) / 64;
+    std::vector<uint64_t> bits(nUnique * words, 0);
+    for (unsigned m = 0; m < n; m++) {
+        const std::vector<uint64_t>& v = *sv[m];
+        for (size_t i = 0; i < v.size(); i++) {
+            if (i && v[i] == v[i - 1]) continue;
+            const uint32_t r = row[*table.find(v[i])];
+            if (r != UINT32_MAX) bits[r * words + m / 64] |= uint64_t(1) << (m % 64);
+        }
+    }
+    const double quota = static_cast<double>(std::max(cfg.sketchnum, 1));
+    const double scale = samples.scale();
+    // Per member: the two pools and, over its node-unique k-mers, the members it
+    // reaches and the mean carriage.
+    struct MemberStat { double poolU = 0.0, poolC = 0.0, reached = 0.0, carriage = 0.0, fill = 0.0; };
+    std::vector<MemberStat> stat(n);
+    std::vector<uint32_t> overlap(n);
+    for (unsigned m = 0; m < n; m++) {
+        const std::vector<uint64_t>& v = *sv[m];
+        size_t uniq = 0, carr = 0;
+        double uniqIn = 0.0;
+        std::fill(overlap.begin(), overlap.end(), 0u);
+        for (uint32_t pos : own[m]) {
+            const uint32_t idx = *table.find(v[pos]);
+            if (cls[idx] == 2) { ++carr; continue; }
+            if (cls[idx] != 1) continue;
+            ++uniq;
+            uniqIn += inNode[idx];
+            const uint64_t* r = &bits[row[idx] * words];
+            for (size_t w = 0; w < words; w++)
+                for (uint64_t word = r[w]; word; word &= word - 1)
+                    overlap[w * 64 + __builtin_ctzll(word)]++;
+        }
+        MemberStat& s = stat[m];
+        s.poolU = uniq * scale;
+        s.poolC = carr * scale;
+        const double takeU = std::min(s.poolU, quota);
+        s.fill = std::min(quota - takeU, s.poolC);
+        if (uniq == 0) continue;
+        for (unsigned i = 0; i < n; i++) {
+            if (i == m) continue;
+            const double carried = static_cast<double>(overlap[i]) / static_cast<double>(uniq) * takeU;
+            s.reached += std::min(carried, saturation) / saturation;
+        }
+        s.carriage = uniqIn / (static_cast<double>(uniq) * n);
+    }
+    auto take = [&](unsigned m, RepresentativeChoice::Rule rule) {
+        const MemberStat& s = stat[m];
+        best.decided = true;
+        best.rule = rule;
+        best.member = m;
+        best.reached = s.reached;
+        best.carriage = s.carriage;
+        best.expectedCarried = std::min(s.poolU, quota) * s.carriage;
+        best.poolUnique = s.poolU;
+        best.poolCarried = s.poolC;
+        best.fill = s.fill;
+    };
+    // The members reached through a member's node-unique k-mers.
+    for (unsigned m = 0; m < n; m++) {
+        const MemberStat& s = stat[m];
+        if (s.poolU < poolFloor || s.reached < minReached) continue;
+        const bool better = !best.decided ||
+            s.reached > best.reached + 1e-9 ||
+            (std::fabs(s.reached - best.reached) <= 1e-9 &&
+             (s.carriage > best.carriage + 1e-9 ||
+              (std::fabs(s.carriage - best.carriage) <= 1e-9 && sv[m]->size() < sv[best.member]->size())));
+        if (better) take(m, RepresentativeChoice::Rule::Reached);
+    }
+    if (best.decided) return best;
+    // No member reaches another through its node-unique k-mers: the node's shared
+    // identity is in the carried pool, and the representative is the member that
+    // leaves the fill the most room.
+    for (unsigned m = 0; m < n; m++) {
+        const MemberStat& s = stat[m];
+        if (s.fill < poolFloor) continue;
+        const bool better = !best.decided ||
+            s.fill > best.fill + 1e-9 ||
+            (std::fabs(s.fill - best.fill) <= 1e-9 &&
+             (s.poolU < best.poolUnique - 1e-9 ||
+              (std::fabs(s.poolU - best.poolUnique) <= 1e-9 && sv[m]->size() < sv[best.member]->size())));
+        if (better) take(m, RepresentativeChoice::Rule::Fill);
+    }
+    return best;
+}
+
+/**
  * Candidate scan for one node: every k-mer not in the solid filter into the node's
  * candidate file, exactly as checkRef, and into a second file the representative's
  * k-mers that occur once in it, are carried by at least half the members (one of them
@@ -324,7 +590,7 @@ struct NodeKmers {
  */
 inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, const std::string& repPath,
                                                  size_t members, const BloomFilter& sbFilter,
-                                                 const CarriageCounter& cc, const NodeKmers& nk,
+                                                 const CarriageCounter* cc, const NodeKmers& nk,
                                                  unsigned cap) {
     const std::string candPath = candidatePath(cfg.outdir, repPath);
     const std::string carrPath = carriedCandidatePath(candPath);
@@ -350,10 +616,10 @@ inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, co
                     ++plain;
                     cand.add(static_cast<uint32_t>(itr.get_pos()));
                 } else {
-                    const uint32_t* v = nk.index.find((*itr)[0]);
+                    const uint32_t* v = cc && cap > 0 ? nk.index.find((*itr)[0]) : nullptr;
                     if (v && nk.repMult[*v] == 1) {
                         const unsigned in = nk.inNode[*v].load(std::memory_order_relaxed);
-                        const unsigned total = cc.count(*itr);
+                        const unsigned total = cc->count(*itr);
                         if (in >= halfMembers && total >= in && total - in <= cap) {
                             ++carried;
                             carr.add(static_cast<uint32_t>(itr.get_pos()));
@@ -399,11 +665,20 @@ inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, co
  * then the representative is scanned again with both rules. Groups are taken in
  * batches whose representatives' k-mers fit `budgetKmers`, since the table and counts cost about
  * 30 bytes per k-mer (KmerTable); every genome is scanned once per level whatever the batching.
+ *
+ * With `samples`, a node's representative is chosen first (chooseNodeRepresentative)
+ * for every group whose `decide` flag is set, and that member is moved to the front of
+ * the group; the function returns the first member of every group as it ended up. The
+ * counter may be null (no carried pool, cap taken as 0): then the candidate files are
+ * exactly identifyGroupUniqKmers's.
  */
-inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
-                                          const std::vector<std::vector<std::string>>& groups,
-                                          BloomFilter& dbFilter, const CarriageCounter& cc,
-                                          unsigned cap, size_t budgetKmers = size_t(150) * 1000 * 1000) {
+inline std::vector<std::string> identifyGroupUniqKmersCarried(
+        const UniqSketchConfig& cfg, std::vector<std::vector<std::string>> groups,
+        BloomFilter& dbFilter, const CarriageCounter* cc, unsigned cap,
+        const GenomeSamples* samples = nullptr, const std::vector<char>* decide = nullptr,
+        std::vector<RepresentativeChoice>* choices = nullptr,
+        size_t budgetKmers = size_t(150) * 1000 * 1000) {
+    if (!cc) cap = 0;
     size_t members = 0;
     for (const auto& g : groups) members += g.size();
     std::cout << "k-mer length: " << cfg.kmerLen << "\n"
@@ -424,6 +699,34 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
     // Nodes, in batches.
     std::vector<unsigned> nodes;
     for (unsigned i = 0; i < groups.size(); ++i) if (groups[i].size() >= 2) nodes.push_back(i);
+    // The representative of each node still to be decided, chosen on the members'
+    // samples and moved to the front of its group.
+    double secChoice = 0;
+    size_t chosen = 0, changed = 0, undecided = 0, byFill = 0;
+    if (samples) {
+        auto tc = Clock::now();
+        std::vector<RepresentativeChoice> choice(nodes.size());
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t j = 0; j < nodes.size(); j++) {
+            const unsigned i = nodes[j];
+            if (decide && !(*decide)[i]) continue;
+            choice[j] = chooseNodeRepresentative(cfg, groups[i], *samples, sbFilter, cc, cap);
+        }
+        if (choices) choices->assign(groups.size(), RepresentativeChoice());
+        for (size_t j = 0; j < nodes.size(); j++) {
+            const unsigned i = nodes[j];
+            if (decide && !(*decide)[i]) continue;
+            ++chosen;
+            if (choices) (*choices)[i] = choice[j];
+            if (!choice[j].decided) { ++undecided; continue; }
+            if (choice[j].rule == RepresentativeChoice::Rule::Fill) ++byFill;
+            if (choice[j].member != 0) {
+                std::swap(groups[i][0], groups[i][choice[j].member]);
+                ++changed;
+            }
+        }
+        secChoice = secs(tc, Clock::now());
+    }
     size_t totalPlain = 0, totalCarried = 0, nodesWithCarried = 0;
     for (size_t b = 0; b < nodes.size();) {
         std::vector<unsigned> batch;
@@ -505,12 +808,22 @@ inline void identifyGroupUniqKmersCarried(const UniqSketchConfig& cfg,
     std::cerr << "Node carriers scan time (s): filters and singles " << std::setprecision(1) << std::fixed
               << secFilters << ", representatives " << secReps << " (" << repKmers / 1000000 << " M k-mers hashed), members "
               << secMembers << " (" << memberGenomes << " genomes), scan " << secScan << "\n";
+    if (samples)
+        std::cout << "Node representatives: " << chosen << " nodes decided on the members' samples in "
+                  << std::setprecision(1) << std::fixed << secChoice << " s, " << changed
+                  << " moved from the genome the tree named" << (byFill ? ", " + std::to_string(byFill) +
+                     " chosen for the room they leave the carried pool (no member's node-unique k-mers are carried)" : std::string())
+                  << (undecided ? ", " + std::to_string(undecided) + " kept (no member qualifies)" : std::string()) << "\n";
     std::cout << "Node candidates: " << totalPlain << " unique to their node; " << totalCarried
               << " carried by at most " << cap << " outside genomes, held for " << nodesWithCarried
               << " of " << nodes.size() << " nodes to fill a quota their unique ones leave short\n";
     std::ofstream tsvOut(cfg.refstat);
     for (size_t i = 0; i < refCount.size(); i++)
         tsvOut << candidatePath(cfg.outdir, groups[i][0]) << "\t" << refCount[i] << "\t" << i << "\n";
+    std::vector<std::string> reps;
+    reps.reserve(groups.size());
+    for (const auto& g : groups) reps.push_back(g[0]);
+    return reps;
 }
 
 #endif // NODECARRIERUTIL_HPP_

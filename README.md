@@ -154,7 +154,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 * `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
-* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level: the six signature columns, then `carriers`, the leaf ids of the genomes outside the node that contain the k-mer or `-`; the column is absent when the index was built with `--node-carriers=0`), `build_params.tsv` (how signatures were selected, `node_carriers` included; read by `querysketch --tree`), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
+* With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level: the six signature columns, then `carriers`, the leaf ids of the genomes outside the node that contain the k-mer or `-`; the column is absent when the index was built with `--node-carriers=0`), `build_params.tsv` (how signatures were selected, `node_carriers` and `node_representative` included; read by `querysketch --tree`), `node_representatives.tsv` (per node: level, name, leaves, the genome the tree named, the member its signatures come from, whether it moved, the rule that chose it, `reached`, `fill`, and the pool estimates), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
 
 ### querysketch
 * `out_sample.tsv`: primary output reporting references and their abundance within the sample:
@@ -266,6 +266,8 @@ A list of files containing file names in each row can be passed with @ prefix.
       --node-carriers=N fill a tree node's signature quota, when its node-unique k-mers leave it short,
                         from k-mers carried by up to N genomes outside the node (recorded; the query
                         sets them aside when a carrier is present) [min(50, leaves/10); 0=off]
+      --node-representative=WHICH  the member a tree node's signatures come from: central (the one
+                        whose node-unique k-mers the other members carry) or largest [central]
       --sensitive       sets sensitivity parameter c to 100
       --very-sensitive  sets sensitivity parameter c to 1000
       --help            display this help and exit
@@ -364,6 +366,40 @@ element, so it is liable to turn up in an organism missing from the index and
 collect that organism's reads for the cluster. Levels whose clustering is
 identical to the next finer level are not written; the query walks whatever level
 files exist.
+
+**Which member stands for a cluster.** A cluster's signatures come from its *central*
+member, the one whose node-unique k-mers the other members carry. Before 2.0 it was
+the largest member, and the largest member is the one with the most accessory
+sequence, which is exactly what the others lack: its node-unique pool is its private
+plasmids and prophages, and a member's reads hit few of the signatures drawn from it.
+On 5 493 *E. coli* genomes a member carried a median 61 % of its node's signatures
+with the largest member as representative (lower quartile 26 %, 1.6 % of member–node
+pairs carried none). The choice is made on 1 in 64 of every genome's k-mers, sampled
+by hash so every genome contributes the same k-mers: for each member, the sampled
+k-mers that are node-unique (absent from every genome outside the node, the rule the
+scan applies) are its would-be signatures, and for each other member the share of
+them it contains, scaled to the signatures the member would get, is what that member
+would carry. The score is the number of members served, each counted as
+min(carried, 500)/500: a member is served once it carries 500 signatures, so a
+representative that gives 100 members 300 each beats one that gives a 20-member
+sub-clade 1 800 each (the mean containment, tried first, picked the sub-clade; a
+MinHash medoid could not tell near-identical members apart). Ties go to the member
+with the least private sequence among its signatures, then to the smaller genome.
+When no member's node-unique k-mers are carried by any other, the node's shared
+identity is in its carried pool (see carriers below), and the representative is the
+member whose node-unique pool leaves that fill the most room; on 5 493 genomes 72
+nodes are decided this way, and where keeping the genome the tree named was measured
+against it, the member with the smaller node-unique pool was the better choice in
+every node. The merges still use the largest genome, so the tree, its nodes and their
+members are unchanged; the node is renamed after the member its signatures come from,
+at every level it spans (`tree_index.tsv` is rewritten after the level scans), and
+`<outdir>/node_representatives.tsv` records per node the genome the tree named, the
+one chosen, the rule and the estimates behind it. On 5 493 genomes 818 of 1 143
+representatives moved; the carried fraction went from 26 %/61 % (lower
+quartile/median) to 41 %/83 %, on 1 000 genomes from 38 %/71 % to 60 %/87 %; the
+sampling adds 8 s and the choice 10 s to the 5 493-genome build.
+`--node-representative=largest` restores the old choice (the index then rebuilds
+byte-identical); `build_params.tsv` records it as `node_representative`.
 
 **Within-group signatures.** A tree build also writes `<outdir>/sketch_group.tsv`,
 a second signature set for the leaves (turn it off with `--no-group-signatures`).

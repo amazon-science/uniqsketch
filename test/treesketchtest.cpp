@@ -65,9 +65,11 @@ void testBuildParamsRoundTrip() {
     p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true;
     p.maxHomopolymer = 6; p.groupSignatures = true; p.thresholds = "10000,1000,100";
     p.bloomFilter = bloomFilterName();
+    p.nodeCarriers = 12; p.centralRepresentative = true;
     writeTreeBuildParams(path, p);
     TreeBuildParams q = loadTreeBuildParams(path);
     assert(q.loaded);
+    assert(q.nodeCarriers == 12 && q.centralRepresentative);
     assert(q.kmerLen == 81 && q.sketchnum == 500);
     assert(q.minMargin == 2 && q.strictMargin);
     assert(q.maxHomopolymer == 6 && q.thresholds == "10000,1000,100");
@@ -80,6 +82,7 @@ void testBuildParamsRoundTrip() {
     assert(!missing.loaded);
     assert(missing.bloomFilter.empty());                      // no layout recorded
     assert(missing.minMargin == 1 && !missing.strictMargin);  // pre-2.0 index: no margin assumed
+    assert(missing.nodeCarriers == 0 && !missing.centralRepresentative);   // nor carriers, nor the central representative
     assert(!missing.groupSignatures);                         // and no within-group signatures
     // A file from before the field existed loads with the field empty, so the
     // query's mismatch check stays silent on older indexes.
@@ -355,6 +358,7 @@ void testBuildHierarchicalTree() {
 
     std::remove("tree_A.fa"); std::remove("tree_B.fa"); std::remove("tree_C.fa");
     std::remove("tree_out.tsv");
+
     std::cerr << "PASSED: Test buildHierarchicalTree\n";
 }
 
@@ -469,10 +473,10 @@ void testNodeCarriers() {
     identifyGroupUniqKmers(plain, groups, dbfPlain);
     {
         BloomFilter dbf(cap0.m1(), cap0.nhash1, cap0.kmerLen);
-        identifyGroupUniqKmersCarried(cap0, groups, dbf, cc, 0);
+        identifyGroupUniqKmersCarried(cap0, groups, dbf, &cc, 0);
     }
     BloomFilter dbf1(cap1.m1(), cap1.nhash1, cap1.kmerLen);
-    identifyGroupUniqKmersCarried(cap1, groups, dbf1, cc, 1);
+    identifyGroupUniqKmersCarried(cap1, groups, dbf1, &cc, 1);
     assert(candidates(candidatePath(plain.outdir, refs[0])) == 880);
     for (const std::string& r : {refs[0], refs[5], refs[6]}) {
         assert(contents(candidatePath(plain.outdir, r)) == contents(candidatePath(cap0.outdir, r)));
@@ -483,6 +487,128 @@ void testNodeCarriers() {
            counts(cap1.refstat) == counts(plain.refstat));
     assert(candidates(carriedCandidatePath(candidatePath(cap1.outdir, refs[0]))) == 80);
     assert(!fileExists(carriedCandidatePath(candidatePath(cap1.outdir, refs[5]))));   // singles: no pool
+
+    // The representative chosen on the members' samples (every k-mer sampled here),
+    // first on this fixture through the scan: with the decision asked for, the
+    // chosen member moves to the front of its group and is the genome the candidate
+    // files, the stat file and the level sketch are written for; with the decision
+    // withheld the group is scanned as given. Every member of this node carries
+    // nearly all of every other member's node-unique k-mers, so the fixture decides
+    // nothing about *which* member; the second fixture below does.
+    {
+        GenomeSamples all = sampleGenomes(cfg, refs, 64);
+        assert(all.byPath.size() == 7 && all.scale() == 1.0);
+        assert(all.byPath.at(refs[0]).size() == 1240 && all.byPath.at(refs[3]).size() == a3.size() - k + 1);
+        BloomFilter dbfC(cfg.m1(), cfg.nhash1, cfg.kmerLen), sbfC(cfg.m2(), cfg.nhash2, cfg.kmerLen);
+        loadBFfaGroups(cfg, groups, dbfC, sbfC);
+        RepresentativeChoice ch = chooseNodeRepresentative(cfg, groups[0], all, sbfC, &cc, 1);
+        assert(ch.decided && ch.reached > 3.9 && ch.reached <= 4.0);       // every other member served
+        assert(ch.poolUnique > 850 && ch.poolUnique < 1000 && ch.poolCarried > 0);
+        RepresentativeChoice none = chooseNodeRepresentative(cfg, groups[1], all, sbfC, &cc, 1);
+        assert(!none.decided);                                             // a single: nothing to choose
+        UniqSketchConfig sel = level("nc_sel");
+        BloomFilter dbfS(sel.m1(), sel.nhash1, sel.kmerLen);
+        std::vector<char> decide = {1, 0, 0};
+        std::vector<std::string> reps = identifyGroupUniqKmersCarried(sel, groups, dbfS, &cc, 1, &all, &decide);
+        assert(reps.size() == 3 && reps[0] == groups[0][ch.member] && reps[1] == refs[5] && reps[2] == refs[6]);
+        assert(fileExists(candidatePath(sel.outdir, reps[0])));
+        {
+            std::ifstream in(sel.refstat);
+            std::string path; int cnt, id; in >> path >> cnt >> id;
+            assert(path == candidatePath(sel.outdir, reps[0]) && cnt > 850 && id == 0);
+        }
+        decide = {0, 0, 0};
+        UniqSketchConfig keep = level("nc_keep");
+        BloomFilter dbfK(keep.m1(), keep.nhash1, keep.kmerLen);
+        reps = identifyGroupUniqKmersCarried(keep, groups, dbfK, &cc, 1, &all, &decide);
+        assert(reps[0] == refs[0]);                                        // not decided: the genome the tree named
+        assert(contents(candidatePath(keep.outdir, refs[0])) == contents(candidatePath(cap1.outdir, refs[0])));
+        system("rm -rf nc_sel nc_keep");
+    }
+
+    // Which member. A node of four: P is a 3 000-bp core plus 2 000 bp of its own
+    // (the largest member, the one the tree would name), P1 the core with two
+    // substitutions, P2 the core alone, P3 the core plus 300 bp of its own; O is
+    // unrelated and outside. Every core k-mer is node-unique. With a quota of 500,
+    // P's signatures are 60 % private, so a member carries about 300 of them and
+    // P scores 3 x 0.6; P2's are all core, every member carries about 500, P2
+    // scores 3; P1 scores a little less (its two substitution sites are 42 k-mers
+    // of 2 980 that the others lack). With the quota at 5 000 every member's pool
+    // is taken whole, so the 2 980 core k-mers serve the members under P too and
+    // all four tie on the score; the mean carriage, which counts private sequence
+    // against a member, puts P2 first again. With the pool floor above every
+    // pool, no one is chosen.
+    {
+        const std::string core = randDNA(3000, 8642);
+        std::string p1 = core;
+        p1[1000] = (core[1000] == 'A') ? 'C' : 'A';
+        p1[2000] = (core[2000] == 'G') ? 'T' : 'G';
+        writeFasta("nc_P.fa", core + randDNA(2000, 1111)); writeFasta("nc_P1.fa", p1);
+        writeFasta("nc_P2.fa", core); writeFasta("nc_P3.fa", core + randDNA(300, 2222));
+        writeFasta("nc_O.fa", randDNA(3000, 3333));
+        std::vector<std::string> prefs = {"nc_P.fa", "nc_P1.fa", "nc_P2.fa", "nc_P3.fa", "nc_O.fa"};
+        std::vector<std::vector<std::string>> pgroups = {{prefs[0], prefs[1], prefs[2], prefs[3]}, {prefs[4]}};
+        UniqSketchConfig pc = cfg;
+        pc.sketchnum = 500;
+        getCardinality(total, pc.dbfSize, pc.sbfSize, pc.kmerLen, pc.threads, prefs);
+        assert(resolveBloomSizes(total, pc.dbfSize, pc.sbfSize));
+        CarriageCounter pcc(pc.dbfSize);
+        countCarriage(pc, prefs, pcc);
+        GenomeSamples pall = sampleGenomes(pc, prefs, 64);
+        BloomFilter dbfP(pc.m1(), pc.nhash1, pc.kmerLen), sbfP(pc.m2(), pc.nhash2, pc.kmerLen);
+        loadBFfaGroups(pc, pgroups, dbfP, sbfP);
+        RepresentativeChoice ch = chooseNodeRepresentative(pc, pgroups[0], pall, sbfP, &pcc, 0);
+        assert(ch.decided && ch.member == 2);
+        assert(ch.reached > 2.9 && ch.reached <= 3.0 && ch.carriage > 0.99);
+        assert(ch.poolUnique > 2900 && ch.poolUnique < 3000 && ch.poolCarried == 0);
+        // P from P's own point of view: the private 2 000 bp dilute what the others carry.
+        std::vector<std::string> g = pgroups[0];
+        std::swap(g[0], g[2]);                                             // P2 first, P third
+        RepresentativeChoice ch2 = chooseNodeRepresentative(pc, g, pall, sbfP, &pcc, 0);
+        assert(ch2.decided && g[ch2.member] == "nc_P2.fa");
+        pc.sketchnum = 5000;
+        RepresentativeChoice ch3 = chooseNodeRepresentative(pc, pgroups[0], pall, sbfP, &pcc, 0);
+        assert(ch3.decided && ch3.member == 2 && ch3.reached > 2.9);
+        RepresentativeChoice ch4 = chooseNodeRepresentative(pc, pgroups[0], pall, sbfP, &pcc, 0, 500.0, 10000.0);
+        assert(!ch4.decided && ch4.rule == RepresentativeChoice::Rule::None);   // every pool below the floor, no carried pool
+        assert(ch.rule == RepresentativeChoice::Rule::Reached && ch3.rule == RepresentativeChoice::Rule::Reached);
+        for (const std::string& r : prefs) std::remove(r.c_str());
+    }
+
+    // No member reached. A node of three that share a 3 000-bp core with O2, a
+    // genome outside the node, so the core is in the solid filter and, with a cap of
+    // 1, the carried pool; what each member has besides is its own (Q 2 000 bp, Q1
+    // 250, Q2 400), so no member's node-unique k-mers reach anyone and the first
+    // rule chooses no one. The second takes the member that leaves the fill the most
+    // room: with a quota of 500, Q and Q2 leave none and 100 (below the floor of
+    // 200), Q1 leaves 250. With a quota of 5 000 all three take the whole carried
+    // pool and the tie goes to the smaller node-unique pool, Q1 again. With a cap of
+    // 0 there is no carried pool and the node keeps Q, the genome the tree named.
+    {
+        const std::string core = randDNA(3000, 9753);
+        writeFasta("nc_Q.fa", core + randDNA(2000, 4444)); writeFasta("nc_Q1.fa", core + randDNA(250, 5555));
+        writeFasta("nc_Q2.fa", core + randDNA(400, 6666)); writeFasta("nc_O2.fa", core);
+        std::vector<std::string> qrefs = {"nc_Q.fa", "nc_Q1.fa", "nc_Q2.fa", "nc_O2.fa"};
+        std::vector<std::vector<std::string>> qgroups = {{qrefs[0], qrefs[1], qrefs[2]}, {qrefs[3]}};
+        UniqSketchConfig qc = cfg;
+        qc.sketchnum = 500;
+        getCardinality(total, qc.dbfSize, qc.sbfSize, qc.kmerLen, qc.threads, qrefs);
+        assert(resolveBloomSizes(total, qc.dbfSize, qc.sbfSize));
+        CarriageCounter qcc(qc.dbfSize);
+        countCarriage(qc, qrefs, qcc);
+        GenomeSamples qall = sampleGenomes(qc, qrefs, 64);
+        BloomFilter dbfQ(qc.m1(), qc.nhash1, qc.kmerLen), sbfQ(qc.m2(), qc.nhash2, qc.kmerLen);
+        loadBFfaGroups(qc, qgroups, dbfQ, sbfQ);
+        RepresentativeChoice ch = chooseNodeRepresentative(qc, qgroups[0], qall, sbfQ, &qcc, 1);
+        assert(ch.decided && ch.rule == RepresentativeChoice::Rule::Fill && ch.member == 1);
+        assert(ch.reached < 0.01 && ch.poolUnique == 250 && ch.poolCarried > 2900 && ch.fill == 250);
+        qc.sketchnum = 5000;
+        RepresentativeChoice ch2 = chooseNodeRepresentative(qc, qgroups[0], qall, sbfQ, &qcc, 1);
+        assert(ch2.decided && ch2.rule == RepresentativeChoice::Rule::Fill && ch2.member == 1 && ch2.fill == ch2.poolCarried);
+        RepresentativeChoice ch3 = chooseNodeRepresentative(qc, qgroups[0], qall, sbfQ, &qcc, 0);
+        assert(!ch3.decided);                                              // no carried pool: the tree's genome
+        for (const std::string& r : qrefs) std::remove(r.c_str());
+    }
 
     // Selection: the node-unique signatures are those of the plain build, byte for
     // byte; the carried pool only fills what they leave of the quota. Each

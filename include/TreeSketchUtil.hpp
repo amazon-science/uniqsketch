@@ -34,6 +34,21 @@ struct TreeNode {
     bool isLeaf;                            // true if this is an individual reference
 };
 
+/** Write the tree to tree_index.tsv (one row per node; loadTree reads it back). */
+inline void writeTreeIndex(const std::vector<TreeNode>& tree, const std::string& treeFile) {
+    std::ofstream treeOut(treeFile);
+    treeOut << "node_id\tname\tlevel\tparent_id\tis_leaf\tchildren\tfile_path\n";
+    for (const auto& node : tree) {
+        treeOut << node.id << "\t" << node.name << "\t" << node.level << "\t"
+                << node.parentId << "\t" << (node.isLeaf ? "yes" : "no") << "\t";
+        for (size_t c = 0; c < node.children.size(); c++) {
+            if (c > 0) treeOut << ",";
+            treeOut << node.children[c];
+        }
+        treeOut << "\t" << node.filePath << "\n";
+    }
+}
+
 /**
  * Build a hierarchical clustering tree from reference files.
  * Uses multiple thresholds to create levels of increasing resolution.
@@ -166,6 +181,9 @@ inline std::vector<TreeNode> buildHierarchicalTree(
                 continue;
             }
             // Representative = largest genome among the merged clusters' representatives.
+            // It stands for the node in the next level's merges, and, until the level
+            // scan chooses otherwise (chooseNodeRepresentative, NodeCarrierUtil.hpp),
+            // for the node's signatures.
             unsigned repIdx = active[members[0]].rep;
             for (unsigned c : members)
                 if (kmerCount[active[c].rep] > kmerCount[repIdx]) repIdx = active[c].rep;
@@ -189,19 +207,7 @@ inline std::vector<TreeNode> buildHierarchicalTree(
         active = std::move(next);
     }
 
-    // Write tree structure to file
-    std::ofstream treeOut(treeFile);
-    treeOut << "node_id\tname\tlevel\tparent_id\tis_leaf\tchildren\tfile_path\n";
-    for (const auto& node : tree) {
-        treeOut << node.id << "\t" << node.name << "\t" << node.level << "\t"
-                << node.parentId << "\t" << (node.isLeaf ? "yes" : "no") << "\t";
-        for (size_t c = 0; c < node.children.size(); c++) {
-            if (c > 0) treeOut << ",";
-            treeOut << node.children[c];
-        }
-        treeOut << "\t" << node.filePath << "\n";
-    }
-    treeOut.close();
+    writeTreeIndex(tree, treeFile);
 
     // Report tree stats
     unsigned numLeaves = 0, numInternal = 0;
@@ -350,6 +356,7 @@ struct TreeBuildParams {
     unsigned maxHomopolymer = 0;
     bool circular = false;
     unsigned nodeCarriers = 0;   // node signatures may be carried by up to this many outside genomes (NodeCarrierUtil.hpp)
+    bool centralRepresentative = false;   // node signatures from the member the others carry most (chooseNodeRepresentative)
     bool groupSignatures = false; // within-group leaf signatures built (sketch_group.tsv)
     std::string thresholds;      // comma-separated, coarsest first
     std::string bloomFilter;     // filter layout the index was built with (see bloomFilterName)
@@ -386,6 +393,7 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "max_homopolymer\t" << p.maxHomopolymer << "\n"
         << "circular\t" << (p.circular ? 1 : 0) << "\n"
         << "node_carriers\t" << p.nodeCarriers << "\n"
+        << "node_representative\t" << (p.centralRepresentative ? "central" : "largest") << "\n"
         << "group_signatures\t" << (p.groupSignatures ? 1 : 0) << "\n"
         << "tree\t" << p.thresholds << "\n"
         << "bloom_filter\t" << p.bloomFilter << "\n";
@@ -453,6 +461,7 @@ inline TreeBuildParams loadTreeBuildParams(const std::string& path) {
             else if (key == "max_homopolymer") p.maxHomopolymer = static_cast<unsigned>(std::stoul(val));
             else if (key == "circular") p.circular = (val == "1");
             else if (key == "node_carriers") p.nodeCarriers = static_cast<unsigned>(std::stoul(val));
+            else if (key == "node_representative") p.centralRepresentative = (val == "central");
             else if (key == "group_signatures") p.groupSignatures = (val == "1");
             else if (key == "tree") p.thresholds = val;
             else if (key == "bloom_filter") p.bloomFilter = val;
