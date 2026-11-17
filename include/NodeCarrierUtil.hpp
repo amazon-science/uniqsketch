@@ -134,6 +134,10 @@ inline unsigned defaultNodeCarriers(size_t leaves) {
  * number of loci does. The leaf sketch is read once more for the positions, which
  * loadSketch does not keep (hand-split, as there; 22 M lines at 5 493 genomes).
  */
+inline std::vector<unsigned> countSignatureLoci(std::vector<std::vector<std::pair<uint64_t, uint32_t>>> pos,
+                                                size_t nLeaves,
+                                                const std::vector<std::tuple<unsigned, std::string, unsigned>>& extra,
+                                                unsigned gap);
 inline std::vector<unsigned> countSignatureLoci(const std::string& leafSketch, size_t nLeaves,
                                                 const std::vector<std::tuple<unsigned, std::string, unsigned>>& extra,
                                                 unsigned gap) {
@@ -157,6 +161,22 @@ inline std::vector<unsigned> countSignatureLoci(const std::string& leafSketch, s
         pos[refId].push_back({hs(line.substr(field[4].first, field[4].second)),
                               static_cast<uint32_t>(std::strtoul(line.c_str() + field[5].first, nullptr, 10))});
     }
+    return countSignatureLoci(std::move(pos), nLeaves, extra, gap);
+}
+
+/**
+ * countSignatureLoci on positions already in hand: per leaf the (contig hash,
+ * position) of its leaf signatures, as loadSketch collects them when asked
+ * (SignaturePositions), so the leaf sketch is not read a second time (1.5 GB and
+ * 2.5 s of every query on the 5 493-genome index). The result is the same: the
+ * positions are sorted before the loci are counted.
+ */
+inline std::vector<unsigned> countSignatureLoci(std::vector<std::vector<std::pair<uint64_t, uint32_t>>> pos,
+                                                size_t nLeaves,
+                                                const std::vector<std::tuple<unsigned, std::string, unsigned>>& extra,
+                                                unsigned gap) {
+    const std::hash<std::string> hs;
+    pos.resize(std::max(pos.size(), nLeaves));
     for (const auto& [refId, contig, p] : extra)
         if (refId < nLeaves) pos[refId].push_back({hs(contig), p});
     std::vector<unsigned> loci(nLeaves, 0);

@@ -90,26 +90,52 @@ struct QuerySketchConfig {
 using SketchHash = std::unordered_map<std::string, unsigned>;
 
 /**
- * Load the uniqsketch index into a hash table.
- *
- * @param fPath  Path to the uniqsketch file.
- * @param sketchHash  Hash table for the uniqsketch.
- * @param sketchRef  Vector mapping refId to refName.
- * @param refSigCount  Per-reference signature count map.
+ * One byte range of a sketch file, parsed into maps of its own (loadSketch).
  */
-void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sketchHash,
-                std::vector<std::string>& sketchRef,
-                std::vector<SketchHash>& refSigCount) {
-    std::ifstream sketchFile(fPath);
+struct SketchPart {
+    unsigned refNum = 0, kmerLen = 0;
     bool init = true;
+    SketchHash hash;
+    std::vector<SketchHash> sig;
+    std::vector<std::string> ref;
+    std::unordered_map<std::string, std::vector<unsigned>> carriers;
+    std::vector<std::vector<std::pair<uint64_t, uint32_t>>> pos;   // per ref: (contig hash, position), if asked for
+    std::string badLine;                 // the first line that did not parse, if any
+    bool bad = false;
+};
+
+/** Per reference, the (contig hash, position) of each of its signatures (countSignatureLoci). */
+using SignaturePositions = std::vector<std::vector<std::pair<uint64_t, uint32_t>>>;
+
+/**
+ * Parse the lines of a sketch file that start in [begin, end) into `part`.
+ * Fields: seq, refId, refName, numRef, contig, pos, and in a level sketch of an
+ * index with node carriers a seventh, the carriers (NodeCarrierUtil.hpp), read when
+ * `withCarriers`. Split on whitespace by hand: an istringstream per line cost 1.2 us,
+ * which on a 120-genome tree index (1.5 M signatures over five files) was 1.8 s of
+ * the query.
+ */
+inline void parseSketchRange(const std::string& fPath, uint64_t begin, uint64_t end, bool withCarriers,
+                             bool withPositions, SketchPart& part) {
+    const std::hash<std::string> hs;
+    std::ifstream in(fPath, std::ios::binary);
+    uint64_t pos = begin;
+    if (begin > 0) {
+        // A line that starts before the range belongs to the range before.
+        in.seekg(static_cast<std::streamoff>(begin - 1));
+        if (in.get() != '\n') {
+            std::string skip;
+            std::getline(in, skip);
+            pos += skip.size() + 1;
+        }
+    }
+    const size_t want = withCarriers ? 7 : 6;
+    std::vector<std::pair<size_t, size_t>> field(want);
     std::string line;
-    // Fields: seq, refId, refName, numRef, contig, pos. Split on whitespace by
-    // hand: an istringstream per line cost 1.2 us, which on a 120-genome tree
-    // index (1.5 M signatures over five files) was 1.8 s of the query.
-    std::vector<std::pair<size_t, size_t>> field(6);
-    while (std::getline(sketchFile, line)) {
+    while (pos < end && std::getline(in, line)) {
+        pos += line.size() + 1;
         size_t n = 0, i = 0;
-        while (n < 6) {
+        while (n < want) {
             while (i < line.size() && (line[i] == '\t' || line[i] == ' ')) ++i;
             if (i >= line.size()) break;
             size_t b = i;
@@ -117,29 +143,128 @@ void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sk
             field[n++] = {b, i - b};
         }
         auto number = [&](size_t f, unsigned& out) {
-            char* end = nullptr;
-            unsigned long v = std::strtoul(line.c_str() + field[f].first, &end, 10);
-            if (end != line.c_str() + field[f].first + field[f].second) return false;
+            char* e = nullptr;
+            unsigned long v = std::strtoul(line.c_str() + field[f].first, &e, 10);
+            if (e != line.c_str() + field[f].first + field[f].second) return false;
             out = static_cast<unsigned>(v);
             return true;
         };
-        unsigned refId = 0, refNum = 0, pos = 0;
-        if (n < 6 || !number(1, refId) || !number(3, refNum) || !number(5, pos)) {
-            std::cerr << "Error in parsing uniqsketch entry:\n" << line << "\n";
-            exit(EXIT_FAILURE);
+        unsigned refId = 0, refNum = 0, p = 0;
+        if (n < 6 || !number(1, refId) || !number(3, refNum) || !number(5, p)) {
+            part.badLine = line;
+            part.bad = true;
+            return;
         }
         std::string uniqSeq = line.substr(field[0].first, field[0].second);
-        if (init) {
-            cfg.kmerLen = uniqSeq.length();
-            sketchRef.resize(refNum);
-            refSigCount.resize(refNum);
-            init = false;
+        if (part.init) {
+            part.kmerLen = static_cast<unsigned>(uniqSeq.length());
+            part.refNum = refNum;
+            part.sig.resize(refNum);
+            part.ref.resize(refNum);
+            part.init = false;
         }
-        sketchRef[refId].assign(line, field[2].first, field[2].second);
-        refSigCount[refId].emplace(uniqSeq, 0);
-        sketchHash.emplace(std::move(uniqSeq), refId);
+        if (refId >= part.sig.size()) { part.sig.resize(refId + 1); part.ref.resize(refId + 1); }
+        part.ref[refId].assign(line, field[2].first, field[2].second);
+        if (withPositions) {
+            if (part.pos.size() < part.sig.size()) part.pos.resize(part.sig.size());
+            part.pos[refId].push_back({hs(line.substr(field[4].first, field[4].second)), p});
+        }
+        if (withCarriers && n == 7 && line[field[6].first] != '-') {
+            std::vector<unsigned> c;
+            const char* q = line.c_str() + field[6].first;
+            const char* e = q + field[6].second;
+            while (q < e) {
+                char* r = nullptr;
+                unsigned long v = std::strtoul(q, &r, 10);
+                if (r == q) break;
+                c.push_back(static_cast<unsigned>(v));
+                q = (r < e && *r == ',') ? r + 1 : r;
+            }
+            if (!c.empty()) part.carriers.emplace(uniqSeq, std::move(c));
+        }
+        part.sig[refId].emplace(uniqSeq, 0);
+        part.hash.emplace(std::move(uniqSeq), refId);
     }
-    sketchFile.close();
+}
+
+/**
+ * Load the uniqsketch index into a hash table.
+ *
+ * The file is parsed in byte ranges side by side, each into maps of its own, and
+ * the parts are joined in file order by moving their nodes, so a k-mer with two
+ * lines resolves to the first, as one pass had it, and a reference's name is its
+ * last line's. Filling the maps is what the load costs (two string keys per line;
+ * the 1.7 GB level-3 sketch of the 5 493-genome index, 8 M lines, took 12 s in one
+ * thread), and the join moves nodes without copying the strings.
+ *
+ * @param fPath  Path to the uniqsketch file.
+ * @param sketchHash  Hash table for the uniqsketch.
+ * @param sketchRef  Vector mapping refId to refName.
+ * @param refSigCount  Per-reference signature count map.
+ * @param carriers  If given, filled with the carriers of each signature that has
+ *                  them (the seventh column of a level sketch), keyed by signature.
+ * @param threads  Byte ranges parsed side by side (1: one pass).
+ * @param positions  If given, filled per reference with each signature's contig
+ *                   hash and position (for countSignatureLoci, which otherwise
+ *                   reads the file again).
+ * @param minChunk  Smallest byte range worth a thread of its own (tests lower it).
+ */
+void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sketchHash,
+                std::vector<std::string>& sketchRef,
+                std::vector<SketchHash>& refSigCount,
+                std::unordered_map<std::string, std::vector<unsigned>>* carriers = nullptr,
+                unsigned threads = 1, SignaturePositions* positions = nullptr,
+                uint64_t minChunk = 32u << 20) {
+    std::ifstream probe(fPath, std::ios::binary | std::ios::ate);
+    const uint64_t size = probe ? static_cast<uint64_t>(probe.tellg()) : 0;
+    probe.close();
+    if (size == 0) return;
+    const unsigned chunks = static_cast<unsigned>(std::max<uint64_t>(1, std::min<uint64_t>(std::max(threads, 1u), size / minChunk + 1)));
+    std::vector<SketchPart> parts(chunks);
+    #pragma omp parallel for schedule(dynamic) num_threads(static_cast<int>(chunks))
+    for (unsigned c = 0; c < chunks; c++)
+        parseSketchRange(fPath, size * c / chunks, size * (c + 1) / chunks, carriers != nullptr, positions != nullptr, parts[c]);
+    for (const SketchPart& part : parts) {
+        if (!part.bad) continue;
+        std::cerr << "Error in parsing uniqsketch entry:\n" << part.badLine << "\n";
+        exit(EXIT_FAILURE);
+    }
+    // The join: the first part's maps are taken whole, the others' nodes moved in
+    // (a key already present stays behind and is dropped). A sketch is written one
+    // reference after another, so a reference's map is in one part, or two at a
+    // range boundary, and the per-reference joins are swaps; the seq -> ref map
+    // spans the parts and is sized once before the nodes come, so they are not
+    // rehashed again as it grows.
+    auto join = [](auto& dst, auto& src, size_t total) {
+        if (src.empty()) { src = {}; return; }
+        if (dst.empty()) dst.swap(src);
+        else { if (total) dst.reserve(total); dst.merge(src); }
+        src = {};
+    };
+    size_t totalSigs = 0, totalCarriers = 0;
+    for (const SketchPart& part : parts) { totalSigs += part.hash.size(); totalCarriers += part.carriers.size(); }
+    bool first = true;
+    for (SketchPart& part : parts) {
+        if (part.init) continue;             // no line started in this range
+        if (first) { cfg.kmerLen = part.kmerLen; first = false; }
+        if (sketchRef.size() < part.ref.size()) {
+            sketchRef.resize(part.ref.size());
+            refSigCount.resize(part.ref.size());
+            if (positions) positions->resize(part.ref.size());
+        }
+        for (size_t r = 0; r < part.ref.size(); r++) {
+            if (!part.ref[r].empty()) sketchRef[r] = std::move(part.ref[r]);
+            join(refSigCount[r], part.sig[r], 0);
+            if (positions && r < part.pos.size() && !part.pos[r].empty()) {
+                auto& dst = (*positions)[r];
+                if (dst.empty()) dst.swap(part.pos[r]);
+                else dst.insert(dst.end(), part.pos[r].begin(), part.pos[r].end());
+                part.pos[r] = {};
+            }
+        }
+        join(sketchHash, part.hash, totalSigs);
+        if (carriers) join(*carriers, part.carriers, totalCarriers);
+    }
 }
 
 /**
@@ -222,6 +347,55 @@ static const unsigned NO_SLOT = UINT32_MAX;
  * vector's storage, and took 1.7 M allocations and three seconds to build for
  * that index; this builds in a sort.
  */
+/**
+ * std::sort of distinct (hash, position) keys, in parallel: the keys are first
+ * scattered into buckets by the hash's top bits (hashes are uniform, so the buckets
+ * are even), then each bucket is sorted on its own thread. Distinct keys have one
+ * sorted order, so the result is std::sort's whatever the thread count. On the
+ * 5 493-genome tree index the 35 M entries took 3.2 s in one thread and 3.2 s as
+ * sorted pieces merged pairwise, the top merges being serial.
+ */
+inline void parallelSort(std::vector<std::pair<uint64_t, uint32_t>>& v) {
+    size_t threads = 1;
+#ifdef _OPENMP
+    threads = static_cast<size_t>(std::max(1, omp_get_max_threads()));
+#endif
+    if (threads <= 1 || v.size() < (1u << 18)) { std::sort(v.begin(), v.end()); return; }
+    const unsigned bits = 10;                                 // 1 024 buckets
+    const size_t buckets = size_t(1) << bits;
+    const unsigned shift = 64 - bits;
+    // Histogram per thread over a static split of the input, then prefix sums give
+    // every (thread, bucket) its range in the output.
+    const size_t parts = threads;
+    std::vector<size_t> count(parts * buckets, 0);
+    auto range = [&](size_t t) { return std::make_pair(v.size() * t / parts, v.size() * (t + 1) / parts); };
+    #pragma omp parallel for schedule(static) num_threads(static_cast<int>(parts))
+    for (size_t t = 0; t < parts; t++) {
+        auto [b, e] = range(t);
+        size_t* c = &count[t * buckets];
+        for (size_t i = b; i < e; i++) c[v[i].first >> shift]++;
+    }
+    std::vector<size_t> start(buckets + 1, 0);
+    for (size_t k = 0; k < buckets; k++) {
+        size_t total = 0;
+        for (size_t t = 0; t < parts; t++) { const size_t c = count[t * buckets + k]; count[t * buckets + k] = total; total += c; }
+        start[k + 1] = start[k] + total;
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> out(v.size());
+    #pragma omp parallel for schedule(static) num_threads(static_cast<int>(parts))
+    for (size_t t = 0; t < parts; t++) {
+        auto [b, e] = range(t);
+        size_t* c = &count[t * buckets];
+        for (size_t i = b; i < e; i++) {
+            const size_t k = v[i].first >> shift;
+            out[start[k] + c[k]++] = v[i];
+        }
+    }
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t k = 0; k < buckets; k++) std::sort(out.begin() + start[k], out.begin() + start[k + 1]);
+    v.swap(out);
+}
+
 struct QueryIndex {
     struct Slot {
         uint64_t hash;
@@ -244,6 +418,7 @@ struct QueryIndex {
     void add(const std::string& seq, unsigned target, unsigned slot) {
         entries.push_back({&seq, target, slot});
     }
+    void add(const QueryEntry& e) { entries.push_back(e); }
 
     /**
      * Sort the entries and build the table. Call once, after the last add().
@@ -256,7 +431,7 @@ struct QueryIndex {
         for (size_t i = 0; i < entries.size(); i++)
             keyed[i] = {NTC64(entries[i].seq->c_str(), static_cast<unsigned>(entries[i].seq->size())),
                         static_cast<uint32_t>(i)};
-        std::sort(keyed.begin(), keyed.end());   // by hash, then by add() order
+        parallelSort(keyed);                     // by hash, then by add() order
 
         std::vector<QueryEntry> sorted(entries.size());
         for (size_t i = 0; i < keyed.size(); i++) sorted[i] = entries[keyed[i].second];

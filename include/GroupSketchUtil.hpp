@@ -370,45 +370,78 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
  * with fewer than the eight fields are skipped, as the stream-based parser this
  * replaced skipped them (an istringstream per line cost 0.4 s on 200 k lines).
  */
-inline std::vector<GroupSignature> loadGroupSketch(const std::string& path) {
+inline std::vector<GroupSignature> loadGroupSketch(const std::string& path, unsigned threads = 1,
+                                                   uint64_t minChunk = 64u << 20) {
     std::vector<GroupSignature> out;
-    std::ifstream in(path);
-    if (!in) return out;
-    std::string line;
-    std::vector<std::pair<size_t, size_t>> f(8);
-    while (std::getline(in, line)) {
-        size_t n = 0, i = 0;
-        while (n < 8) {
-            while (i < line.size() && (line[i] == '\t' || line[i] == ' ')) ++i;
-            if (i >= line.size()) break;
-            size_t b = i;
-            while (i < line.size() && line[i] != '\t' && line[i] != ' ') ++i;
-            f[n++] = {b, i - b};
-        }
-        if (n < 8) continue;
-        GroupSignature s;
-        s.seq.assign(line, f[0].first, f[0].second);
-        s.refId = static_cast<unsigned>(std::strtoul(line.c_str() + f[1].first, nullptr, 10));
-        s.refName.assign(line, f[2].first, f[2].second);
-        s.contig.assign(line, f[4].first, f[4].second);
-        s.pos = static_cast<unsigned>(std::strtoul(line.c_str() + f[5].first, nullptr, 10));
-        if (line[f[6].first] != '-') {
-            const char* p = line.c_str() + f[6].first;
-            const char* end = p + f[6].second;
-            while (p < end) {
-                char* q = nullptr;
-                unsigned long v = std::strtoul(p, &q, 10);
-                if (q == p) break;
-                s.carriers.push_back(static_cast<unsigned>(v));
-                p = (q < end && *q == ',') ? q + 1 : q;
+    std::ifstream probe(path, std::ios::binary | std::ios::ate);
+    if (!probe) return out;
+    const uint64_t size = static_cast<uint64_t>(probe.tellg());
+    probe.close();
+    if (size == 0) return out;
+    // Parsed in byte ranges side by side, each range taking the lines that start in
+    // it, and the pieces joined in file order, so the result is the one a single
+    // pass gives (the order numbers the signatures' targets). On the 5 493-genome
+    // index the file is 2.7 GB and 5.6 M lines, 11 s in one pass. `minChunk` is the
+    // smallest range worth a thread (tests lower it).
+    const unsigned chunks = static_cast<unsigned>(std::max<uint64_t>(1, std::min<uint64_t>(std::max(threads, 1u), size / minChunk + 1)));
+    std::vector<std::vector<GroupSignature>> part(chunks);
+    #pragma omp parallel for schedule(dynamic) num_threads(static_cast<int>(chunks))
+    for (unsigned c = 0; c < chunks; c++) {
+        const uint64_t begin = size * c / chunks, end = size * (c + 1) / chunks;
+        std::ifstream in(path, std::ios::binary);
+        uint64_t pos = begin;
+        if (begin > 0) {
+            // A line that starts before the range belongs to the previous one.
+            in.seekg(static_cast<std::streamoff>(begin - 1));
+            if (in.get() != '\n') {
+                std::string skip;
+                std::getline(in, skip);
+                pos += skip.size() + 1;
             }
         }
-        s.node.assign(line, f[7].first, f[7].second);
-        out.push_back(std::move(s));
+        std::string line;
+        std::vector<std::pair<size_t, size_t>> f(8);
+        while (pos < end && std::getline(in, line)) {
+            pos += line.size() + 1;
+            size_t n = 0, i = 0;
+            while (n < 8) {
+                while (i < line.size() && (line[i] == '\t' || line[i] == ' ')) ++i;
+                if (i >= line.size()) break;
+                size_t b = i;
+                while (i < line.size() && line[i] != '\t' && line[i] != ' ') ++i;
+                f[n++] = {b, i - b};
+            }
+            if (n < 8) continue;
+            GroupSignature g;
+            g.seq.assign(line, f[0].first, f[0].second);
+            g.refId = static_cast<unsigned>(std::strtoul(line.c_str() + f[1].first, nullptr, 10));
+            g.refName.assign(line, f[2].first, f[2].second);
+            g.contig.assign(line, f[4].first, f[4].second);
+            g.pos = static_cast<unsigned>(std::strtoul(line.c_str() + f[5].first, nullptr, 10));
+            if (line[f[6].first] != '-') {
+                const char* p = line.c_str() + f[6].first;
+                const char* e = p + f[6].second;
+                while (p < e) {
+                    char* q = nullptr;
+                    unsigned long v = std::strtoul(p, &q, 10);
+                    if (q == p) break;
+                    g.carriers.push_back(static_cast<unsigned>(v));
+                    p = (q < e && *q == ',') ? q + 1 : q;
+                }
+            }
+            g.node.assign(line, f[7].first, f[7].second);
+            part[c].push_back(std::move(g));
+        }
+    }
+    size_t total = 0;
+    for (const auto& v : part) total += v.size();
+    out.reserve(total);
+    for (auto& v : part) {
+        for (auto& g : v) out.push_back(std::move(g));
+        v = {};
     }
     return out;
 }
-
 /**
  * What each leaf of a tree index can be reported through, and which leaves no
  * query can report at all.

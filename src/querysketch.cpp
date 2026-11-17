@@ -1,10 +1,12 @@
 #include <getopt.h>
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <numeric>
 #include <set>
+#include <thread>
 #include <unordered_map>
 
 #include "ntHashIterator.hpp"
@@ -221,14 +223,34 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     // of the config, since loadSketch records k in it).
     std::vector<SketchHash> levelHash(levelSketches.size());
     // Carriers of the coarse-level signatures (NodeCarrierUtil.hpp): the seventh
-    // column of a level sketch, absent from an index built without node carriers.
+    // column of a level sketch, absent from an index built without node carriers,
+    // read in the same pass as the signatures.
     std::vector<std::unordered_map<std::string, std::vector<unsigned>>> levelCarriers(levelSketches.size());
-    #pragma omp parallel for schedule(dynamic) num_threads(static_cast<int>(std::min<size_t>(levelSketches.size(), cfg.threads)))
-    for (size_t li = 0; li < levelSketches.size(); li++) {
-        QuerySketchConfig local = cfg;
-        levels[li].level = levelSketches[li].first;
-        loadSketch(local, levelSketches[li].second, levelHash[li], levels[li].ref, levels[li].sig);
-        if (li + 1 < levelSketches.size()) levelCarriers[li] = loadLevelCarriers(levelSketches[li].second);
+    // The leaf signatures' positions, for the carrier exclusion test's loci
+    // (countSignatureLoci), taken as the leaf sketch is parsed.
+    SignaturePositions leafPositions;
+    {
+        // One thread per file, each parsing its file in as many byte ranges as the
+        // remaining threads allow (loadSketch). The files are on std::threads
+        // rather than an OpenMP loop so that the ranges' OpenMP loop inside each
+        // is a region of its own, not a nested one, which OpenMP serialises
+        // unless told otherwise.
+        const unsigned outer = static_cast<unsigned>(std::min<size_t>(levelSketches.size(), std::max(1u, cfg.threads)));
+        const unsigned inner = std::max(1u, cfg.threads / outer);
+        std::vector<std::thread> loaders;
+        std::atomic<size_t> next{0};
+        for (unsigned t = 0; t < outer; t++) {
+            loaders.emplace_back([&] {
+                for (size_t li = next++; li < levelSketches.size(); li = next++) {
+                    QuerySketchConfig local = cfg;
+                    const bool leaf = li + 1 == levelSketches.size();
+                    levels[li].level = levelSketches[li].first;
+                    loadSketch(local, levelSketches[li].second, levelHash[li], levels[li].ref, levels[li].sig,
+                               leaf ? nullptr : &levelCarriers[li], inner, leaf ? &leafPositions : nullptr);
+                }
+            });
+        }
+        for (std::thread& t : loaders) t.join();
     }
     {
         // k, as loadSketch would have recorded it: the length of the first signature.
@@ -249,55 +271,101 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         std::vector<unsigned> carriers;
     };
     std::vector<CarriedSig> carriedSigs;
+    std::vector<std::thread> freeing;
     for (size_t li = 0; li < levelSketches.size(); li++) {
         Level& L = levels[li];
         SketchHash& hash = levelHash[li];
         L.targetBase = index.numTargets;
         index.numTargets += static_cast<unsigned>(L.ref.size());
         L.slotBegin = static_cast<unsigned>(slotCounter.size());
-        auto& carriers = levelCarriers[li];
-        auto carriedBy = [&](const std::string& seq, unsigned ref, const std::string* key) {
-            auto c = carriers.find(seq);
-            if (c == carriers.end()) return false;
-            carriedSigs.push_back({li, ref, key, std::move(c->second)});
-            return true;
-        };
+        const auto& carriers = levelCarriers[li];
         // Each signature's slot is its counter in its reference's map, whose key
         // also gives the index its sequence. When every line of the sketch is a
-        // distinct k-mer (always, unless a file was edited by hand) the maps hold
-        // exactly the signatures and are walked directly; otherwise the seq -> ref
-        // map decides, as loadSketch's first-line-wins rule has it, and a
-        // signature a map does not hold still counts for its reference.
+        // distinct k-mer (the leaf sketch) the maps hold exactly the signatures and
+        // are walked directly; otherwise the seq -> ref map decides, as
+        // loadSketch's first-line-wins rule has it, and a signature a map does not
+        // hold still counts for its reference. A signature with carriers is not an
+        // entry of its node but its own target (carriedSigs).
         size_t mapped = 0;
         for (const SketchHash& m : L.sig) mapped += m.size();
         if (mapped == hash.size()) {
+            // The references are independent here: each one's entries, counters
+            // and carried signatures are gathered in parallel and appended in
+            // reference order, so targets, slots and the entries' order are what
+            // one pass in that order would give (the walk over 29 M map nodes
+            // and the carrier lookups took 22 s of the 5 493-genome query).
+            struct RefEntries {
+                std::vector<QueryEntry> entries;
+                std::vector<unsigned*> counters;
+                std::vector<CarriedSig> carried;
+            };
+            std::vector<RefEntries> per(L.ref.size());
+            #pragma omp parallel for schedule(dynamic, 8) num_threads(static_cast<int>(cfg.threads))
             for (unsigned i = 0; i < L.ref.size(); i++) {
+                RefEntries& r = per[i];
                 for (auto& kv : L.sig[i]) {
-                    if (carriedBy(kv.first, i, &kv.first)) continue;
-                    index.add(kv.first, L.targetBase + i, static_cast<unsigned>(slotCounter.size()));
-                    slotCounter.push_back(&kv.second);
-                    slotRef.push_back(i);
+                    auto c = carriers.find(kv.first);
+                    if (c != carriers.end()) { r.carried.push_back({li, i, &kv.first, c->second}); continue; }
+                    r.entries.push_back({&kv.first, L.targetBase + i, static_cast<unsigned>(r.counters.size())});
+                    r.counters.push_back(&kv.second);
                 }
             }
+            for (unsigned i = 0; i < L.ref.size(); i++) {
+                RefEntries& r = per[i];
+                const unsigned offset = static_cast<unsigned>(slotCounter.size());
+                for (QueryEntry& e : r.entries) { e.slot += offset; index.add(e); }
+                slotCounter.insert(slotCounter.end(), r.counters.begin(), r.counters.end());
+                slotRef.insert(slotRef.end(), r.counters.size(), i);
+                carriedSigs.insert(carriedSigs.end(), r.carried.begin(), r.carried.end());
+                r = RefEntries();
+            }
         } else {
-            for (const auto& [seq, refId] : hash) {
-                auto it = L.sig[refId].find(seq);
-                if (it != L.sig[refId].end()) {
-                    if (carriedBy(it->first, refId, &it->first)) continue;
-                    index.add(it->first, L.targetBase + refId, static_cast<unsigned>(slotCounter.size()));
-                    slotCounter.push_back(&it->second);
-                    slotRef.push_back(refId);
+            // This is the path the level sketches of an index with node carriers
+            // take: a carried k-mer can fill two sibling nodes' quotas and then has
+            // two lines (54 k to 159 k per level on 5 493 genomes). The order is the
+            // map's; the two lookups per signature, which took 22 s of that query
+            // in one thread, are done in parallel and their results applied in
+            // that order.
+            struct Lookup { const std::string* seq; unsigned ref; const std::string* key; unsigned* counter; const std::vector<unsigned>* carried; };
+            std::vector<Lookup> lookups;
+            lookups.reserve(hash.size());
+            for (const auto& [seq, refId] : hash) lookups.push_back({&seq, refId, nullptr, nullptr, nullptr});
+            #pragma omp parallel for schedule(static) num_threads(static_cast<int>(cfg.threads))
+            for (size_t j = 0; j < lookups.size(); j++) {
+                Lookup& u = lookups[j];
+                SketchHash& m = L.sig[u.ref];
+                auto it = m.find(*u.seq);              // a read of the map; the maps are not modified here
+                if (it == m.end()) continue;
+                u.key = &it->first;
+                u.counter = &it->second;
+                auto c = carriers.find(it->first);
+                if (c != carriers.end()) u.carried = &c->second;
+            }
+            for (const Lookup& u : lookups) {
+                if (!u.key) {
+                    L.extra.push_back(*u.seq);
+                    index.add(L.extra.back(), L.targetBase + u.ref, NO_SLOT);
+                } else if (u.carried) {
+                    carriedSigs.push_back({li, u.ref, u.key, *u.carried});
                 } else {
-                    L.extra.push_back(seq);
-                    index.add(L.extra.back(), L.targetBase + refId, NO_SLOT);
+                    index.add(*u.key, L.targetBase + u.ref, static_cast<unsigned>(slotCounter.size()));
+                    slotCounter.push_back(u.counter);
+                    slotRef.push_back(u.ref);
                 }
             }
         }
         L.slotEnd = static_cast<unsigned>(slotCounter.size());
-        carriers = {};
-        // The index and the level's maps hold the sequences now; the leaf level's
-        // map stays a little longer, to screen the group signatures against.
-        if (li + 1 < levelSketches.size()) hash = SketchHash();
+        // The index and the level's maps hold the sequences now. Freeing a level's
+        // seq -> ref map and its carriers, 22 M nodes and as many strings over the
+        // four coarse levels of the 5 493-genome index, took 4.7 s of one thread;
+        // it is done beside the work that follows and waited for before the reads.
+        // The leaf level's map stays a little longer, to screen the group
+        // signatures against.
+        if (li + 1 < levelSketches.size()) {
+            auto* doomed = new std::pair<SketchHash, std::unordered_map<std::string, std::vector<unsigned>>>(
+                std::move(hash), std::move(levelCarriers[li]));
+            freeing.emplace_back([doomed] { delete doomed; });
+        }
     }
     index.numSlots = static_cast<unsigned>(slotCounter.size());
     const SketchHash& leafHash = levelHash.back();
@@ -311,7 +379,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     std::vector<char> groupDropped;
     unsigned groupBase = index.numTargets;
     if (!cfg.noGroupSignatures) {
-        groupSigs = loadGroupSketch(groupSketchPath(treeDir));
+        groupSigs = loadGroupSketch(groupSketchPath(treeDir), static_cast<unsigned>(cfg.threads));
         if (groupSigs.empty()) {
             std::cerr << "Tree query: index has no within-group signatures (built with "
                          "--no-group-signatures or by an older uniqsketch); leaf level uses "
@@ -329,6 +397,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     index.numTargets += static_cast<unsigned>(carriedSigs.size());
     levelHash.clear();
     index.finalize();
+    for (std::thread& t : freeing) t.join();
 
     auto t1 = now();
 
@@ -497,7 +566,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
             for (unsigned c : s.carriers) if (c < nLeaves && mayBe[c]) { ambiguous = true; break; }
             if (!ambiguous) seen[s.refId] = 1;
         }
-        const std::vector<unsigned> loci = countSignatureLoci(cfg.ref, nLeaves, groupPos, cfg.locusGap);
+        const std::vector<unsigned> loci = countSignatureLoci(std::move(leafPositions), nLeaves, groupPos, cfg.locusGap);
         groupPos = {};
         size_t leavesLeafSeen = 0, leavesSeen = 0;
         for (unsigned c = 0; c < nLeaves; c++) { leavesLeafSeen += leafSeen[c]; leavesSeen += seen[c]; }
@@ -537,23 +606,27 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         size_t carriersSeen = 0, carriersExcluded = 0, carriersPossible = 0, carriersUntestable = 0,
                carriersUntestablePossible = 0;
         std::set<std::pair<size_t, unsigned>> nodesUsing;
+        // Per carrier of the node at hand: the signatures it carries, the hits on
+        // them, and its status; dense over the leaves and cleared between nodes
+        // (a map keyed by carrier, with 2 M carried signatures of up to 50
+        // carriers each, took 3 s of the 5 493-genome query).
+        std::vector<unsigned> carriedOf(nLeaves, 0), hitsOf(nLeaves, 0);
+        std::vector<Status> status(nLeaves, ABSENT);
+        std::vector<unsigned> touched;
         for (const auto& [node, sigs] : byNode) {
             Level& L = levels[node.first];
             const std::string& nodeRep = L.ref[node.second];
-            std::unordered_map<unsigned, std::pair<unsigned, unsigned>> perCarrier;   // carrier -> (carried, hits)
             bool anyHit = false;
             for (unsigned j : sigs) {
                 const unsigned h = tally.count[carriedBase + j];
                 anyHit |= h > 0;
                 for (unsigned c : carriedSigs[j].carriers) {
                     if (c >= nLeaves) continue;
-                    auto& e = perCarrier[c];
-                    e.first++;
-                    e.second += h;
+                    if (carriedOf[c]++ == 0) touched.push_back(c);
+                    hitsOf[c] += h;
                 }
             }
-            std::unordered_map<unsigned, Status> status;
-            for (const auto& [c, e] : perCarrier) {
+            for (unsigned c : touched) {
                 Status st;
                 const Lineage ln = seen[c] ? ATTESTED : lineage(c, nodeRep);
                 if (ln == ATTESTED) { st = PRESENT; carriersSeen += anyHit; }
@@ -563,7 +636,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                     ++carriersUntestable;
                     carriersUntestablePossible += st == POSSIBLE;
                 } else {
-                    const double perSig = static_cast<double>(e.second) / static_cast<double>(e.first);
+                    const double perSig = static_cast<double>(hitsOf[c]) / static_cast<double>(carriedOf[c]);
                     const double expectedReads = perSig * static_cast<double>(loci[c]);
                     if (expectedReads >= cfg.carrierExcludeReads) { st = ABSENT; ++carriersExcluded; }
                     else { st = POSSIBLE; ++carriersPossible; }
@@ -596,6 +669,8 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 if (it != L.sig[s.ref].end()) it->second += tally.count[t];
                 nodesUsing.insert(node);
             }
+            for (unsigned c : touched) { carriedOf[c] = 0; hitsOf[c] = 0; status[c] = ABSENT; }
+            touched.clear();
         }
         std::cerr << "Tree query: carried node signatures: " << carriedSigs.size() << " in the index, "
                   << used << " in use (" << hit << " with hits, for " << nodesUsing.size() << " node(s)), "
@@ -1062,7 +1137,7 @@ int main(int argc, char* const argv[]) {
         std::vector<std::string> sketchRef;
         std::vector<SketchHash> refSigCount;
 
-        loadSketch(cfg, cfg.ref, sketchHash, sketchRef, refSigCount);
+        loadSketch(cfg, cfg.ref, sketchHash, sketchRef, refSigCount, nullptr, cfg.threads);
 
         std::cout << "k: " << cfg.kmerLen << "\n";
         std::cout << "Number of references: " << sketchRef.size() << "\n";

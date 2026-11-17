@@ -12,6 +12,7 @@
 #include "SequenceUtil.hpp"
 #include "TestUtil.hpp"
 #include "QuerySketchUtil.hpp"
+#include "GroupSketchUtil.hpp"
 
 void testQuerySampleBatch(QuerySketchConfig cfg, const std::vector<std::string>& sampleFiles) {
     std::cerr << "START: Test querySample... \t";
@@ -194,6 +195,104 @@ void testFamilyBreadth(QuerySketchConfig cfg) {
     std::cerr << "PASSED: Test family breadth floor\n";
 }
 
+static std::string randDNA(size_t n, uint64_t seed) {
+    std::string s(n, 'A');
+    uint64_t x = seed * 6364136223846793005ull + 1442695040888963407ull;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        s[i] = "ACGT"[x & 3];
+    }
+    return s;
+}
+
+void testChunkedLoad(QuerySketchConfig cfg) {
+    std::cerr << "START: Test chunked sketch load... \t";
+
+    /*
+    A sketch of 7 references and 3 000 lines, written one reference after another
+    as uniqsketch writes it, with a carriers column on every third line and two
+    sequences that occur twice (the second line under another reference, as a
+    carried k-mer that filled two sibling nodes does), loaded in one pass and in
+    seven byte ranges on four threads: the maps, names, carriers and positions
+    must come out the same, the duplicates resolved to their first line. Then the
+    same for the within-group sketch loader.
+    */
+    const unsigned k = 21;
+    std::vector<std::string> seqs;
+    for (unsigned i = 0; i < 3000; i++) seqs.push_back(randDNA(k, 1000 + i));
+    seqs[2500] = seqs[10];                 // duplicates: ref 5 repeats ref 0's k-mer, ref 6 ref 1's
+    seqs[2900] = seqs[500];
+    {
+        std::ofstream out("chunked_sketch.tsv");
+        for (unsigned i = 0; i < 3000; i++) {
+            const unsigned ref = i / 430;      // refs 0..6
+            out << seqs[i] << "\t" << ref << "\tref" << ref << "\t7\tcontig" << (i % 3) << "\t" << (i * 37 % 100000);
+            if (i % 3 == 0) out << "\t" << (ref + 1) % 7 << "," << (ref + 2) % 7; else out << "\t-";
+            out << "\n";
+        }
+    }
+    auto load = [&](unsigned threads, uint64_t minChunk, SketchHash& hash, std::vector<std::string>& ref,
+                    std::vector<SketchHash>& sig, std::unordered_map<std::string, std::vector<unsigned>>& car,
+                    SignaturePositions& pos) {
+        QuerySketchConfig c = cfg;
+        loadSketch(c, "chunked_sketch.tsv", hash, ref, sig, &car, threads, &pos, minChunk);
+        assert(c.kmerLen == k);
+    };
+    SketchHash h1, h7;
+    std::vector<std::string> r1, r7;
+    std::vector<SketchHash> s1, s7;
+    std::unordered_map<std::string, std::vector<unsigned>> c1, c7;
+    SignaturePositions p1, p7;
+    load(1, 32u << 20, h1, r1, s1, c1, p1);
+    load(4, 1, h7, r7, s7, c7, p7);          // every range at least one byte: as many as threads
+    assert(h1.size() == 2998 && h1 == h7);
+    assert(h1.at(seqs[10]) == 0 && h1.at(seqs[500]) == 1);   // first line wins
+    assert(r1.size() == 7 && r1 == r7 && r1[6] == "ref6");
+    assert(s1.size() == 7 && s1 == s7);
+    size_t mapped = 0;
+    for (const SketchHash& m : s1) mapped += m.size();
+    assert(mapped == 3000);                  // each reference's map holds its own lines
+    assert(c1.size() == 1000 && c1 == c7 && c1.at(seqs[3]) == std::vector<unsigned>({1, 2}));
+    assert(p1.size() == 7 && p7.size() == 7);
+    for (size_t r = 0; r < 7; r++) {
+        auto a = p1[r], b = p7[r];
+        std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+        assert(a.size() == (r < 6 ? 430 : 420) && a == b);
+    }
+    std::remove("chunked_sketch.tsv");
+
+    {
+        std::ofstream out("chunked_group.tsv");
+        for (unsigned i = 0; i < 2000; i++)
+            out << seqs[i] << "\t" << i / 300 << "\tref" << i / 300 << "\t7\tcontig" << (i % 2) << "\t" << i * 11
+                << "\t" << (i % 4 == 0 ? "-" : std::to_string(i % 7)) << "\tnode" << i / 600 << "\n";
+    }
+    std::vector<GroupSignature> g1 = loadGroupSketch("chunked_group.tsv"), g5 = loadGroupSketch("chunked_group.tsv", 5, 1);
+    assert(g1.size() == 2000 && g5.size() == 2000);
+    for (size_t i = 0; i < g1.size(); i++) {
+        assert(g1[i].seq == g5[i].seq && g1[i].refId == g5[i].refId && g1[i].refName == g5[i].refName &&
+               g1[i].contig == g5[i].contig && g1[i].pos == g5[i].pos && g1[i].carriers == g5[i].carriers &&
+               g1[i].node == g5[i].node);
+        assert(g1[i].seq == seqs[i] && g1[i].pos == i * 11);
+    }
+    std::remove("chunked_group.tsv");
+
+    // The index's sort: distinct (hash, position) keys come out as std::sort orders
+    // them, buckets or not.
+    std::vector<std::pair<uint64_t, uint32_t>> keys(400000);
+    uint64_t x = 88172645463325252ull;
+    for (uint32_t i = 0; i < keys.size(); i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        keys[i] = {x >> (i % 5 == 0 ? 40 : 0), i};   // a few hashes repeat (small values), positions break ties
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> expected = keys;
+    std::sort(expected.begin(), expected.end());
+    parallelSort(keys);
+    assert(keys == expected);
+
+    std::cerr << "PASSED: Test chunked sketch load\n";
+}
+
 int main() {
     QuerySketchConfig cfg;
     cfg.ref = "expected_out_uniqsketch.txt";
@@ -214,6 +313,7 @@ int main() {
     testGenerateQueryResult(cfg);
     testAbundanceIsHitsPerSignature(cfg);
     testFamilyBreadth(cfg);
+    testChunkedLoad(cfg);
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;
