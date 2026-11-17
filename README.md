@@ -495,7 +495,8 @@ Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
       --tree-prune=N    min coarse-level hits to keep a sub-tree in play (with --tree) [1]
       --tree-breadth=F  min breadth of a call: distinct signatures hit, as a fraction of
                         what its hit count would spread over if the genome were present;
-                        below it the hits sit in one locus and the call is withheld (with --tree) [0.5]
+                        below it the hits sit in one locus and the call is withheld (with --tree;
+                        family rows judged against the signatures a member carries) [0.5; 0=off]
       --no-group-signatures  leaf level uses globally unique signatures only (with --tree)
       --help            display this help and exit
       --version         version information and exit
@@ -704,11 +705,24 @@ hit its 80 signatures there 2 732 times, and scored 0.035. Withheld calls are li
 on stderr with their numbers; `--tree-breadth=0` reports them. A read-limited call
 is not affected: at λ ≪ 1 the expectation is the count itself and distinct reads
 hit distinct signatures, so the ratio is about 1 however few reads there are.
-Family rows are not subject to the floor: a node's signatures are its
-representative's, a member carries only part of them, and a present member looks
-no different from one locus by this measure. Family rows are protected against
-mobile sequence by the build instead (see the repeat exclusion under
-[uniqsketch](#uniqsketch-1)).
+A family row is held to the same floor, judged against the signatures a member
+carries rather than the node's total: a node's signatures are its representative's,
+a member carries part of them (`ancestor_signatures.tsv` records how many), and a
+present member can hit only that part, so the expectation is computed for the
+member the row fits best (the one carrying the fewest). This needs the
+representative to be the member the others carry (the default since 2.0, see "Which
+member stands for a cluster" under [uniqsketch](#uniqsketch-1)): with the largest
+member as representative a member carried a median 61 % of its node's signatures on
+5 493 *E. coli* and less than a tenth in one member–node pair of six, and 11 of the
+sweep's 152 true family rows fell below 0.5 by this measure, so an index built with
+`--node-representative=largest` keeps its family rows unjudged (stderr says so). In
+the validation sweeps every true family row scored 0.638 or above by this measure
+(pure MG1655's 345-member row 1.107, where the ratio against the node's total is
+0.378), and every row that chromosome reads of ten genomes outside the species
+produced on the 120-, 1 000- and 5 493-genome indexes, 148 rows of shared mobile or
+conserved sequence hitting 2 to 40 of a node's signatures, scored 0.264 or below and
+is withheld. Inside the species, family rows are also protected by the build's repeat
+exclusion (see [uniqsketch](#uniqsketch-1)).
 
 The same test applies to flat queries as `--breadth=F`, also 0.5 by default. What it
 catches there is a reference that is wrong or oddly rendered in a single window: a

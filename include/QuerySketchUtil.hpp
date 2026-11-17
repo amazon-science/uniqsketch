@@ -72,6 +72,13 @@ struct QuerySketchConfig {
     // node's signatures, and at least this many (see generateTreeQueryResult).
     double familyExcess = 0.10;
     size_t familyExcessMin = 50;
+    // treeBreadth applies to family rows too, judged against the signatures a member
+    // carries (see generateTreeQueryResult). Set by the tree query from the index:
+    // true when its node signatures come from central representatives
+    // (build_params.tsv node_representative central) and ancestor_signatures.tsv is
+    // there; an index built with the largest member as representative keeps its
+    // family rows unjudged, as before.
+    bool familyBreadth = false;
     // A carrier of a node's carried signatures (NodeCarrierUtil.hpp) that shows no
     // hit of its own is excluded only when its own signature loci would have
     // collected at least this many reads at the coverage the node's hits imply;
@@ -658,6 +665,35 @@ inline double breadthRatio(size_t count, size_t sigsHit, size_t sigsTotal) {
     return expected > 0.0 ? static_cast<double>(sigsHit) / expected : 1.0;
 }
 
+struct FamilyBreadth { double ratio; size_t carried; };
+
+/**
+ * The breadth of a family call, judged against the signatures a member carries.
+ *
+ * A present member can hit only the node signatures its genome contains, which the
+ * build counts per (member, node, level) in ancestor_signatures.tsv (FamilyCall::
+ * memberCarried). The signature set the call was scored on is the one in use for
+ * this sample (carried signatures set aside for a possible carrier have left it), and
+ * which of them a member carries is not known, so the member's count is capped at
+ * the set's size. The call's ratio is breadthRatio against that cap, for the member
+ * it fits best, which is the member carrying the fewest signatures: the expectation
+ * grows with the signatures the reads could have hit, so fewer signatures make the
+ * same hits look broader. A node none of whose members carries any of its signatures
+ * (or whose members are missing from the table) is judged against its own total.
+ *
+ * @return the ratio and the signature count it was computed against.
+ */
+inline FamilyBreadth familyBreadthRatio(const FamilyCall& f) {
+    size_t fewest = 0;
+    for (const auto& [leaf, carried] : f.memberCarried) {
+        if (carried == 0) continue;
+        const size_t c = std::min(carried, f.sigsTotal);
+        if (fewest == 0 || c < fewest) fewest = c;
+    }
+    if (fewest == 0) fewest = f.sigsTotal;
+    return {breadthRatio(f.count, f.sigsHit, fewest), fewest};
+}
+
 /**
  * Write the per-signature hit log (`log_<out>`): one row per signature that was
  * seen at least once, with the number of distinct reads supporting its reference.
@@ -759,13 +795,31 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
 
     // A family is only worth reporting when it is itself confident and none of the
     // leaves it covers was resolved; otherwise the leaf rows already say more.
-    // The breadth floor does not apply here: a node's signatures are its
-    // representative's node-unique k-mers, which sit in that genome's accessory
-    // sequence, and a member carries only a part of them (36 % for one E. coli
-    // node, a median 13 % across the 5 493-genome tree), so a present member
-    // gives its node a low-breadth pattern that cannot be told from one locus.
-    // The repeat exclusion in the group scan is what guards family rows against
-    // mobile sequence.
+    //
+    // The breadth floor applies to a family row against the signatures a member
+    // carries, not the node's total (familyBreadthRatio): a node's signatures are
+    // its representative's, a member carries part of them, and a present member
+    // hits only that part. While the representative was the largest member a
+    // member carried a median 61 % of its node's signatures on 5 493 E. coli, and
+    // less than 10 % in one (member, node) pair of six, so no floor could be
+    // stated: 11 of the 5 493-genome sweep's 152 true family rows fell below 0.5,
+    // down to 0.059, against the node's total and against the signatures the
+    // best-placed member carries alike (one node, Esc13 present with no signature
+    // of its own and 400 of the node's 2 000 signatures in use, 24 of them hit).
+    // With the representative the other members carry
+    // (chooseNodeRepresentative, build_params.tsv node_representative central)
+    // every true family row of the four sweeps and the five acceptance samples is
+    // at 0.638 or above by this measure (115 rows on 5 493 genomes; pure MG1655's
+    // 345-member level-1 row at 1.107, where the ratio against the node's 3 029
+    // signatures is 0.378 because MG1655 carries 985 of them), and every row that
+    // chromosome reads of ten genomes outside the species make, 148 rows over
+    // three indexes, is at 0.264 or below: shared mobile or conserved sequence
+    // hitting 2 to 40 of a node's 2 000 to 4 000 signatures, 11 to 2 625 reads,
+    // the pattern the floor withholds for strain rows. An index built with the
+    // largest member as representative keeps its family rows unjudged
+    // (familyBreadth is false), since there the floor would cut true rows. The
+    // repeat exclusion in the group scan guards against mobile sequence inside
+    // the species either way.
     //
     // One exception to "a resolved member suppresses the family". A member can
     // hit only the node signatures its genome carries, and the build records
@@ -790,6 +844,21 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     std::vector<const FamilyCall*> reportedFamilies;
     struct BesideResolved { std::string name; size_t sigsHit, sigsTotal, explained; };
     std::vector<BesideResolved> besideResolved;
+    struct WithheldFamily { std::string name; unsigned count; size_t reads, sigsHit, sigsTotal, carried; double ratio; };
+    std::vector<WithheldFamily> withheldFamilies;
+    // The breadth floor, on the calls the rules above would report: withheld means
+    // the floor alone kept the row out.
+    auto admit = [&](const FamilyCall& f) {
+        if (cfg.familyBreadth && cfg.treeBreadth > 0.0) {
+            const FamilyBreadth fb = familyBreadthRatio(f);
+            if (fb.ratio < cfg.treeBreadth) {
+                withheldFamilies.push_back({f.name, f.count, f.reads, f.sigsHit, f.sigsTotal, fb.carried, fb.ratio});
+                return false;
+            }
+        }
+        reportedFamilies.push_back(&f);
+        return true;
+    };
     for (const FamilyCall& f : families) {
         if (f.count < static_cast<unsigned>(cfg.sketchHit) ||
             f.reads <= static_cast<size_t>(cfg.readCutoff)) {
@@ -804,14 +873,12 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
             if (it == f.memberCarried.end()) { carriedKnown = false; break; }
             explained += it->second;
         }
-        if (!anyLeafResolved) { reportedFamilies.push_back(&f); continue; }
+        if (!anyLeafResolved) { admit(f); continue; }
         if (!carriedKnown) continue;
         const size_t margin = std::max<size_t>(cfg.familyExcessMin,
             static_cast<size_t>(std::ceil(cfg.familyExcess * static_cast<double>(f.sigsTotal))));
-        if (f.sigsHit > explained + margin) {
-            reportedFamilies.push_back(&f);
+        if (f.sigsHit > explained + margin && admit(f))
             besideResolved.push_back({f.name, f.sigsHit, f.sigsTotal, explained});
-        }
     }
 
     // One row per group. A node spanning several levels is scored at each of
@@ -932,6 +999,17 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         for (const Withheld& w : withheld) {
             std::cerr << "  " << w.name << "\tcount " << w.count << "\treads " << w.reads
                       << "\tsigs_hit " << w.sigsHit << "/" << w.sigsTotal
+                      << "\tbreadth " << std::setprecision(3) << w.ratio << "\n";
+        }
+    }
+    if (!withheldFamilies.empty()) {
+        std::cerr << "Tree query: " << withheldFamilies.size() << " family-level call(s) withheld, hits confined to a few "
+                     "signatures (breadth below " << cfg.treeBreadth << " against the signatures the best-placed member "
+                     "carries; --tree-breadth=0 to report them):\n";
+        for (const WithheldFamily& w : withheldFamilies) {
+            std::cerr << "  " << w.name << "\tcount " << w.count << "\treads " << w.reads
+                      << "\tsigs_hit " << w.sigsHit << "/" << w.sigsTotal
+                      << "\tmember carries " << w.carried
                       << "\tbreadth " << std::setprecision(3) << w.ratio << "\n";
         }
     }

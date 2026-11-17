@@ -51,7 +51,8 @@ static const char USAGE_MESSAGE[] =
     "      --tree-prune=N\tmin coarse-level hits to keep a sub-tree in play (with --tree) [1]\n"
     "      --tree-breadth=F\tmin breadth of a call: distinct signatures hit, as a fraction of\n"
     "\t\t\twhat its hit count would spread over if the genome were present;\n"
-    "\t\t\tbelow it the hits sit in one locus and the call is withheld (with --tree) [0.5]\n"
+    "\t\t\tbelow it the hits sit in one locus and the call is withheld (with --tree;\n"
+    "\t\t\tfamily rows judged against the signatures a member carries) [0.5; 0=off]\n"
     "      --no-group-signatures\tleaf level uses globally unique signatures only (with --tree)\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\tversion information and exit\n"
@@ -124,6 +125,16 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     if (ancestorCarried.empty())
         std::cerr << "Tree query: index has no ancestor_signatures.tsv; a resolved member always "
                      "suppresses its family row (rebuild with the current uniqsketch to lift that)\n";
+    // The breadth floor on family rows needs node signatures the members carry, which
+    // an index has when its representatives were chosen for that (see
+    // QuerySketchConfig::familyBreadth), and the per-member counts to judge against.
+    cfg.familyBreadth = bp.loaded && bp.centralRepresentative && !ancestorCarried.empty();
+    if (!cfg.familyBreadth && cfg.treeBreadth > 0.0)
+        std::cerr << "Tree query: index "
+                  << (bp.loaded && bp.centralRepresentative ? "has no ancestor_signatures.tsv" :
+                      "was built with the largest member as node representative")
+                  << "; family rows are not held to the breadth floor (rebuild with the current "
+                     "uniqsketch to enable that)\n";
     // The two filter layouts select different signatures from the same pool, so
     // an index is meant to be queried by a binary built with the layout that
     // built it. The sketch is read verbatim either way; this is a warning only.

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <sstream>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <cassert>
@@ -130,6 +131,69 @@ void testAbundanceIsHitsPerSignature(QuerySketchConfig cfg) {
     std::cerr << "PASSED: Test abundance is hits per signature\n";
 }
 
+void testFamilyBreadth(QuerySketchConfig cfg) {
+    std::cerr << "START: Test family breadth floor... \t";
+
+    /*
+    A node of 2 000 signatures hit 2 000 times on 20 distinct ones: one locus. Against
+    the node's total the ratio is 20 / (2000 (1 - e^-1)) = 0.016. Its members carry
+    1 800 and 1 500 of the signatures; against the fewest, 1 500, the ratio is
+    20 / (1500 (1 - e^-1.33)) = 0.018. A present member at 2 000 hits on 1 000 distinct
+    signatures of the 1 500 it carries scores 1 000 / 1 105 = 0.90, where against the
+    node's total it would be 0.79. The floor withholds the first and keeps the second;
+    with familyBreadth off (an index built with the largest member) both are reported;
+    --tree-breadth=0 reports both as well.
+    */
+    FamilyCall locus;
+    locus.name = "family_locus"; locus.level = 1; locus.count = 2000; locus.reads = 300;
+    locus.sigsHit = 20; locus.sigsTotal = 2000; locus.coveredLeaves = {"m1", "m2"};
+    locus.memberCarried = {{"m1", 1800}, {"m2", 1500}};
+    FamilyCall present = locus;
+    present.name = "family_present"; present.sigsHit = 1000; present.coveredLeaves = {"m3", "m4"};
+    present.memberCarried = {{"m3", 1800}, {"m4", 1500}};
+    FamilyBreadth fl = familyBreadthRatio(locus), fp = familyBreadthRatio(present);
+    assert(fl.carried == 1500 && fl.ratio > 0.017 && fl.ratio < 0.019);
+    assert(fp.carried == 1500 && fp.ratio > 0.89 && fp.ratio < 0.91);
+    assert(breadthRatio(present.count, present.sigsHit, present.sigsTotal) < 0.80);
+    // A member's count is capped at the signatures in use; with no member carrying
+    // anything the node's own total is the reference.
+    FamilyCall bare = locus;
+    bare.memberCarried = {{"m1", 0}, {"m2", 5000}};
+    assert(familyBreadthRatio(bare).carried == 2000);
+    bare.memberCarried.clear();
+    assert(familyBreadthRatio(bare).carried == 2000);
+
+    std::vector<unsigned> sketchCount = {0};
+    std::vector<std::string> sketchRef = {"unrelated"};
+    std::vector<SketchHash> refSigCount{{{"A", 0}}};
+    std::vector<std::unordered_set<std::string>> refRead{{}};
+    std::vector<FamilyCall> families{locus, present};
+    auto names = [&](const std::string& path) {
+        std::set<std::string> n;
+        std::ifstream in(path);
+        std::string line;
+        std::getline(in, line);
+        while (std::getline(in, line)) n.insert(line.substr(0, line.find('\t')));
+        return n;
+    };
+    cfg.out = "out_querysketch_fam_breadth.tsv";
+    cfg.familyBreadth = true;
+    generateTreeQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, families, cfg.out);
+    assert(names(cfg.out) == std::set<std::string>{"family_present"});
+    cfg.familyBreadth = false;
+    generateTreeQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, families, cfg.out);
+    assert(names(cfg.out) == std::set<std::string>({"family_locus", "family_present"}));
+    cfg.familyBreadth = true;
+    cfg.treeBreadth = 0.0;
+    generateTreeQueryResult(cfg, sketchCount, sketchRef, refSigCount, refRead, families, cfg.out);
+    assert(names(cfg.out) == std::set<std::string>({"family_locus", "family_present"}));
+    std::remove(cfg.out.c_str());
+    std::remove("log_out_querysketch_fam_breadth.tsv");
+    std::remove("logread_out_querysketch_fam_breadth.tsv");
+
+    std::cerr << "PASSED: Test family breadth floor\n";
+}
+
 int main() {
     QuerySketchConfig cfg;
     cfg.ref = "expected_out_uniqsketch.txt";
@@ -149,6 +213,7 @@ int main() {
     testQuerySampleBatch(cfg, sampleFiles);
     testGenerateQueryResult(cfg);
     testAbundanceIsHitsPerSignature(cfg);
+    testFamilyBreadth(cfg);
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;
