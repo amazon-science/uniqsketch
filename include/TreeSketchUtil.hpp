@@ -85,23 +85,11 @@ inline std::vector<TreeNode> buildHierarchicalTree(
     }
 
     // Candidate distinguishing-k-mer estimates: only pairs that share sketch hashes
-    // are scored (via an inverted index), rather than all O(n^2) pairs.
-    std::unordered_map<uint64_t, std::vector<unsigned>> hashIndex;
-    for (unsigned i = 0; i < n; i++)
-        for (uint64_t h : sketches[i]) hashIndex[h].push_back(i);
-
+    // are scored (via an inverted index), rather than all O(n^2) pairs
+    // (countSharedSketchHashes; 458 s of the 5 493-genome build as map increments,
+    // the same map in the same order from dense counts now).
     const size_t POPULAR_CAP = 20000;  // skip hashes shared by too many refs (stay linear)
-    std::unordered_map<uint64_t, uint32_t> sharedCnt;
-    for (auto& kv : hashIndex) {
-        auto& refs = kv.second;
-        if (refs.size() < 2 || refs.size() > POPULAR_CAP) continue;
-        for (size_t a = 0; a < refs.size(); a++)
-            for (size_t b = a + 1; b < refs.size(); b++) {
-                unsigned i = refs[a], j = refs[b];
-                if (i > j) std::swap(i, j);
-                sharedCnt[(static_cast<uint64_t>(i) << 32) | j]++;
-            }
-    }
+    std::unordered_map<uint64_t, uint32_t> sharedCnt = countSharedSketchHashes(sketches, POPULAR_CAP);
 
     // Estimated distinguishing k-mers between i and j (huge if they share no sketch
     // hashes, i.e. too distant to be a merge candidate).

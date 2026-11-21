@@ -12,6 +12,7 @@
 #ifndef NTCARD_HPP_
 #define NTCARD_HPP_
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -176,4 +177,91 @@ bool getCardinality(size_t& kmerNum, size_t& dbsize, size_t& sbsize,
     return false;
 }
 
+/**
+ * The sample ntCard draws from one file, kept instead of counted: the counter
+ * slots (indBit * rBuck + shVal, as ntComp indexes them) its sampled k-mers fall
+ * into, with multiplicity, sorted, and the file's k-mer count. The counter table is
+ * additive over files, so the sample of a set of files is the concatenation of
+ * their samples, and the estimate getCardinality would compute for the set
+ * (estimateCardinality) comes from the merged slots alone. About one k-mer in a
+ * thousand is sampled (two of 2^sBits top-bit patterns), 10 k slots for a 5 Mb
+ * genome.
+ */
+struct CardinalitySample {
+    std::vector<uint32_t> slots;
+    size_t kmers = 0;
+};
+
+inline CardinalitySample ntSample(const std::string& file, unsigned kmerLen) {
+    opt::rBuck = static_cast<size_t>(1) << opt::rBits;
+    opt::sMask = (static_cast<size_t>(1) << (opt::sBits - 1)) - 1;
+    CardinalitySample out;
+    gzFile fp = gzopen(file.c_str(), "r");
+    kseq_t* record = kseq_init(fp);
+    while (kseq_read(record) >= 0) {
+        std::string seq(record->seq.s, record->seq.l);
+        ntHashIterator itr(seq, 1, kmerLen);
+        while (itr != itr.end()) {
+            const uint64_t hVal = (*itr)[0];
+            uint64_t indBit = opt::nSamp;
+            if (hVal >> (64 - opt::sBits) == 1) indBit = 0;
+            if (hVal >> (64 - opt::sBits) == opt::sMask) indBit = 1;
+            if (indBit < opt::nSamp)
+                out.slots.push_back(static_cast<uint32_t>(indBit * opt::rBuck + (hVal & (opt::rBuck - 1))));
+            ++itr;
+            ++out.kmers;
+        }
+    }
+    kseq_destroy(record);
+    gzclose(fp);
+    std::sort(out.slots.begin(), out.slots.end());
+    return out;
+}
+
+/**
+ * getCardinality's estimate for the union of the files behind `parts`, from their
+ * samples: the same F0 and f1 as compEst reads off the counter table (a slot's
+ * count taken as the uint16 the table would hold), so the same filter sizes.
+ * Linear in the samples rather than in the 2^28-entry table, which getCardinality
+ * allocates, zeroes and walks on every call: the within-group build on 5 493
+ * genomes made 1 125 such calls, 419 s, now one pass over the genomes and a merge
+ * per group.
+ */
+inline void estimateCardinality(const std::vector<const CardinalitySample*>& parts,
+                                size_t& kmerNum, size_t& dbsize, size_t& sbsize) {
+    opt::rBuck = static_cast<size_t>(1) << opt::rBits;
+    std::vector<uint32_t> slots;
+    size_t total = 0;
+    kmerNum = 0;
+    for (const CardinalitySample* p : parts) { total += p->slots.size(); kmerNum += p->kmers; }
+    slots.reserve(total);
+    for (const CardinalitySample* p : parts) slots.insert(slots.end(), p->slots.begin(), p->slots.end());
+    std::sort(slots.begin(), slots.end());
+    // Per sample index: counters at zero (every slot not seen, and any whose uint16
+    // count wrapped to zero) and counters at one.
+    std::vector<size_t> zeros(opt::nSamp, opt::rBuck), ones(opt::nSamp, 0);
+    for (size_t i = 0; i < slots.size();) {
+        size_t j = i + 1;
+        while (j < slots.size() && slots[j] == slots[i]) ++j;
+        const size_t s = slots[i] / opt::rBuck;
+        const uint16_t c = static_cast<uint16_t>(j - i);
+        if (c != 0) --zeros[s];
+        if (c == 1) ++ones[s];
+        i = j;
+    }
+    double pMean0 = 0.0, pMean1 = 0.0;
+    for (size_t j = 0; j < opt::nSamp; j++) {
+        pMean0 += static_cast<unsigned>(zeros[j]);
+        pMean1 += static_cast<unsigned>(ones[j]);
+    }
+    pMean0 /= static_cast<double>(opt::nSamp);
+    pMean1 /= static_cast<double>(opt::nSamp);
+    const double F0Mean = static_cast<double>(
+        (opt::rBits * std::log(2) - std::log(pMean0)) *
+        (static_cast<size_t>(1) << (opt::sBits + opt::rBits)));
+    double f1 = -1.0 * pMean1 / (pMean0 * (std::log(pMean0) - opt::rBits * std::log(2)));
+    f1 = std::abs(static_cast<ssize_t>(f1 * F0Mean));
+    dbsize = static_cast<size_t>(F0Mean);
+    sbsize = dbsize - static_cast<size_t>(f1);
+}
 #endif // NTCARD_HPP_

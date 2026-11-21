@@ -1060,6 +1060,8 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
     // them with a different signature draw and yields one call per level; keep
     // the finest. And when a group and one of its sub-groups are both called,
     // the sub-group already says more, so the enclosing group is dropped.
+    struct Nested { std::string name, sub; unsigned count; size_t reads, sigsHit, sigsTotal, explained, extraMembers; };
+    std::vector<Nested> nested;
     {
         std::unordered_map<std::string, const FamilyCall*> finest;
         for (const FamilyCall* f : reportedFamilies) {
@@ -1068,15 +1070,33 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         }
         std::vector<const FamilyCall*> kept;
         for (const auto& [name, f] : finest) {
-            bool hasReportedSubgroup = false;
+            const FamilyCall* sub = nullptr;
             for (const auto& [otherName, g] : finest) {
                 if (g == f || g->coveredLeaves.size() >= f->coveredLeaves.size()) continue;
                 bool subset = true;
                 for (const std::string& leaf : g->coveredLeaves)
                     if (!f->coveredLeaves.count(leaf)) { subset = false; break; }
-                if (subset) { hasReportedSubgroup = true; break; }
+                if (subset && (!sub || g->coveredLeaves.size() > sub->coveredLeaves.size())) sub = g;
             }
-            if (!hasReportedSubgroup) kept.push_back(f);
+            if (!sub) { kept.push_back(f); continue; }
+            // The enclosing row is dropped without a look at its evidence. What
+            // that evidence is: the most of the enclosing node's signatures a member
+            // of the reported sub-group carries (the sub-group present could hit at
+            // most that many), against the distinct ones hit. Reported on stderr,
+            // for the rule that would keep an enclosing row whose hits the
+            // sub-group's members cannot account for (a 928-genome mock community:
+            // MC4100, a direct child of an 87-member node and not in its 37-member
+            // K-12 sub-node, had only the enclosing row to be covered by, and that
+            // row was dropped at 0.1x, 0.5x and 1x in favour of the K-12 one).
+            size_t explained = 0;
+            bool known = !f->memberCarried.empty();
+            for (const std::string& leaf : sub->coveredLeaves) {
+                auto it = f->memberCarried.find(leaf);
+                if (it == f->memberCarried.end()) { known = false; break; }
+                explained = std::max(explained, it->second);
+            }
+            nested.push_back({f->name, sub->name, f->count, f->reads, f->sigsHit, f->sigsTotal, known ? explained : SIZE_MAX,
+                              f->coveredLeaves.size() - sub->coveredLeaves.size()});
         }
         std::sort(kept.begin(), kept.end(),
                   [](const FamilyCall* a, const FamilyCall* b) { return a->count > b->count; });
@@ -1175,6 +1195,16 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
             std::cerr << "  " << w.name << "\tcount " << w.count << "\treads " << w.reads
                       << "\tsigs_hit " << w.sigsHit << "/" << w.sigsTotal
                       << "\tbreadth " << std::setprecision(3) << w.ratio << "\n";
+        }
+    }
+    if (!nested.empty()) {
+        std::cerr << "Tree query: " << nested.size() << " family-level call(s) dropped for a reported sub-group "
+                     "(the finest nested call is kept):\n";
+        for (const Nested& n : nested) {
+            std::cerr << "  " << n.name << "\tfor " << n.sub << "\tcount " << n.count << "\treads " << n.reads
+                      << "\tsigs_hit " << n.sigsHit << "/" << n.sigsTotal << "\tsub-group members carry at most ";
+            if (n.explained == SIZE_MAX) std::cerr << "?"; else std::cerr << n.explained;
+            std::cerr << "\tmembers outside the sub-group " << n.extraMembers << "\n";
         }
     }
     if (!withheldFamilies.empty()) {

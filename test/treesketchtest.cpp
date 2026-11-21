@@ -725,6 +725,78 @@ void testNodeCarriers() {
     std::cerr << "PASSED: Test node signatures with carriers (" << rows << " level signatures, " << carried << " carried)\n";
 }
 
+// The shared-hash counts behind the tree's merges, from dense counting
+// (countSharedSketchHashes) against the original one-increment-per-visit loop:
+// same pairs, same counts, and the same map iteration order, which is what the
+// merges read. 40 sketches of 300 hashes drawn so that some hashes are in many
+// sketches, some in two, some in one.
+void testSharedSketchHashes() {
+    std::cerr << "START: Test shared sketch hash counts... \t";
+    std::vector<std::vector<uint64_t>> sketches(40);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto next = [&] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<uint64_t> common(50), pairs(400);
+    for (auto& h : common) h = next();
+    for (auto& h : pairs) h = next();
+    for (unsigned i = 0; i < 40; i++) {
+        std::unordered_set<uint64_t> s;
+        for (unsigned c = 0; c < 50; c++) if ((i + c) % 3) s.insert(common[c]);          // in two of three sketches
+        for (unsigned p = 0; p < 400; p++) if (p % 40 == i || (p * 7) % 40 == i) s.insert(pairs[p]);   // in one or two
+        while (s.size() < 300) s.insert(next());                                         // private
+        sketches[i].assign(s.begin(), s.end());
+        std::sort(sketches[i].begin(), sketches[i].end());
+    }
+    auto reference = [&](size_t cap) {
+        std::unordered_map<uint64_t, std::vector<unsigned>> index;
+        for (unsigned i = 0; i < sketches.size(); i++) for (uint64_t h : sketches[i]) index[h].push_back(i);
+        std::unordered_map<uint64_t, uint32_t> shared;
+        for (auto& kv : index) {
+            auto& refs = kv.second;
+            if (refs.size() < 2 || refs.size() > cap) continue;
+            for (size_t a = 0; a < refs.size(); a++)
+                for (size_t b = a + 1; b < refs.size(); b++) {
+                    unsigned i = refs[a], j = refs[b];
+                    if (i > j) std::swap(i, j);
+                    shared[(static_cast<uint64_t>(i) << 32) | j]++;
+                }
+        }
+        return shared;
+    };
+    for (size_t cap : {size_t(20000), size_t(20)}) {
+        std::unordered_map<uint64_t, uint32_t> ref = reference(cap), dense = countSharedSketchHashes(sketches, cap);
+        assert(ref.size() == dense.size() && ref.size() > 30);   // 780 pairs at cap 20 000, 35 at cap 20
+        std::vector<std::pair<uint64_t, uint32_t>> a(ref.begin(), ref.end()), b(dense.begin(), dense.end());
+        assert(a == b);                                                      // same content in the same iteration order
+        assert(countSharedSketchHashes(sketches, cap, /*denseMaxRefs*/ 10) == ref);   // the fallback loop
+    }
+    std::cerr << "PASSED: Test shared sketch hash counts\n";
+}
+
+// ntCard's estimate from per-genome samples (ntSample, estimateCardinality) is
+// getCardinality's for the same files, on singles and on unions.
+void testCardinalitySamples() {
+    std::cerr << "START: Test cardinality samples... \t";
+    writeFasta("card_A.fa", randDNA(60000, 1357));
+    writeFasta("card_B.fa", randDNA(40000, 2468));
+    std::string shared = randDNA(30000, 8642);
+    writeFasta("card_C.fa", shared + randDNA(10000, 777));
+    writeFasta("card_D.fa", shared + randDNA(15000, 888));
+    std::vector<std::string> files = {"card_A.fa", "card_B.fa", "card_C.fa", "card_D.fa"};
+    std::vector<CardinalitySample> samples;
+    for (const std::string& f : files) samples.push_back(ntSample(f, 21));
+    auto check = [&](const std::vector<unsigned>& which) {
+        std::vector<std::string> sub; std::vector<const CardinalitySample*> parts;
+        for (unsigned w : which) { sub.push_back(files[w]); parts.push_back(&samples[w]); }
+        size_t k1 = 0, d1 = 0, s1 = 0, k2 = 0, d2 = 0, s2 = 0;
+        getCardinality(k1, d1, s1, 21, 2, sub);
+        estimateCardinality(parts, k2, d2, s2);
+        assert(k1 == k2 && d1 == d2 && s1 == s2 && k1 > 0);
+    };
+    check({0}); check({2}); check({0, 1}); check({2, 3}); check({0, 1, 2, 3});
+    for (const std::string& f : files) std::remove(f.c_str());
+    std::cerr << "PASSED: Test cardinality samples\n";
+}
+
 int main() {
     testLoadTree();
     testBuildParamsRoundTrip();
@@ -735,6 +807,8 @@ int main() {
     testBuildGroupSketch();
     testNodeCarriers();
     testBuildHierarchicalTree();
+    testSharedSketchHashes();
+    testCardinalitySamples();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;
 }

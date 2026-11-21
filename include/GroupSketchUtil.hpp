@@ -180,9 +180,8 @@ inline void writeGroupSketch(const std::string& path, const std::vector<GroupSig
  * check). Signatures already present in the leaf sketch are not repeated.
  *
  * The work is laid out so that a many-core machine stays busy on many small
- * groups. Filter sizes come from ntCard one group at a time (it runs its own
- * parallel region over the group's files and sets the OpenMP thread count, so
- * it cannot be called from inside a parallel loop). Candidate identification is
+ * groups. Filter sizes come from ntCard's estimate per group, computed from one
+ * sampling pass over the genomes (ntSample, estimateCardinality). Candidate identification is
  * the ordinary distinct/solid filter pass: each group's members go into its
  * filters with every thread on that group (GroupScanner, so the result does not
  * depend on the thread count), then the direct leaves of a whole batch of groups
@@ -229,7 +228,21 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
     // Per-group configuration: the ordinary pipeline's settings over the group's
     // genomes alone, output under groups/g<i>. The leaf numbering stays the
     // index-wide one; only the filter sizes are the group's.
+    // Filter sizes: ntCard's estimate for each group's members. ntCard's sample of
+    // a genome set is the union of its samples of the genomes (ntSample,
+    // estimateCardinality), so every genome is sampled once, in parallel, and each
+    // group's estimate is a merge; the estimates, and so the filters and the
+    // index, are the ones getCardinality gave group by group (419 s on 5 493
+    // genomes, a 512 MB counter table allocated, zeroed and walked per call).
     Clock::time_point t = Clock::now();
+    std::vector<CardinalitySample> card(refFiles.size());
+    {
+        std::vector<char> needed(refFiles.size(), 0);
+        for (const SignatureGroup& g : groups) for (unsigned m : g.members) needed[m] = 1;
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < refFiles.size(); i++)
+            if (needed[i]) card[i] = ntSample(refFiles[i], cfg.kmerLen);
+    }
     std::vector<UniqSketchConfig> gcfg(groups.size(), cfg);
     std::vector<bool> usable(groups.size(), false);
     for (size_t gi = 0; gi < groups.size(); gi++) {
@@ -238,12 +251,13 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
         c.refstat = c.outdir + "/db_uniq_count.tsv";
         c.numRef = groups[gi].members.size();
         mkdir(c.outdir.c_str(), 0777);
-        std::vector<std::string> files;
-        for (unsigned m : groups[gi].members) files.push_back(refFiles[m]);
+        std::vector<const CardinalitySample*> parts;
+        for (unsigned m : groups[gi].members) parts.push_back(&card[m]);
         size_t total = 0;
-        getCardinality(total, c.dbfSize, c.sbfSize, c.kmerLen, c.threads, files);
+        estimateCardinality(parts, total, c.dbfSize, c.sbfSize);
         usable[gi] = resolveBloomSizes(total, c.dbfSize, c.sbfSize);
     }
+    card = {};
     const double secCardinality = since(t);
 
     // Candidates unique within each group. Every member genome goes into the

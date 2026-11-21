@@ -2,6 +2,9 @@
 #define CLUSTERUTIL_HPP_
 
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -220,6 +223,96 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
 }
 
 /**
+ * Shared sketch hashes per candidate pair: for every pair of references that share
+ * at least one MinHash sketch hash (hashes shared by more than `cap` references are
+ * skipped, to stay near-linear), how many they share, keyed (i << 32 | j) with
+ * i < j. The merges read the map in its iteration order and name nodes in the order
+ * the merges produce, so the map must come out as the original loop built it: one
+ * operator[] per (hash, pair) visit, over the inverted index in its order. libstdc++
+ * lays an unordered_map out by its sequence of distinct-key insertions (the rehash
+ * points and the within-bucket order follow from it), so the same sequence of first
+ * insertions with the same final counts gives the same iteration order.
+ *
+ * On 5 493 E. coli the sketches share 136 k distinct hashes, 117 of them in nearly
+ * every genome, and the visits number 10.4 billion: as map increments, 458 s of a
+ * 500 s tree construction. Here the counts go into a dense n x n array, rows
+ * partitioned over threads so no two threads touch a cell (each thread walks the
+ * whole index and takes the pairs whose smaller member is one of its rows; a hash's
+ * reference list is ascending, so the inner loop walks a row in order), and the
+ * walk position at which a pair is first seen is kept beside the count. The pairs
+ * sorted by (first position, i, j) are the original insertion sequence: within one
+ * hash the original loop ran a then b, i.e. (i, j) ascending. The dense arrays are
+ * 8 bytes per ordered pair (240 MB at 5 493 genomes); above `denseMaxRefs`
+ * references the original loop runs instead.
+ */
+inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
+        const std::vector<std::vector<uint64_t>>& sketches, size_t cap, unsigned denseMaxRefs = 20000) {
+    const size_t n = sketches.size();
+    std::unordered_map<uint64_t, std::vector<unsigned>> index;
+    for (unsigned i = 0; i < n; i++)
+        for (uint64_t h : sketches[i]) index[h].push_back(i);
+    std::unordered_map<uint64_t, uint32_t> shared;
+    if (n > denseMaxRefs) {
+        for (auto& kv : index) {
+            auto& refs = kv.second;
+            if (refs.size() < 2 || refs.size() > cap) continue;
+            for (size_t a = 0; a < refs.size(); a++)
+                for (size_t b = a + 1; b < refs.size(); b++) {
+                    unsigned i = refs[a], j = refs[b];
+                    if (i > j) std::swap(i, j);
+                    shared[(static_cast<uint64_t>(i) << 32) | j]++;
+                }
+        }
+        return shared;
+    }
+    // The hashes in the index's order, as the original loop visited them.
+    std::vector<const std::vector<unsigned>*> walk;
+    walk.reserve(index.size());
+    for (auto& kv : index)
+        if (kv.second.size() >= 2 && kv.second.size() <= cap) walk.push_back(&kv.second);
+    std::vector<uint32_t> count(n * n, 0), first(n * n, UINT32_MAX);
+    unsigned threads = 1;
+#ifdef _OPENMP
+    threads = static_cast<unsigned>(std::max(1, omp_get_max_threads()));
+#endif
+    #pragma omp parallel num_threads(static_cast<int>(threads))
+    {
+        unsigned t = 0, T = 1;
+#ifdef _OPENMP
+        t = static_cast<unsigned>(omp_get_thread_num()); T = static_cast<unsigned>(omp_get_num_threads());
+#endif
+        for (size_t pos = 0; pos < walk.size(); pos++) {
+            const std::vector<unsigned>& refs = *walk[pos];
+            for (size_t a = 0; a + 1 < refs.size(); a++) {
+                const unsigned i = refs[a];
+                if (i % T != t) continue;
+                uint32_t* c = &count[static_cast<size_t>(i) * n];
+                uint32_t* f = &first[static_cast<size_t>(i) * n];
+                for (size_t b = a + 1; b < refs.size(); b++) {
+                    const unsigned j = refs[b];
+                    if (c[j]++ == 0) f[j] = static_cast<uint32_t>(pos);
+                }
+            }
+        }
+    }
+    // The pairs in insertion order.
+    struct Seen { uint32_t pos, i, j; };
+    std::vector<Seen> seen;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t* f = &first[i * n];
+        for (size_t j = i + 1; j < n; j++)
+            if (f[j] != UINT32_MAX) seen.push_back({f[j], static_cast<uint32_t>(i), static_cast<uint32_t>(j)});
+    }
+    first = {};
+    std::sort(seen.begin(), seen.end(), [](const Seen& a, const Seen& b) {
+        return a.pos != b.pos ? a.pos < b.pos : a.i != b.i ? a.i < b.i : a.j < b.j;
+    });
+    for (const Seen& s : seen)
+        shared.emplace((static_cast<uint64_t>(s.i) << 32) | s.j, count[static_cast<size_t>(s.i) * n + s.j]);
+    return shared;
+}
+
+/**
  * Near-linear clustering via MinHash + inverted index + single-linkage union-find.
  * Instead of scoring all O(n^2) pairs, references are sketched (bottom-s MinHash)
  * and only pairs that share sketch hashes are scored, using an inverted index. The
@@ -257,25 +350,10 @@ inline std::vector<std::string> clusterReferencesMinHash(
         names[i] = getBaseId(refFiles[i]);
     }
 
-    // Inverted index: sketch hash -> references that contain it.
-    std::unordered_map<uint64_t, std::vector<unsigned>> idx;
-    for (unsigned i = 0; i < n; i++)
-        for (uint64_t h : sketches[i]) idx[h].push_back(i);
-
-    // Accumulate shared-hash counts per candidate pair. Ultra-popular hashes
-    // (shared by more than CAP references) are skipped to keep this near-linear.
+    // Shared-hash counts per candidate pair (countSharedSketchHashes). Ultra-popular
+    // hashes (shared by more than CAP references) are skipped to keep this near-linear.
     const size_t CAP = 20000;
-    std::unordered_map<uint64_t, uint32_t> shared;
-    for (auto& kv : idx) {
-        auto& refs = kv.second;
-        if (refs.size() < 2 || refs.size() > CAP) continue;
-        for (size_t a = 0; a < refs.size(); a++)
-            for (size_t b = a + 1; b < refs.size(); b++) {
-                unsigned i = refs[a], j = refs[b];
-                if (i > j) std::swap(i, j);
-                shared[(static_cast<uint64_t>(i) << 32) | j]++;
-            }
-    }
+    std::unordered_map<uint64_t, uint32_t> shared = countSharedSketchHashes(sketches, CAP);
 
     // Single-linkage union-find.
     std::vector<unsigned> parent(n);
