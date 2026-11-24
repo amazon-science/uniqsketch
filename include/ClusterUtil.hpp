@@ -195,7 +195,11 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
                                                   size_t& kmerCount) {
     std::priority_queue<uint64_t> heap;    // max-heap of the s smallest hashes seen
     std::unordered_set<uint64_t> inHeap;   // current heap contents (<= s), for dedup
-    kmerCount = 0;
+    // Counted in a local and stored once at the end. `kmerCount` is the caller's
+    // kmerCount[i], eight to a cache line, and the callers run one reference per
+    // thread: incremented in place, once per k-mer, every increment took the line
+    // away from the threads working on the neighbouring references.
+    size_t counted = 0;
     gzFile fp = gzopen(fPath.c_str(), "r");
     kseq_t* ks = kseq_init(fp);
     while (kseq_read(ks) >= 0) {
@@ -203,7 +207,7 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
         ntHashIterator itr(seq, 1, kmerLen);
         while (itr != itr.end()) {
             uint64_t h = (*itr)[0];
-            ++kmerCount;
+            ++counted;
             if (heap.size() < s) {
                 if (inHeap.insert(h).second) heap.push(h);
             } else if (h < heap.top() && inHeap.find(h) == inHeap.end()) {
@@ -217,6 +221,7 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
     }
     kseq_destroy(ks);
     gzclose(fp);
+    kmerCount = counted;
     std::vector<uint64_t> sketch(inHeap.begin(), inHeap.end());
     std::sort(sketch.begin(), sketch.end());
     return sketch;
