@@ -316,6 +316,40 @@ inline bool kmerMatches(const char* kp, const std::string& sig) {
 }
 
 /**
+ * Every canonical ntHash value of a sequence's k-mers, in order: fn(position, hash).
+ * The values and the positions are those ntHashIterator yields (a k-mer holding a
+ * non-ACGT base is skipped the same way, by its init() and next()), with one hash
+ * function instead of the iterator's h and without its per-read copy of the sequence
+ * and per-step bounds checks. The loop is short enough that several iterations are in
+ * the processor's window at once, which matters to the caller: each hash is followed
+ * by a memory probe that misses the cache.
+ */
+template <class F>
+inline void forEachCanonicalHash(const char* s, size_t len, unsigned k, F&& fn) {
+    if (k == 0 || k > len) return;
+    const size_t last = len - k;
+    size_t pos = 0;
+    uint64_t fh = 0, rh = 0, h = 0;
+    unsigned locN = 0;
+    auto init = [&]() -> bool {
+        while (pos <= last && !NTC64(s + pos, k, fh, rh, h, locN)) pos += locN + 1;
+        return pos <= last;
+    };
+    if (!init()) return;
+    for (;;) {
+        fn(pos, h);
+        ++pos;
+        if (pos > last) return;
+        if (seedTab[static_cast<unsigned char>(s[pos + k - 1])] == seedN) {
+            pos += k;
+            if (!init()) return;
+        } else {
+            h = NTC64(static_cast<unsigned char>(s[pos - 1]), static_cast<unsigned char>(s[pos - 1 + k]), k, fh, rh);
+        }
+    }
+}
+
+/**
  * The query engine, shared by the flat and the tree query.
  *
  * Signatures are stored under their canonical ntHash value, the same value the
@@ -472,6 +506,17 @@ struct QueryIndex {
     }
 
     /**
+     * Ask for the prefilter word of `h` ahead of find(h). On an index of thousands of
+     * genomes the prefilter is larger than the cache (128 MB at 5 493 E. coli), so the
+     * probe that decides nearly every position is a memory access of its own, and the
+     * time of the read pass is the time of those accesses taken one or two at a time.
+     * Asked for a few hundred positions ahead they overlap.
+     */
+    void prefetch(uint64_t h) const {
+        __builtin_prefetch(&prefilter[(h >> prefilterShift) >> 6], 0, 0);
+    }
+
+    /**
      * The entries whose signature hashes to `h`: a pointer to the first and their
      * number, or nullptr. Linear probing; the table is at most half full.
      */
@@ -561,6 +606,7 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
     // its hit reads (with runs of the same read collapsed).
     std::vector<std::string> hitNames;
     std::vector<std::vector<uint32_t>> readIds(index.numTargets);
+    std::vector<unsigned> hitTargets;       // the targets with at least one read, in the order they got it
 
     // Producers: one parser thread per input file (paired reads are two
     // independent streams), filling a bounded queue of batches. Consumers: the
@@ -651,7 +697,45 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
             const std::vector<std::string>& seqBatch = b->seq;
             mine.clear();
 
-            for (size_t r = 0; r < seqBatch.size(); ++r) {
+            // Without --solid a position needs one hash and one probe, and the probes of
+            // a read do not depend on each other: the hashes are taken a block at a time,
+            // each one's prefilter word asked for as it is computed, and the block is
+            // probed once they are on their way. The hits come out in the order the
+            // position-by-position loop below gives.
+            static const size_t BLOCK = 256;
+            uint64_t blockHash[BLOCK];
+            uint32_t blockPos[BLOCK];
+            for (size_t r = 0; r < seqBatch.size() && !solidFilter; ++r) {
+                const std::string& seq = seqBatch[r];
+                if (seq.length() < cfg.kmerLen) continue;
+                size_t nb = 0;
+                auto probe = [&]() {
+                    for (size_t j = 0; j < nb; j++) {
+                        uint32_t n = 0;
+                        if (const QueryEntry* e = index.find(blockHash[j], n)) {
+                            const char* kp = seq.data() + blockPos[j];
+                            for (uint32_t i = 0; i < n; i++) {
+                                if (kmerMatches(kp, *e[i].seq)) {
+                                    mine.push_back({e[i].target, e[i].slot, static_cast<unsigned>(r)});
+                                }
+                            }
+                        }
+                    }
+                    nb = 0;
+                };
+                forEachCanonicalHash(seq.data(), seq.size(), cfg.kmerLen, [&](size_t pos, uint64_t h) {
+                    blockHash[nb] = h;
+                    blockPos[nb] = static_cast<uint32_t>(pos);
+                    ++nb;
+                    index.prefetch(h);
+                    if (nb == BLOCK) probe();
+                });
+                probe();
+            }
+
+            // With --solid the read filter is updated position by position and takes
+            // all of the iterator's hash values.
+            for (size_t r = 0; r < seqBatch.size() && solidFilter; ++r) {
                 const std::string& seq = seqBatch[r];
                 if (seq.length() < cfg.kmerLen) continue;
 
@@ -688,6 +772,7 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
                             nameId[h.read] = static_cast<uint32_t>(hitNames.size());
                             hitNames.push_back(std::move(b->name[h.read]));
                         }
+                        if (readIds[h.target].empty()) hitTargets.push_back(h.target);
                         readIds[h.target].push_back(nameId[h.read]);
                         prevTarget = h.target;
                         prevRead = h.read;
@@ -712,8 +797,12 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
     // Distinct read names per target. Two reads with the same name (mates named
     // alike, say) are one read here, as they were when names went straight into
     // the set.
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t t = 0; t < readIds.size(); t++) {
+    // Over the targets that have reads only: a tree index has a target per within-group
+    // and carried signature (7.8 M on 5 493 genomes), nearly all of them untouched, and
+    // handing those out one by one kept every thread of the team busy for nothing.
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (size_t x = 0; x < hitTargets.size(); x++) {
+        const size_t t = hitTargets[x];
         std::vector<uint32_t>& ids = readIds[t];
         if (ids.empty()) continue;
         std::sort(ids.begin(), ids.end());

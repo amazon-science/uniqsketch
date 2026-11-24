@@ -317,6 +317,89 @@ void testChunkedLoad(QuerySketchConfig cfg) {
     std::cerr << "PASSED: Test chunked sketch load\n";
 }
 
+static std::string revComp(const std::string& s) {
+    std::string r(s.rbegin(), s.rend());
+    for (char& c : r) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : c == 'T' ? 'A' : c;
+    return r;
+}
+
+void testReadPass(QuerySketchConfig cfg) {
+    std::cerr << "START: Test read pass hash loop and blocks... \t";
+
+    /*
+    The read pass takes its hashes from forEachCanonicalHash, not from ntHashIterator:
+    the positions and values must be the iterator's, k-mers holding a non-ACGT
+    character skipped the same way, for k below and above the 32- and 64-base word
+    sizes and for sequences shorter than k.
+    */
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto next = [&] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    const char alpha[] = "ACGTacgtNnRX-";
+    size_t kmers = 0;
+    for (unsigned k : {1u, 2u, 15u, 31u, 32u, 33u, 64u, 81u, 127u}) {
+        for (int rep = 0; rep < 600; rep++) {
+            const size_t len = next() % 400;
+            std::string s(len, 'A');
+            for (size_t i = 0; i < len; i++) {
+                const uint64_t r = next();
+                if (rep % 3 == 0) s[i] = alpha[r % 4];                                              // clean
+                else if (rep % 3 == 1) s[i] = (r % 97 == 0) ? alpha[8 + (r >> 8) % 5] : alpha[r % 8];   // a stray N
+                else s[i] = alpha[r % 13];                                                          // dense junk
+            }
+            std::vector<std::pair<size_t, uint64_t>> a, b;
+            if (s.length() >= k) {                          // queryReads' guard
+                ntHashIterator itr(s, 3, k);
+                while (itr != itr.end()) { a.emplace_back(itr.get_pos(), (*itr)[0]); ++itr; }
+            }
+            forEachCanonicalHash(s.data(), s.size(), k, [&](size_t pos, uint64_t h) { b.emplace_back(pos, h); });
+            assert(a == b);
+            kmers += a.size();
+        }
+    }
+    assert(kmers > 200000);
+
+    /*
+    A read is hashed and probed 256 positions at a time. Signatures on both sides of
+    the block boundaries, at the read's first and last position, in both orientations,
+    and next to an N: each is hit once by the read and once by its reverse complement,
+    and nothing else is.
+    */
+    const unsigned k = 21;
+    std::string read = randDNA(1000, 4242);
+    read[300] = 'N';
+    const std::vector<size_t> at = {0, 100, 255, 256, 257, 279, 301, 511, 512, 513, 767, 768, 979};
+    SketchHash sketchHash;
+    std::vector<SketchHash> refSigCount(2);
+    for (size_t i = 0; i < at.size(); i++) {
+        std::string sig = read.substr(at[i], k);
+        if (i % 2) sig = revComp(sig);
+        sketchHash.emplace(sig, static_cast<unsigned>(i % 2));
+        refSigCount[i % 2].emplace(sig, 0);
+    }
+    refSigCount[0].emplace(randDNA(k, 99), 0);      // a signature the sample does not hold
+    sketchHash.emplace(randDNA(k, 99), 0);
+    {
+        std::ofstream out("readpass.fq");
+        const std::string rc = revComp(read);
+        out << "@fwd\n" << read << "\n+\n" << std::string(read.size(), 'I') << "\n"
+            << "@rev\n" << rc << "\n+\n" << std::string(rc.size(), 'I') << "\n"
+            << "@short\nACGTACGT\n+\nIIIIIIII\n";
+    }
+    cfg.kmerLen = k;
+    cfg.solid = 0;
+    std::vector<unsigned> sketchCount(2);
+    std::vector<std::unordered_set<std::string>> refRead(2);
+    querySampleBatch(cfg, {"readpass.fq"}, sketchHash, sketchCount, refSigCount, refRead);
+    assert(sketchCount[0] == 2 * 7 && sketchCount[1] == 2 * 6);
+    for (unsigned r = 0; r < 2; r++) {
+        for (const auto& [sig, count] : refSigCount[r]) assert(count == (sig == randDNA(k, 99) ? 0u : 2u));
+        assert(refRead[r] == std::unordered_set<std::string>({"fwd", "rev"}));
+    }
+    std::remove("readpass.fq");
+
+    std::cerr << "PASSED: Test read pass hash loop and blocks\n";
+}
+
 int main() {
     QuerySketchConfig cfg;
     cfg.ref = "expected_out_uniqsketch.txt";
@@ -339,6 +422,7 @@ int main() {
     testAbundanceIsHitsPerSignature(cfg);
     testFamilyBreadth(cfg);
     testChunkedLoad(cfg);
+    testReadPass(cfg);
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;
