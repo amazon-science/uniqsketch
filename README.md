@@ -116,6 +116,9 @@ cmake --build build --target test
 # Make
 make test
 ```
+Both run the seven unit suites and the tree query's rule-stack test (`test/tree_rules/`), which builds a
+small synthetic tree index with the freshly built binaries and checks 69 queries against
+`test/tree_rules/expected.tsv`; it needs `python3` and takes about ten seconds.
 
 ## Quick Start
 

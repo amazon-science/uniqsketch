@@ -50,9 +50,21 @@ headerstest: test/headerstest.cpp
 e2etest: test/e2etest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
 
+# Rule-stack test of the tree query, through the binaries: runTreeQuery lives in
+# src/querysketch.cpp, where no in-process suite can call it. Generates 16
+# synthetic genomes and their reads, builds a tree index and compares the rows of
+# 69 queries with test/tree_rules/expected.tsv (about ten seconds; needs python3).
+# The two tools are file targets here, so they are rebuilt only when a source is
+# newer than the binary (the uniqsketch and querysketch targets always compile).
+bin/%: src/%.cpp $(wildcard include/*.hpp) $(wildcard vendor/*)
+	$(MAKE) bin_dir $*
+
+treerulestest: bin/uniqsketch bin/querysketch
+	python3 test/tree_rules/run_tree_rules.py bin test/tree_rules_work
+
 # Suites are chained with && so the first failing one fails the target; joined
 # with ';' (as before) a failed assertion left `make test` exiting 0.
-test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest e2etest
+test: uniqsketchtest querysketchtest bloomfiltertest comparesketchtest treesketchtest headerstest e2etest treerulestest
 	cd test && ./uniqsketchtest > /dev/null && ./querysketchtest > /dev/null && ./bloomfiltertest > /dev/null && ./comparesketchtest > /dev/null && ./treesketchtest > /dev/null && ./headerstest > /dev/null && ./e2etest > /dev/null
 
 clean:

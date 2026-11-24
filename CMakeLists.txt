@@ -90,3 +90,15 @@ add_test(NAME comparesketchtest COMMAND comparesketchtest WORKING_DIRECTORY ${CM
 add_test(NAME treesketchtest COMMAND treesketchtest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME headerstest COMMAND headerstest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
 add_test(NAME e2etest COMMAND e2etest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
+
+# Rule-stack test of the tree query, through the built binaries: runTreeQuery
+# lives in src/querysketch.cpp, where no in-process suite can call it (see
+# test/tree_rules/run_tree_rules.py). Nothing is compiled; it needs Python 3.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME treerulestest
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/tree_rules/run_tree_rules.py
+                $<TARGET_FILE_DIR:querysketch> ${CMAKE_BINARY_DIR}/tree_rules_work)
+else()
+    message(WARNING "Python 3 not found: the tree rule-stack test (treerulestest) is not registered")
+endif()

@@ -1,0 +1,87 @@
+# Expected verdicts of the tree query's rule-stack test (run_tree_rules.py).
+#
+# One query per line: the index (idx, or a variant of it lacking what an older
+# uniqsketch did not write), the read file(s) under reads/ ('+' joins two files),
+# extra querysketch options, the exit status, and the rows of the result table.
+#
+# rows: name:resolution[:members], comma-separated, compared as a set (the table
+# is ordered by count, and rows with equal counts have no defined order). '-' is
+# an empty table, '*' is not compared (no table is expected), '=ID' means
+# byte-for-byte the table of case ID. Counts and abundances are not listed here:
+# the checks that bound them are in run_tree_rules.py, next to the stderr
+# evidence that the rule named in the last column is what produced the rows.
+#
+# A change to a rule of the query is expected to change lines of this file, and
+# only lines whose last column names that rule. KNOWN marks behaviour recorded as
+# it is, not endorsed.
+#
+# id	index	reads	options	exit	rows	pins
+S01_X2	idx	S01_X2.fq	-	0	X2:strain	settlement: a carrier excluded on its own loci and an untestable one with a silent lineage are absent; a resolved member that carries the node's signatures suppresses the family row
+S02_X3	idx	S02_X3.fq	-	0	cluster_L1_X1:family:X1|X1s|X2|X3	carried signatures join the node when every carrier is absent: family row for a member without signatures; the enclosing level-0 row is dropped (nested)
+S03_X3_low	idx	S03_X3_low.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	settlement: at 3x no carrier can be excluded, the carried signatures are set aside and the call falls back to the parent
+S04_SL	idx	S04_SL.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	untestable carrier: a sibling without signatures puts no row on the node it is not in
+S05_SB	idx	S05_SB.fq	-	0	SB:strain	carrier seen on its own signatures: what it carries is set aside, no row on the sibling node
+S06_SB_X3	idx	S06_SB_X3.fq	-	0	SB:strain,cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	family row beside a resolved member that cannot account for the node's hits. KNOWN: the level-1 row is withheld by the family breadth floor (0.215), judged against signatures that were set aside
+S07_Y2	idx	S07_Y2.fq	-	0	cluster_L1_Y2:family:Y1|Y2	carrier attested by its own lineage: what it carries is set aside, no row on node X
+S08_A2	idx	S08_A2.fq	-	0	cluster_L1_A2:family:A1|A2	rejoin: a node pruned at level 0 is scored on its own evidence
+S09_B2	idx	S09_B2.fq	-	0	cluster_L1_B2:family:B1|B2	nested suppression: the level-0 row is dropped for its level-1 sub-group
+S10_A1	idx	S10_A1.fq	-	0	A1:strain	leaf rescue on its own global signatures after its lineage was pruned
+S11_X1	idx	S11_X1.fq	-	0	cluster_L2_X1:family:X1|X1s	three nested family calls: the finest is kept
+S12_W	idx	S12_W.fq	-	0	W:strain	within-group signatures admitted when no carrier may be present
+S13_W_U	idx	S13_W_U.fq	-	0	U:strain,cluster_L1_W:family:V|W	within-group mask: the carrier is present, the signatures are withheld, family row instead
+S14_U	idx	S14_U.fq	-	0	U:strain	within-group mask: the carrier alone does not light the leaf
+S15_V_amplicon	idx	S15_V_amplicon.fq	-	0	-	strain breadth floor: one locus at depth is withheld
+S16_PP_locus	idx	S16_PP_locus.fq	-	0	-	family breadth floor: one locus at depth is withheld
+S17_B2_b1read	idx	S17_B2_b1read.fq	-	0	B1:strain	KNOWN: a strain called on one read (lineage attested) suppresses its family's 269-read row
+S18_D_b1read	idx	S18_D_b1read.fq	-	0	D:strain	one read on a leaf whose lineage is not attested is not a call
+S19_D_b1read2	idx	S19_D_b1read2.fq	-	0	D:strain,B1:strain	two reads rescue a leaf whose lineage is not attested
+S20_NEG	idx	S20_NEG.fq	-	0	-	an organism outside the index: empty table
+S21_mix	idx	S21_mix_R1.fq+S21_mix_R2.fq	-	0	=S22_mix	two read files give the table one file gives
+S22_mix	idx	S22_mix.fq	-	0	X2:strain,A1:strain,U:strain,D:strain	abundance follows coverage (20:10:5:5)
+S23_V_grouprescue	idx	S23_V_grouprescue.fq	-	0	V:strain	leaf rescue on within-group signatures nobody else carries
+S24_X2_X3	idx	S24_X2_X3.fq	-	0	X2:strain	a resolved member that carries what the node's hits show suppresses the family row, a hidden sibling or not
+S25_X3_gz	idx	S25_X3.fq.gz	-	0	=S02_X3	gzip reads give the table plain reads give
+S26_A2_a1read	idx	S26_A2_a1read.fq	-	0	A1:strain	KNOWN: a one-read rescue (lineage attested by the rejoined node) suppresses the rejoined family row
+S27_D_vread	idx	S27_D_vread.fq	-	0	D:strain	one unattested read beside a dominant unrelated genome is not a call
+S28_X3_A2	idx	S28_X3_A2.fq	-	0	cluster_L1_X1:family:X1|X1s|X2|X3,cluster_L1_A2:family:A1|A2	two unrelated family rows are both kept
+S29_X2_12x	idx	S29_X2_12x.fq	-	0	X2:strain	carrier exclusion constant: at 12x a two-locus carrier expects 11 reads (excluded), a one-locus carrier 5.6 (possible)
+S30_W_trace	idx	S30_W_trace.fq	-	0	W:strain	permissive pruning: three hits on a node keep its leaves in play, and a leaf with within-group signatures only is reported through its lineage
+S31_X3_x2short	idx	S31_X3_x2short.fq	-	0	cluster_L1_X1:family:X1|X1s|X2|X3	hit threshold: a member in play with five hits is not a strain row and does not suppress its family
+S32_D_a2read	idx	S32_D_a2read.fq	-	0	D:strain	rejoin needs two reads: one read clearing the hit threshold on a pruned node is not a family row
+S33_SB_sl_low	idx	S33_SB_sl_low.fq	-	0	SB:strain	family beside a resolved member needs the excess margin: about 45 node signatures hit beyond the 615 the member carries are not enough
+S34_X3_sbread	idx	S34_X3_sbread.fq	-	0	SB:strain,cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	a carrier is present on one read of its own signatures: what it carries is set aside. KNOWN: single-read strain row beside the family; level-1 row withheld as in S06
+S36_D_b2read	idx	S36_D_b2read.fq	-	0	D:strain,cluster_L1_B2:family:B1|B2	KNOWN: one read makes a family row when the node was not pruned above (its level-0 node has a few hits from the same read); compare S32, where the node was pruned and one read is not enough
+S37_D_b1mates	idx	S37_D_b1mates_R1.fq+S37_D_b1mates_R2.fq	-	0	D:strain,B1:strain	the two mates of one fragment count as two reads: they rescue a leaf whose lineage is not attested (compare S18, S19)
+S38_X2_X3x3	idx	S38_X2_X3x3.fq	-	0	X2:strain	KNOWN: a hidden sibling at three times the resolved member's depth leaves no row: the family is suppressed while the member carries the signatures hit, whatever the depth
+S39_B1_a1read	idx	S39_B1_a1read.fq	-	0	B1:strain,A1:strain	KNOWN: a leaf rescued on one read counts its lineage as attested by a node whose evidence is another, resolved member's (node R is lit by B1's reads, which A1's genome cannot produce)
+S40_D_b1read_qbread	idx	S40_D_b1read_qbread.fq	-	0	D:strain,B1:strain	KNOWN: a leaf kept by the narrowing is a strain row on one read whether or not its lineage is attested (one other read keeps node B in play without attesting it); compare S18, where the leaf was pruned and one read is not enough
+O_rcutoff2_S17	idx	S17_B2_b1read.fq	--rcutoff=2	0	cluster_L1_B2:family:B1|B2	--rcutoff=2: the single read no longer suppresses the family
+O_rcutoff2_S19	idx	S19_D_b1read2.fq	--rcutoff=2	0	D:strain	--rcutoff=2: two reads are not a call
+O_nogroup_S12	idx	S12_W.fq	--no-group-signatures	0	cluster_L1_W:family:V|W	--no-group-signatures: W falls back to its family
+O_breadth0_S15	idx	S15_V_amplicon.fq	--tree-breadth=0	0	V:strain	--tree-breadth=0 reports the withheld strain
+O_breadth0_S16	idx	S16_PP_locus.fq	--tree-breadth=0	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	--tree-breadth=0 reports the withheld family
+O_breadth0_S06	idx	S06_SB_X3.fq	--tree-breadth=0	0	SB:strain,cluster_L1_X1:family:X1|X1s|X2|X3	--tree-breadth=0: the level-1 row withheld in S06 is the one reported
+O_prune5_S30	idx	S30_W_trace.fq	--tree-prune=5	0	-	--tree-prune=5: three hits no longer keep the sub-tree, and W has nothing else to be reported by
+O_hit5_S31	idx	S31_X3_x2short.fq	--very-sensitive	0	X2:strain	--very-sensitive (h=5): the five-hit member is a strain row and suppresses its family
+O_acutoff_S22	idx	S22_mix.fq	-a 0.2	0	X2:strain,A1:strain	-a 0.2 drops rows at or below the abundance cutoff
+O_solid_S22	idx	S22_mix.fq	--solid	0	X2:strain,A1:strain,U:strain,D:strain	--solid: same rows
+O_t1_S22	idx	S22_mix.fq	-t 1	0	=S22_mix	the thread count does not change the table
+O_t8_S22	idx	S22_mix.fq	-t 8	0	=S22_mix	the thread count does not change the table
+O_empty	idx	EMPTY.fq	-	0	-	an empty read file: empty table, exit 0
+O_solid_empty	idx	EMPTY.fq	--solid	1	*	--solid on an empty read file: an error, not a table
+V_no_ancestor_S16	no_ancestor	S16_PP_locus.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	no ancestor_signatures.tsv: family rows are not held to the breadth floor
+V_no_ancestor_S06	no_ancestor	S06_SB_X3.fq	-	0	SB:strain,cluster_L1_X1:family:X1|X1s|X2|X3	no ancestor_signatures.tsv: a resolved member always suppresses its family row (level 0), and the level-1 row withheld in S06 is not held to the breadth floor
+V_no_params_S19	no_params	S19_D_b1read2.fq	-	0	D:strain	no build_params.tsv: the read cutoff stays at 2
+V_margin1_S19	margin1	S19_D_b1read2.fq	-	0	D:strain	an index without a strict margin: the read cutoff stays at 2
+V_no_group_S12	no_group	S12_W.fq	-	0	cluster_L1_W:family:V|W	no sketch_group.tsv: W falls back to its family
+V_no_leaves_S02	no_leaves	S02_X3.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	no leaves.tsv: unnamed leaves are kept in play, coarser row
+V_short_leaves_S12	short_leaves	S12_W.fq	-	0	W:strain	a leaves.tsv of the wrong length is ignored
+V_no_carriers_S02	no_carriers	S02_X3.fq	-	0	cluster_L1_X1:family:X1|X1s|X2|X3	level sketches without the carriers column: every signature is the node's
+V_largest_rep_S16	largest_rep	S16_PP_locus.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	an index with the largest member as representative: family rows are not held to the breadth floor
+V_other_bf_S12	other_bf	S12_W.fq	-	0	W:strain	another Bloom filter layout: a warning only
+V_dup_line_S12	dup_line	S12_W.fq	-	0	W:strain	a k-mer on two lines of a level sketch
+V_dup_line_S08	dup_line	S08_A2.fq	-	0	cluster_L1_A2:family:A1|A2	a k-mer on two lines of a level sketch counts for the node of its first line
+V_dup_line_S09	dup_line	S09_B2.fq	-	0	cluster_L1_B2:family:B1|B2	KNOWN: the second line of a k-mer cannot be hit but is counted in its node's sigs_total
+V_no_level1_S02	no_level1	S02_X3.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	a level sketch missing: the level is skipped
+V_no_level0_S08	no_level0	S08_A2.fq	-	0	cluster_L1_A2:family:A1|A2	the coarsest level sketch missing: nothing is pruned above, no rejoin needed
+V_no_tree_S12	no_tree	S12_W.fq	-	1	*	no tree_index.tsv: a message and exit 1
