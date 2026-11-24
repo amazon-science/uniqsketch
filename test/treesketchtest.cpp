@@ -940,7 +940,9 @@ void testSharedSketchHashes() {
 }
 
 // ntCard's estimate from per-genome samples (ntSample, estimateCardinality) is
-// getCardinality's for the same files, on singles and on unions.
+// getCardinality's for the same files, on singles and on unions. ntSample itself
+// neither needs nor sets ntCard's two derived globals: it runs on every thread of
+// the within-group sampling loop, where assigning them was a data race.
 void testCardinalitySamples() {
     std::cerr << "START: Test cardinality samples... \t";
     writeFasta("card_A.fa", randDNA(60000, 1357));
@@ -950,7 +952,14 @@ void testCardinalitySamples() {
     writeFasta("card_D.fa", shared + randDNA(15000, 888));
     std::vector<std::string> files = {"card_A.fa", "card_B.fa", "card_C.fa", "card_D.fa"};
     std::vector<CardinalitySample> samples;
+    opt::rBuck = 0; opt::sMask = 0;   // cleared here, still clear after the sampling
     for (const std::string& f : files) samples.push_back(ntSample(f, 21));
+    assert(opt::rBuck == 0 && opt::sMask == 0);
+    // The slots are counter indices of getCardinality's table: both sample indices
+    // occur in every file's sample and nothing lies beyond the table.
+    const size_t rBuck = static_cast<size_t>(1) << opt::rBits;
+    for (const CardinalitySample& s : samples)
+        assert(!s.slots.empty() && s.slots.front() / rBuck == 0 && s.slots.back() / rBuck == opt::nSamp - 1);
     auto check = [&](const std::vector<unsigned>& which) {
         std::vector<std::string> sub; std::vector<const CardinalitySample*> parts;
         for (unsigned w : which) { sub.push_back(files[w]); parts.push_back(&samples[w]); }

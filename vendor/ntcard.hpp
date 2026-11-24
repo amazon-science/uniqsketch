@@ -203,8 +203,11 @@ struct CardinalitySample {
 };
 
 inline CardinalitySample ntSample(const std::string& file, unsigned kmerLen) {
-    opt::rBuck = static_cast<size_t>(1) << opt::rBits;
-    opt::sMask = (static_cast<size_t>(1) << (opt::sBits - 1)) - 1;
+    // The values getCardinality gives opt::rBuck and opt::sMask, as locals: ntSample
+    // runs on every thread of the within-group sampling loop, and assigning the two
+    // globals here was a data race (the same constants from every thread).
+    const size_t rBuck = static_cast<size_t>(1) << opt::rBits;
+    const unsigned sMask = (static_cast<size_t>(1) << (opt::sBits - 1)) - 1;
     CardinalitySample out;
     gzFile fp = gzopen(file.c_str(), "r");
     kseq_t* record = kseq_init(fp);
@@ -215,9 +218,9 @@ inline CardinalitySample ntSample(const std::string& file, unsigned kmerLen) {
             const uint64_t hVal = (*itr)[0];
             uint64_t indBit = opt::nSamp;
             if (hVal >> (64 - opt::sBits) == 1) indBit = 0;
-            if (hVal >> (64 - opt::sBits) == opt::sMask) indBit = 1;
+            if (hVal >> (64 - opt::sBits) == sMask) indBit = 1;
             if (indBit < opt::nSamp)
-                out.slots.push_back(static_cast<uint32_t>(indBit * opt::rBuck + (hVal & (opt::rBuck - 1))));
+                out.slots.push_back(static_cast<uint32_t>(indBit * rBuck + (hVal & (rBuck - 1))));
             ++itr;
             ++out.kmers;
         }
