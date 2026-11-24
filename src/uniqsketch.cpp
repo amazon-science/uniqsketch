@@ -464,8 +464,10 @@ int main(int argc, char** argv) {
                         TreeNode& node = tree[it->second];
                         node.filePath = reps[i];
                         node.name = "cluster_L" + std::to_string(node.level) + "_" + getBaseId(reps[i]);
-                        treeIndexByName.erase(nodeNames[i]);
-                        treeIndexByName[node.name] = it->second;
+                        // `it` dies with the entry it points at: take the index first.
+                        const size_t nodeIndex = it->second;
+                        treeIndexByName.erase(it);
+                        treeIndexByName[node.name] = nodeIndex;
                         representativeDecided.insert(node.name);
                         ++representativesMoved;
                     }
