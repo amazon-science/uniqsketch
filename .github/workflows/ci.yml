@@ -58,6 +58,21 @@ jobs:
             echo "CXX=g++"     >> "$GITHUB_ENV"
           fi
 
+      - name: Test suites keep their assertions under NDEBUG
+        # Every check in test/*.cpp is an assert(). A build that defines NDEBUG
+        # (CMake's RelWithDebInfo and MinSizeRel, a packager's CPPFLAGS) compiled
+        # all of them out and each suite still printed PASSED and exited 0, so the
+        # suites undefine NDEBUG before their first include. This step keeps a new
+        # or edited suite from losing that line.
+        run: |
+          for f in test/*.cpp; do
+            grep -q 'assert(' "$f" || continue
+            if ! awk '/^#undef NDEBUG/ { ok = 1; exit } /^#include/ { exit } END { exit !ok }' "$f"; then
+              echo "::error file=$f::assert() is used, but '#undef NDEBUG' does not precede the first #include"
+              exit 1
+            fi
+          done
+
       - name: Build and test (Make)
         if: matrix.build == 'make'
         # The Makefile bakes the standard into CXX ("g++ -std=c++17"), so an
