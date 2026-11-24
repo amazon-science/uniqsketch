@@ -55,8 +55,8 @@ static const char USAGE_MESSAGE[] =
     "\t\t\tsets them aside when a carrier is present) [min(50, leaves/10); 0=off]\n"
     "      --node-representative=WHICH\tthe member a tree node's signatures come from: central (the one whose\n"
     "\t\t\tnode-unique k-mers the other members carry) or largest [central]\n"
-    "      --sensitive\tsets sensitivity parameter c to 100\n"
-    "      --very-sensitive\tsets sensitivity parameter c to 1000\n"
+    "      --sensitive\tsets sensitivity parameter c to 100 (an explicit -c wins)\n"
+    "      --very-sensitive\tsets sensitivity parameter c to 1000 (an explicit -c wins)\n"
     "      --help\t\tdisplay this help and exit\n"
     "      --version\t\toutput version information and exit\n"
     "\n";
@@ -68,8 +68,10 @@ enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TRE
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
-// the value is copied into the config once parsing is complete.
-static int g_sketchnum = 100;
+// the value is copied into the config once parsing is complete (0: neither given).
+// -c is kept apart from them: when it shared this variable the last of -c and the
+// flags on the command line won, and "-c500 --sensitive" built with c = 100.
+static int g_sketchnum = 0;
 
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
@@ -117,6 +119,8 @@ int main(int argc, char** argv) {
     bool groupSignatures = true;    // within-group leaf signatures for a tree index (--no-group-signatures)
     int nodeCarriers = -1;          // --node-carriers (-1: min(50, leaves/10) once the leaf count is known)
     bool centralRepresentative = true;   // --node-representative=central|largest
+    int explicitCov = 0;            // -c
+    bool covGiven = false;
 
     bool die = false;
     int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
@@ -131,7 +135,7 @@ int main(int argc, char** argv) {
         case 'b': arg >> cfg.bits;             break;
         case 'd': arg >> cfg.nhash1;           break;
         case 's': arg >> cfg.nhash2;           break;
-        case 'c': arg >> g_sketchnum;          break;
+        case 'c': arg >> explicitCov; covGiven = true; break;
         case 'o': arg >> cfg.outfile;          break;
         case 'f': arg >> cfg.outdir;           break;
         case 'r': arg >> cfg.refstat;          break;
@@ -183,7 +187,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    cfg.sketchnum = g_sketchnum;
+    // An explicit -c wins over --sensitive / --very-sensitive wherever it stands.
+    cfg.sketchnum = covGiven ? explicitCov : (g_sketchnum ? g_sketchnum : 100);
+    if (covGiven && g_sketchnum && g_sketchnum != explicitCov)
+        std::cerr << PROGRAM ": -c " << explicitCov << " given; --sensitive / --very-sensitive ignored\n";
 
     // A tree index exists to separate close relatives, and that is exactly where
     // margin-1 signatures fail: a signature one substitution away from a k-mer of

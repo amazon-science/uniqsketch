@@ -272,8 +272,8 @@ A list of files containing file names in each row can be passed with @ prefix.
                         sets them aside when a carrier is present) [min(50, leaves/10); 0=off]
       --node-representative=WHICH  the member a tree node's signatures come from: central (the one
                         whose node-unique k-mers the other members carry) or largest [central]
-      --sensitive       sets sensitivity parameter c to 100
-      --very-sensitive  sets sensitivity parameter c to 1000
+      --sensitive       sets sensitivity parameter c to 100 (an explicit -c wins)
+      --very-sensitive  sets sensitivity parameter c to 1000 (an explicit -c wins)
       --help            display this help and exit
       --version         output version information and exit
 ```
@@ -488,8 +488,8 @@ Acceptable file formats: fastq or fasta, plain or gzip-compressed.
   -h, --hit=N           number of uniqsketch hits to call a reference [10]
   -a, --acutoff=N       abundance cutoff to report [0.0]
   -s, --rcutoff=N       read cutoff to report [2; 0 with --tree on a strict-margin index]
-      --sensitive       sets sensitivity parameter h=10
-      --very-sensitive  sets sensitivity parameter h=5
+      --sensitive       sets sensitivity parameter h=10 (an explicit -h wins)
+      --very-sensitive  sets sensitivity parameter h=5 (an explicit -h wins)
       --solid           only use solid k-mers in reads
       --breadth=F       min breadth of a call: distinct signatures hit, as a fraction of
                         what its hit count would spread over if the genome were present;

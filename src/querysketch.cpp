@@ -43,8 +43,8 @@ static const char USAGE_MESSAGE[] =
     "  -h, --hit=N\t\tnumber of uniqsketch hits to call a reference [10]\n"
     "  -a, --acutoff=N\tabundance cutoff to report [0.0]\n"
     "  -s, --rcutoff=N\tread cutoff to report [2; 0 with --tree on a strict-margin index]\n"
-    "      --sensitive\tsets sensitivity parameter h=10\n"
-    "      --very-sensitive\tsets sensitivity parameter h=5\n"
+    "      --sensitive\tsets sensitivity parameter h=10 (an explicit -h wins)\n"
+    "      --very-sensitive\tsets sensitivity parameter h=5 (an explicit -h wins)\n"
     "      --solid\t\tonly use solid k-mers in reads\n"
     "      --breadth=F\tmin breadth of a call: distinct signatures hit, as a fraction of\n"
     "\t\t\twhat its hit count would spread over if the genome were present;\n"
@@ -67,9 +67,10 @@ enum { OPT_HELP = 1, OPT_VERSION, OPT_BREADTH, OPT_TREE, OPT_TREEPRUNE, OPT_TREE
 
 // --sensitive / --very-sensitive / --solid are getopt flag entries, which store
 // through a pointer at parse time and so cannot target a struct member. They write
-// here and the values are copied into the config once parsing is complete. -h also
-// routes through g_sketchHit so the flags and the explicit option share one source.
-static int g_sketchHit = 10;
+// here and the values are copied into the config once parsing is complete
+// (g_sketchHit 0: neither flag given). -h is kept apart from them: when it shared
+// the variable the last of -h and the flags on the command line won.
+static int g_sketchHit = 0;
 static int g_solid = 0;
 
 static const struct option longopts[] = {
@@ -1117,6 +1118,8 @@ int main(int argc, char* const argv[]) {
     QuerySketchConfig cfg;
     std::string treeDir;  // --tree: hierarchical query index directory (empty = flat)
     bool readCutoffGiven = false;  // --rcutoff passed explicitly (tree mode picks a default otherwise)
+    int explicitHit = 0;           // -h
+    bool hitGiven = false;
 
     bool die = false;
     int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
@@ -1131,7 +1134,7 @@ int main(int argc, char* const argv[]) {
         case 'l': arg >> cfg.r1;              break;
         case 'r': arg >> cfg.r2;              break;
         case 'g': arg >> cfg.ref;             break;
-        case 'h': arg >> g_sketchHit;          break;
+        case 'h': arg >> explicitHit; hitGiven = true; break;
         case 'a': arg >> cfg.abundanceCutoff; break;
         case 's': arg >> cfg.readCutoff; readCutoffGiven = true; break;
         case 'b': arg >> cfg.bits;            break;
@@ -1156,7 +1159,10 @@ int main(int argc, char* const argv[]) {
             exit(EXIT_FAILURE);
         }
     }
-    cfg.sketchHit = g_sketchHit;
+    // An explicit -h wins over --sensitive / --very-sensitive wherever it stands.
+    cfg.sketchHit = hitGiven ? explicitHit : (g_sketchHit ? g_sketchHit : 10);
+    if (hitGiven && g_sketchHit && g_sketchHit != explicitHit)
+        std::cerr << PROGRAM ": -h " << explicitHit << " given; --sensitive / --very-sensitive ignored\n";
     cfg.solid = g_solid;
 
     if (cfg.r1.empty()) {
