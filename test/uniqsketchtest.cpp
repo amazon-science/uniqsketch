@@ -155,8 +155,10 @@ void testGroupRepeatExclusion(UniqSketchConfig cfg) {
 // contig longer than one hashing piece, the representative's internal repeat, a
 // k-mer shared by two members but not the representative, k-mers shared by the
 // whole group, runs of N, a contig shorter than k and a gzip member; a group of
-// one (loadBFfa's rule, no group-private filters); a group of two; another
-// single. A small flush size forces several flushes within and across files.
+// one (loadBFfa's rule, no group-private filters); a group of two; a run of
+// three singles, which the scanner feeds as one stream (flushed by size, not per
+// genome), the middle one gzipped and the last repeating k-mers of the first.
+// A small flush size forces several flushes within and across files.
 //
 // The filters are thin (16 bits per element) so that false positives are
 // common, and the test first checks that it can see order dependence at all:
@@ -183,6 +185,8 @@ void testGroupScanIdentical() {
         {"pgroup_s1.fa"},
         {"pgroup_p1.fa", "pgroup_p2.fa"},
         {"pgroup_s2.fa"},
+        {"pgroup_s3.fa.gz"},
+        {"pgroup_s4.fa"},
     };
     {
         std::ofstream rep(groups[0][0]);
@@ -214,14 +218,24 @@ void testGroupScanIdentical() {
         p1 << ">p1\n" << pairCore << dna(30000) << "\n";
         std::ofstream p2(groups[2][1]);
         p2 << ">p2_a\n" << mutate(pairCore, 503) << "\n>p2_b\n" << dna(40000) << "\n";
+        const std::string s2Seq = dna(180000);
         std::ofstream s2(groups[3][0]);
-        s2 << ">s2\n" << dna(180000) << "\n";
+        s2 << ">s2\n" << s2Seq << "\n";
+        std::ostringstream s3;
+        s3 << ">s3_a\n" << dna(60000) << "\n>s3_b\n" << mutate(pairCore, 211) << "\n";
+        gzFile g3 = gzopen(groups[4][0].c_str(), "wb");
+        assert(g3);
+        const std::string s3s = s3.str();
+        assert(gzwrite(g3, s3s.data(), static_cast<unsigned>(s3s.size())) == static_cast<int>(s3s.size()));
+        gzclose(g3);
+        std::ofstream s4(groups[5][0]);
+        s4 << ">s4_a\n" << mutate(s2Seq, 307) << "\n>s4_b\n" << dna(25000) << dup << "\n";
     }
     UniqSketchConfig cfg;
     cfg.kmerLen = 31;
     cfg.bits = 16;                                         // thin filters: false positives are common
-    cfg.dbfSize = 1800000;
-    cfg.sbfSize = 900000;
+    cfg.dbfSize = 2200000;
+    cfg.sbfSize = 1100000;
     auto bitsOf = [&](const BloomFilter& db, const BloomFilter& sb) {
         std::string bits(reinterpret_cast<const char*>(const_cast<BloomFilter&>(db).getFilter()), db.sizeBytes());
         bits.append(reinterpret_cast<const char*>(const_cast<BloomFilter&>(sb).getFilter()), sb.sizeBytes());

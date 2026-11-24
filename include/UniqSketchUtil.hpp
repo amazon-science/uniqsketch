@@ -14,6 +14,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "SequenceUtil.hpp"
 #include "FileUtil.hpp"
 #include "BloomFilter.hpp"
@@ -526,12 +530,27 @@ public:
             loadUnordered(groups, dbFilter, sbFilter);
             return;
         }
-        for (const auto& files : groups) loadGroup(files, dbFilter, sbFilter);
+        // A run of single-genome groups is one stream: every k-mer of every one of
+        // them gets the same treatment (distinct, else solid; no group filter), so the
+        // run is flushed by size, as the members of a node are, where it was flushed
+        // after every genome. A flush is two parallel regions; one per 5 Mb genome is
+        // twenty hashing pieces for however many threads there are, and a fifth of a
+        // second of work between two fork-joins. Each partition still replays its
+        // k-mers in list order, so every block sees the same operations in the same
+        // order and the filters are bit for bit the same.
+        for (size_t g = 0; g < groups.size();) {
+            if (groups[g].size() != 1) { loadGroup(groups[g++], dbFilter, sbFilter); continue; }
+            std::vector<std::string> run;
+            while (g < groups.size() && groups[g].size() == 1) run.push_back(groups[g++][0]);
+            feed(run, false, nullptr, nullptr, dbFilter, sbFilter);
+            flush(false, nullptr, nullptr, dbFilter, sbFilter);
+        }
     }
 
 private:
     static constexpr unsigned P = BloomFilter::PARTITIONS;
     static constexpr size_t PIECE_KMERS = size_t(1) << 18;     // hashing work unit
+    static constexpr size_t DECODE_FLUSHES = 8;                // bytes of files read ahead of the replay, in flushes (feed)
 
     /** Standard filter: one group per thread, largest first. */
     void loadUnordered(const std::vector<std::vector<std::string>>& groups,
@@ -548,6 +567,7 @@ private:
     }
 
     void loadGroup(const std::vector<std::string>& files, BloomFilter& dbFilter, BloomFilter& sbFilter) {
+        if (files.empty()) return;
         const unsigned k = cfg_.kmerLen;
         // Group-private filters, sized as loadBFfaGroup sizes them; none for a
         // group of one, which loadBFfa scans without them.
@@ -559,14 +579,62 @@ private:
             repSeen.reset(new BloomFilter(std::max<size_t>(uncompressedSize(files[0]), 1) * 64,
                                           cfg_.nhash1, k));
         }
-        for (size_t fi = 0; fi < files.size(); ++fi) {
-            const bool isRep = (fi == 0);
-            scanFasta(files[fi], [&](const std::string&, std::string& faSeq, size_t) {
-                pendingBases_ += faSeq.size();
-                contigs_.push_back(std::move(faSeq));
-                if (pendingBases_ >= flushBases_) flush(isRep, seen.get(), repSeen.get(), dbFilter, sbFilter);
-            }, wrapPad(cfg_));
-            if (isRep || fi + 1 == files.size()) flush(isRep, seen.get(), repSeen.get(), dbFilter, sbFilter);
+        // The representative, flushed on its own (repSeen applies to exactly its
+        // k-mers), then the other members.
+        feed({files[0]}, true, seen.get(), repSeen.get(), dbFilter, sbFilter);
+        flush(true, seen.get(), repSeen.get(), dbFilter, sbFilter);
+        if (files.size() > 1) {
+            feed(std::vector<std::string>(files.begin() + 1, files.end()), false,
+                 seen.get(), repSeen.get(), dbFilter, sbFilter);
+            flush(false, seen.get(), repSeen.get(), dbFilter, sbFilter);
+        }
+    }
+
+    /**
+     * Append the contigs of `files`, in list order, to the pending ones, flushing
+     * whenever the pending bases reach the flush size: the loop over scanFasta that
+     * loadGroup had, with the files read a window at a time by every thread where
+     * they were read one after another on the calling thread (decompressing and
+     * joining the lines of a genome is serial work that every filter pass of the
+     * build repeated for every genome while the other threads waited). The contigs
+     * reach contigs_ in the same order and the flushes fall after the same contigs,
+     * so the filters see the same sequence of operations on any thread count. A
+     * window is at most one file per thread and at most DECODE_FLUSHES flushes' worth
+     * of bytes on disk (but always one file), which bounds the decoded sequence held
+     * at once whatever the genome size; a compressed file decodes to a few times its
+     * size on disk, and sizing it exactly would mean reading a multi-member gzip
+     * file twice (uncompressedSize).
+     */
+    void feed(const std::vector<std::string>& files, bool isRep, BloomFilter* seen, BloomFilter* repSeen,
+              BloomFilter& dbFilter, BloomFilter& sbFilter) {
+        size_t threads = 1;
+#ifdef _OPENMP
+        threads = static_cast<size_t>(std::max(1, omp_get_max_threads()));
+#endif
+        for (size_t b = 0; b < files.size();) {
+            size_t e = b, bytes = 0;
+            while (e < files.size() && e - b < threads) {
+                struct stat st;
+                const size_t size = stat(files[e].c_str(), &st) == 0 ? static_cast<size_t>(st.st_size) : 0;
+                if (e > b && bytes + size > DECODE_FLUSHES * flushBases_) break;
+                bytes += size;
+                ++e;
+            }
+            std::vector<std::vector<std::string>> decoded(e - b);
+            #pragma omp parallel for schedule(dynamic) if(e - b > 1)
+            for (size_t i = b; i < e; i++) {
+                scanFasta(files[i], [&](const std::string&, std::string& faSeq, size_t) {
+                    decoded[i - b].push_back(std::move(faSeq));
+                }, wrapPad(cfg_));
+            }
+            for (std::vector<std::string>& contigs : decoded) {
+                for (std::string& faSeq : contigs) {
+                    pendingBases_ += faSeq.size();
+                    contigs_.push_back(std::move(faSeq));
+                    if (pendingBases_ >= flushBases_) flush(isRep, seen, repSeen, dbFilter, sbFilter);
+                }
+            }
+            b = e;
         }
     }
 

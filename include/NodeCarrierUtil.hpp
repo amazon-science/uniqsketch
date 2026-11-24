@@ -203,6 +203,10 @@ public:
     explicit CarriageCounter(size_t elements)
         : size_(roundUp(std::max<size_t>(elements, 1) * 16)), mask_(size_ - 1),
           counters_(new std::atomic<uint16_t>[size_]) {
+        // Zeroed by every thread: the table is 16 counters per distinct k-mer of the
+        // index (8.6 G of them on 5 493 E. coli), and one thread storing them held the
+        // others for the first seconds of the carriage pass.
+        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < size_; i++) counters_[i].store(0, std::memory_order_relaxed);
     }
     size_t size() const { return size_; }
