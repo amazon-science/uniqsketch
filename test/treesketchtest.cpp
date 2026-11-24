@@ -845,6 +845,12 @@ void testNodeCarriers() {
 // same pairs, same counts, and the same map iteration order, which is what the
 // merges read. 40 sketches of 300 hashes drawn so that some hashes are in many
 // sketches, some in two, some in one.
+// Neither the popular-hash cap nor the dense limit may change the result. A hash
+// over the cap was once left out of the counts, and with more references than the
+// cap (20 000 in the build) that is every hash most genomes share: here a cap of 20
+// took the 50 common hashes, in 26 or 27 sketches each, out of every pair and left
+// 35 candidate pairs of 780. The caps below put some, all and none of the shared
+// hashes over the cap, on the dense path and on the loop that runs above the limit.
 void testSharedSketchHashes() {
     std::cerr << "START: Test shared sketch hash counts... \t";
     std::vector<std::vector<uint64_t>> sketches(40);
@@ -861,29 +867,31 @@ void testSharedSketchHashes() {
         sketches[i].assign(s.begin(), s.end());
         std::sort(sketches[i].begin(), sketches[i].end());
     }
-    auto reference = [&](size_t cap) {
+    std::unordered_map<uint64_t, uint32_t> ref;   // the original loop, every hash visited
+    {
         std::unordered_map<uint64_t, std::vector<unsigned>> index;
         for (unsigned i = 0; i < sketches.size(); i++) for (uint64_t h : sketches[i]) index[h].push_back(i);
-        std::unordered_map<uint64_t, uint32_t> shared;
         for (auto& kv : index) {
             auto& refs = kv.second;
-            if (refs.size() < 2 || refs.size() > cap) continue;
+            if (refs.size() < 2) continue;
             for (size_t a = 0; a < refs.size(); a++)
                 for (size_t b = a + 1; b < refs.size(); b++) {
                     unsigned i = refs[a], j = refs[b];
                     if (i > j) std::swap(i, j);
-                    shared[(static_cast<uint64_t>(i) << 32) | j]++;
+                    ref[(static_cast<uint64_t>(i) << 32) | j]++;
                 }
         }
-        return shared;
-    };
-    for (size_t cap : {size_t(20000), size_t(20)}) {
-        std::unordered_map<uint64_t, uint32_t> ref = reference(cap), dense = countSharedSketchHashes(sketches, cap);
-        assert(ref.size() == dense.size() && ref.size() > 30);   // 780 pairs at cap 20 000, 35 at cap 20
-        std::vector<std::pair<uint64_t, uint32_t>> a(ref.begin(), ref.end()), b(dense.begin(), dense.end());
-        assert(a == b);                                                      // same content in the same iteration order
-        assert(countSharedSketchHashes(sketches, cap, /*denseMaxRefs*/ 10) == ref);   // the fallback loop
     }
+    assert(ref.size() == 780);                    // every pair shares a common hash
+    const std::vector<std::pair<uint64_t, uint32_t>> expected(ref.begin(), ref.end());
+    // 20 000: nothing over the cap. 26: the common hashes in 27 sketches. 20: all the
+    // common ones. 2: every hash in three sketches or more. 1: every shared hash.
+    for (size_t cap : {size_t(20000), size_t(26), size_t(20), size_t(2), size_t(1)})
+        for (unsigned denseMaxRefs : {20000u, 10u}) {            // dense counts; the fallback loop
+            std::unordered_map<uint64_t, uint32_t> got = countSharedSketchHashes(sketches, cap, denseMaxRefs);
+            std::vector<std::pair<uint64_t, uint32_t>> b(got.begin(), got.end());
+            assert(b == expected);                               // same content in the same iteration order
+        }
     std::cerr << "PASSED: Test shared sketch hash counts\n";
 }
 

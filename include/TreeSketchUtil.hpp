@@ -88,7 +88,7 @@ inline std::vector<TreeNode> buildHierarchicalTree(
     // are scored (via an inverted index), rather than all O(n^2) pairs
     // (countSharedSketchHashes; 458 s of the 5 493-genome build as map increments,
     // the same map in the same order from dense counts now).
-    const size_t POPULAR_CAP = 20000;  // skip hashes shared by too many refs (stay linear)
+    const size_t POPULAR_CAP = 20000;  // hashes in more references are counted by bit sets, not pair by pair
     std::unordered_map<uint64_t, uint32_t> sharedCnt = countSharedSketchHashes(sketches, POPULAR_CAP);
 
     // Estimated distinguishing k-mers between i and j (huge if they share no sketch

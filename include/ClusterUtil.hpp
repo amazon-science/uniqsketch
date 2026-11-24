@@ -229,8 +229,7 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
 
 /**
  * Shared sketch hashes per candidate pair: for every pair of references that share
- * at least one MinHash sketch hash (hashes shared by more than `cap` references are
- * skipped, to stay near-linear), how many they share, keyed (i << 32 | j) with
+ * at least one MinHash sketch hash, how many they share, keyed (i << 32 | j) with
  * i < j. The merges read the map in its iteration order and name nodes in the order
  * the merges produce, so the map must come out as the original loop built it: one
  * operator[] per (hash, pair) visit, over the inverted index in its order. libstdc++
@@ -249,6 +248,20 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
  * hash the original loop ran a then b, i.e. (i, j) ascending. The dense arrays are
  * 8 bytes per ordered pair (240 MB at 5 493 genomes); above `denseMaxRefs`
  * references the original loop runs instead.
+ *
+ * That loop does not visit a hash held by more than `cap` references pair by pair
+ * (C(f, 2) map increments for a hash in f references). Such a hash used to be
+ * skipped, which took it out of every pair's count. The hashes most genomes of a
+ * species share are 6 % of an E. coli sketch at nine references in ten and 40 % at
+ * one in three, so above 20 000 references every distance estimate rose by that
+ * share of a genome and the tree lost its levels without a word: with the cap at
+ * 950 of 1 000 E. coli the two finest levels are empty, at 500 five nodes are
+ * left of 195. They are counted now, through one bit per reference and popular
+ * hash: a pair's AND gives how many of them it shares and, the bits being in walk
+ * order, the first. The result is the uncapped loop's map in the uncapped loop's
+ * order whatever `cap` and `denseMaxRefs` are, so both are costs only. No hash can
+ * exceed the cap while the references do not, and such a set takes the path it
+ * took before.
  */
 inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
         const std::vector<std::vector<uint64_t>>& sketches, size_t cap, unsigned denseMaxRefs = 20000) {
@@ -258,23 +271,93 @@ inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
         for (uint64_t h : sketches[i]) index[h].push_back(i);
     std::unordered_map<uint64_t, uint32_t> shared;
     if (n > denseMaxRefs) {
+        // The hashes over the cap, with their positions in the walk (the hashes of
+        // two or more references in the index's order, as the dense path numbers them).
+        std::vector<const std::vector<unsigned>*> popular;
+        std::vector<uint32_t> popularPos;
+        uint32_t walkLen = 0;
+        for (auto& kv : index) {
+            if (kv.second.size() < 2) continue;
+            if (kv.second.size() > cap) { popular.push_back(&kv.second); popularPos.push_back(walkLen); }
+            ++walkLen;
+        }
+        if (popular.empty()) {
+            for (auto& kv : index) {
+                auto& refs = kv.second;
+                if (refs.size() < 2) continue;
+                for (size_t a = 0; a < refs.size(); a++)
+                    for (size_t b = a + 1; b < refs.size(); b++) {
+                        unsigned i = refs[a], j = refs[b];
+                        if (i > j) std::swap(i, j);
+                        shared[(static_cast<uint64_t>(i) << 32) | j]++;
+                    }
+            }
+            return shared;
+        }
+        // The other hashes pair by pair as above, keeping where each pair was first
+        // seen: the popular hashes can put a pair earlier in the walk, and the map
+        // must receive the pairs in the order the uncapped loop would have.
+        struct Cell { uint32_t count = 0, first = 0; };
+        std::unordered_map<uint64_t, Cell> cells;
+        uint32_t pos = 0;
         for (auto& kv : index) {
             auto& refs = kv.second;
-            if (refs.size() < 2 || refs.size() > cap) continue;
-            for (size_t a = 0; a < refs.size(); a++)
-                for (size_t b = a + 1; b < refs.size(); b++) {
-                    unsigned i = refs[a], j = refs[b];
-                    if (i > j) std::swap(i, j);
-                    shared[(static_cast<uint64_t>(i) << 32) | j]++;
-                }
+            if (refs.size() < 2) continue;
+            if (refs.size() <= cap)
+                for (size_t a = 0; a < refs.size(); a++)
+                    for (size_t b = a + 1; b < refs.size(); b++) {
+                        Cell& c = cells[(static_cast<uint64_t>(refs[a]) << 32) | refs[b]];
+                        if (c.count++ == 0) c.first = pos;
+                    }
+            ++pos;
         }
+        // One bit per (reference, popular hash), bits in walk order.
+        const size_t words = (popular.size() + 63) / 64;
+        std::vector<uint64_t> bits(n * words, 0);
+        for (size_t p = 0; p < popular.size(); p++)
+            for (unsigned r : *popular[p]) bits[r * words + p / 64] |= uint64_t(1) << (p % 64);
+        std::vector<unsigned> holders;   // references holding a popular hash, ascending
+        for (unsigned i = 0; i < n; i++)
+            for (size_t w = 0; w < words; w++)
+                if (bits[i * words + w]) { holders.push_back(i); break; }
+        for (size_t x = 0; x < holders.size(); x++) {
+            const uint64_t* bx = &bits[holders[x] * words];
+            for (size_t y = x + 1; y < holders.size(); y++) {
+                const uint64_t* by = &bits[holders[y] * words];
+                uint32_t common = 0, firstPos = 0;
+                for (size_t w = 0; w < words; w++) {
+                    const uint64_t both = bx[w] & by[w];
+                    if (!both) continue;
+                    if (common == 0) firstPos = popularPos[w * 64 + __builtin_ctzll(both)];
+                    common += static_cast<uint32_t>(__builtin_popcountll(both));
+                }
+                if (common == 0) continue;
+                Cell& c = cells[(static_cast<uint64_t>(holders[x]) << 32) | holders[y]];
+                if (c.count == 0 || firstPos < c.first) c.first = firstPos;
+                c.count += common;
+            }
+        }
+        // The pairs in the uncapped loop's insertion order (first position, i, j).
+        struct Entry { uint32_t pos, i, j, count; };
+        std::vector<Entry> entries;
+        entries.reserve(cells.size());
+        for (auto& kv : cells)
+            entries.push_back({kv.second.first, static_cast<uint32_t>(kv.first >> 32),
+                               static_cast<uint32_t>(kv.first & 0xffffffffu), kv.second.count});
+        cells = {};
+        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            return a.pos != b.pos ? a.pos < b.pos : a.i != b.i ? a.i < b.i : a.j < b.j;
+        });
+        for (const Entry& e : entries)
+            shared.emplace((static_cast<uint64_t>(e.i) << 32) | e.j, e.count);
         return shared;
     }
-    // The hashes in the index's order, as the original loop visited them.
+    // The hashes in the index's order, as the original loop visited them. Every
+    // hash is counted here whatever the cap: a visit is an array increment.
     std::vector<const std::vector<unsigned>*> walk;
     walk.reserve(index.size());
     for (auto& kv : index)
-        if (kv.second.size() >= 2 && kv.second.size() <= cap) walk.push_back(&kv.second);
+        if (kv.second.size() >= 2) walk.push_back(&kv.second);
     std::vector<uint32_t> count(n * n, 0), first(n * n, UINT32_MAX);
     unsigned threads = 1;
 #ifdef _OPENMP
@@ -355,8 +438,9 @@ inline std::vector<std::string> clusterReferencesMinHash(
         names[i] = getBaseId(refFiles[i]);
     }
 
-    // Shared-hash counts per candidate pair (countSharedSketchHashes). Ultra-popular
-    // hashes (shared by more than CAP references) are skipped to keep this near-linear.
+    // Shared-hash counts per candidate pair (countSharedSketchHashes). Above 20 000
+    // references, hashes shared by more than CAP of them are counted through bit sets
+    // rather than pair by pair; the counts are the same.
     const size_t CAP = 20000;
     std::unordered_map<uint64_t, uint32_t> shared = countSharedSketchHashes(sketches, CAP);
 
