@@ -29,7 +29,7 @@ static const char VERSION_MESSAGE[] =
 static const char USAGE_MESSAGE[] =
     "Usage: " PROGRAM " [OPTIONS] [ARGS]\n"
     "Identify references and their abundance in FILE(S).\n\n"
-    "Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.\n"
+    "Acceptable file formats: fastq or fasta, plain or gzip-compressed.\n"
     "\n"
     " Options:\n"
     "\n"
@@ -159,6 +159,13 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
     }
 
     std::vector<TreeNode> tree = loadTree(treeFile);
+    {
+        const std::string defect = treeDefect(tree);
+        if (!defect.empty()) {
+            std::cerr << "Error: " << treeFile << ": " << defect << " (damaged or truncated index?)\n";
+            exit(EXIT_FAILURE);
+        }
+    }
 
     // level -> (representative basename -> covered leaf names), from the same
     // partition the index was built with (treeLevelPartition), so every leaf is
@@ -253,11 +260,23 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         for (std::thread& t : loaders) t.join();
     }
     {
-        // k, as loadSketch would have recorded it: the length of the first signature.
-        std::ifstream in(levelSketches.front().second);
-        std::string first;
-        std::getline(in, first);
-        cfg.kmerLen = static_cast<unsigned>(first.find_first_of(" \t"));
+        // k, as loadSketch would have recorded it: the length of the first signature,
+        // of the coarsest sketch that has one. An empty coarsest sketch used to make
+        // k the 4294967295 of a failed search, every read shorter than k and the
+        // table empty, with exit status 0.
+        cfg.kmerLen = 0;
+        for (const auto& ls : levelSketches) {
+            std::ifstream in(ls.second);
+            std::string first;
+            std::getline(in, first);
+            const size_t k = first.find_first_of(" \t");
+            if (k != std::string::npos && k > 0) { cfg.kmerLen = static_cast<unsigned>(k); break; }
+            std::cerr << "Tree query: " << ls.second << " holds no signatures (damaged index?); skipped\n";
+        }
+        if (cfg.kmerLen == 0) {
+            std::cerr << "Error: no sketch of the index holds a signature: " << treeDir << ", " << cfg.ref << "\n";
+            exit(EXIT_FAILURE);
+        }
     }
 
     // Node signatures with carriers: a coarse-level signature that genomes outside
@@ -1114,6 +1133,14 @@ int main(int argc, char* const argv[]) {
     if (!validateFile(cfg.r1, "read file r1")) die = true;
     if (!cfg.r2.empty() && !validateFile(cfg.r2, "read file r2")) die = true;
     if (!validateFile(cfg.ref, "sketch reference file")) die = true;
+    // zlib reads plain text and gzip and passes anything else through as it is.
+    for (const std::string* f : {&cfg.r1, &cfg.r2}) {
+        const char* format = f->empty() ? nullptr : unsupportedCompression(*f);
+        if (format) {
+            std::cerr << "Error: " << *f << " is " << format << "-compressed; reads must be plain or gzip-compressed\n";
+            die = true;
+        }
+    }
     // The table is written when the query is over. A path that cannot be written
     // used to cost the whole query, print nothing and return 0.
     if (!canWriteFile(cfg.out)) {
@@ -1144,6 +1171,12 @@ int main(int argc, char* const argv[]) {
         std::vector<SketchHash> refSigCount;
 
         loadSketch(cfg, cfg.ref, sketchHash, sketchRef, refSigCount, nullptr, cfg.threads);
+        if (sketchHash.empty()) {
+            // What a build that could not write its outputs left behind: the query
+            // ran, wrote a table with no rows and returned 0.
+            std::cerr << "Error: the sketch holds no signatures: " << cfg.ref << "\n";
+            exit(EXIT_FAILURE);
+        }
 
         std::cout << "k: " << cfg.kmerLen << "\n";
         std::cout << "Number of references: " << sketchRef.size() << "\n";

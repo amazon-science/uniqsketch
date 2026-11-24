@@ -358,6 +358,46 @@ void testGzLineReader() {
     std::string l;
     assert(!missing.getline(l));
 
+    // A gzip stream cut short reads like a shorter file; failed() is how a caller
+    // tells the two apart (scanFasta stops the build on it). Lines that do not
+    // compress away, so that half of the bytes is half of the stream.
+    {
+        std::string body;
+        unsigned x = 12345;
+        for (int i = 0; i < 4000; i++) {
+            for (int j = 0; j < 60; j++) { x = x * 1103515245u + 12345u; body += "ACGT"[(x >> 16) & 3]; }
+            body += '\n';
+        }
+        writeGzip("gzline_whole.gz", body);
+        std::ifstream in("gzline_whole.gz", std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        { std::ofstream o("gzline_cut.gz", std::ios::binary); o.write(bytes.data(), static_cast<std::streamsize>(bytes.size() / 2)); }
+        GzLineReader whole("gzline_whole.gz"), cut("gzline_cut.gz");
+        size_t nWhole = 0, nCut = 0;
+        while (whole.getline(l)) ++nWhole;
+        while (cut.getline(l)) ++nCut;
+        assert(nWhole == 4000 && !whole.failed());
+        assert(nCut < 4000 && cut.failed() && !cut.error().empty());
+        std::remove("gzline_whole.gz");
+        std::remove("gzline_cut.gz");
+    }
+    // Formats zlib would pass through as text, by their first bytes.
+    {
+        auto magic = [](const std::string& bytes) {
+            { std::ofstream o("magic_probe.bin", std::ios::binary); o << bytes; }
+            const char* f = unsupportedCompression("magic_probe.bin");
+            return std::string(f ? f : "");
+        };
+        assert(magic("BZh91AY&SY") == "bzip2");
+        assert(magic(std::string("\xFD" "7zXZ\0", 6) + "more") == "xz");
+        assert(magic(std::string("PK\x03\x04", 4) + "more") == "zip");
+        assert(magic("@read1\nACGT\n+\nIIII\n").empty());
+        assert(magic(">contig\nACGT\n").empty());
+        assert(magic("").empty());
+        assert(unsupportedCompression("gzline.txt.gz") == nullptr);      // gzip is read
+        std::remove("magic_probe.bin");
+    }
+
     // uncompressedSize: the plain size, or the gzip trailer's.
     assert(uncompressedSize("gzline_plain.txt") == content.size());
     assert(uncompressedSize("gzline.txt.gz") == content.size());

@@ -471,13 +471,13 @@ exact O(n^2) method for small reference sets.
 Usage: querysketch [OPTIONS] [ARGS]
 Identify references and their abundance in FILE(S).
 
-Acceptable file formats: fastq in compressed formats gz, bz, zip, xz.
+Acceptable file formats: fastq or fasta, plain or gzip-compressed.
 
  Options:
 
   -t, --threads=N       use N parallel threads [1]
   -b, --bit=N           use N bits per element in Bloom filter [64]
-  -o, --out=STRING      the output file name
+  -o, --out=STRING      the output file name [out_sketch.tsv]
   -l, --r1=STRING       input read 1
   -r, --r2=STRING       input read 2
   -g, --ref=STRING      input uniqsketch reference

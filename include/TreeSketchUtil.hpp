@@ -489,26 +489,68 @@ inline std::vector<TreeNode> loadTree(const std::string& treeFile) {
         if (col.size() < 5) continue;  // malformed row
 
         TreeNode node;
-        node.id = static_cast<unsigned>(std::stoul(col[0]));
-        node.name = col[1];
-        node.level = static_cast<unsigned>(std::stoul(col[2]));
-        node.parentId = std::stoi(col[3]);
-        node.isLeaf = (col[4] == "yes");
-        std::string childrenStr = (col.size() > 5) ? col[5] : "";
-        node.filePath = (col.size() > 6) ? col[6] : "";
+        try {
+            node.id = static_cast<unsigned>(std::stoul(col[0]));
+            node.name = col[1];
+            node.level = static_cast<unsigned>(std::stoul(col[2]));
+            node.parentId = std::stoi(col[3]);
+            node.isLeaf = (col[4] == "yes");
+            std::string childrenStr = (col.size() > 5) ? col[5] : "";
+            node.filePath = (col.size() > 6) ? col[6] : "";
 
-        if (!childrenStr.empty() && childrenStr != "-") {
-            std::istringstream cs(childrenStr);
-            std::string token;
-            while (std::getline(cs, token, ',')) {
-                if (!token.empty()) {
-                    node.children.push_back(std::stoi(token));
+            if (!childrenStr.empty() && childrenStr != "-") {
+                std::istringstream cs(childrenStr);
+                std::string token;
+                while (std::getline(cs, token, ',')) {
+                    if (!token.empty()) {
+                        node.children.push_back(std::stoi(token));
+                    }
                 }
             }
+        } catch (const std::exception&) {
+            // A number that is not one: the conversions threw and the query died
+            // on an uncaught exception.
+            std::cerr << "Error: " << treeFile << ": cannot parse the row (damaged index?):\n" << line << "\n";
+            exit(EXIT_FAILURE);
         }
         tree.push_back(std::move(node));
     }
     return tree;
+}
+
+/**
+ * What is wrong with the structure of a loaded tree, or an empty string.
+ *
+ * treeLevelPartition walks from every leaf up its parents. It took a parent id
+ * that is not in the file with unordered_map::at (an uncaught exception: a
+ * tree_index.tsv cut short loses its internal nodes first, they are written
+ * last), followed a cycle of parents for ever, and from a file with no rows
+ * made a tree without leaves, for which the query took the coarsest level
+ * sketch for the leaf sketch and reported a node's hits as a strain. The query
+ * asks this once after loadTree and stops with the answer.
+ */
+inline std::string treeDefect(const std::vector<TreeNode>& tree) {
+    std::unordered_map<unsigned, size_t> byId;
+    size_t leaves = 0;
+    for (size_t i = 0; i < tree.size(); i++) {
+        if (!byId.emplace(tree[i].id, i).second)
+            return "node id " + std::to_string(tree[i].id) + " appears twice";
+        leaves += tree[i].isLeaf;
+    }
+    if (leaves == 0) return "no leaf node";
+    for (const TreeNode& n : tree) {
+        size_t steps = 0;
+        for (int pid = n.parentId; pid != -1; ++steps) {
+            auto it = pid < 0 ? byId.end() : byId.find(static_cast<unsigned>(pid));
+            if (it == byId.end())
+                return "node " + std::to_string(n.id) + " (" + n.name + ") has an ancestor with id " +
+                       std::to_string(pid) + ", which is not in the file";
+            if (steps > tree.size())
+                return "node " + std::to_string(n.id) + " (" + n.name + ") is its own ancestor";
+            pid = tree[it->second].parentId;
+        }
+    }
+    return std::string();
 }
 
 #endif // TREESKETCHUTIL_HPP_

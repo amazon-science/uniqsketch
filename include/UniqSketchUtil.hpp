@@ -126,6 +126,14 @@ inline void scanFasta(const std::string& fPath, Fn fn, unsigned padK = 0) {
             std::replace(header.begin(), header.end(), ' ', '_');
         }
     }
+    // The file ended on an error, not at its end (a gzip stream cut short, corrupt
+    // data): what was read is part of the genome. The reference used to be indexed
+    // from that part, its signatures all from the first half, without a word.
+    if (refFile.failed()) {
+        std::cerr << "Error: " + (refFile.error().find(fPath) == 0 ? std::string() : fPath + ": ") + refFile.error() +
+                     " (truncated or corrupt file?)\n";
+        exit(EXIT_FAILURE);
+    }
 }
 
 /** Wrap padding for a build: k-1 bases with --circular, none without. */

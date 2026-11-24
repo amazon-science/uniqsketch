@@ -61,6 +61,42 @@ void testLoadTree() {
 
 // build_params.tsv round-trips, and its absence is reported rather than guessed:
 // querysketch lowers the read cutoff only for a record that says strict margin 2.
+// treeDefect: the structural damage the query refuses (a parent that is not in the
+// file, a cycle of parents, a tree without leaves, an id used twice). Each of the
+// first three used to end in an uncaught exception, a hang, or wrong rows.
+void testTreeDefect() {
+    std::cerr << "START: Test treeDefect... \t";
+    auto node = [](unsigned id, int parent, bool leaf, unsigned level) {
+        TreeNode n;
+        n.id = id; n.name = "n" + std::to_string(id); n.level = level; n.parentId = parent; n.isLeaf = leaf;
+        return n;
+    };
+    // Two leaves under node 2, node 2 under node 3, one leaf on its own.
+    std::vector<TreeNode> tree = {node(0, 2, true, 2), node(1, 2, true, 2), node(4, -1, true, 2),
+                                  node(2, 3, false, 1), node(3, -1, false, 0)};
+    assert(treeDefect(tree).empty());
+    assert(treeLevelPartition(tree).size() == 2);
+
+    std::vector<TreeNode> dangling = tree;
+    dangling.pop_back();                                   // the file cut before its last row
+    assert(treeDefect(dangling).find("not in the file") != std::string::npos);
+
+    std::vector<TreeNode> cycle = tree;
+    cycle[4].parentId = 2;                                 // 2 -> 3 -> 2
+    assert(treeDefect(cycle).find("its own ancestor") != std::string::npos);
+    std::vector<TreeNode> self = tree;
+    self[4].parentId = 3;
+    assert(treeDefect(self).find("its own ancestor") != std::string::npos);
+
+    assert(treeDefect({}).find("no leaf") != std::string::npos);
+    assert(treeDefect({node(0, -1, false, 0)}).find("no leaf") != std::string::npos);
+
+    std::vector<TreeNode> twice = tree;
+    twice[1].id = 0;
+    assert(treeDefect(twice).find("appears twice") != std::string::npos);
+    std::cerr << "PASSED: Test treeDefect\n";
+}
+
 void testBuildParamsRoundTrip() {
     std::cerr << "START: Test build params round trip... \t";
     const char* dir = ".";
@@ -878,6 +914,7 @@ void testCardinalitySamples() {
 
 int main() {
     testLoadTree();
+    testTreeDefect();
     testBuildParamsRoundTrip();
     testTreeLeavesRoundTrip();
     testGetTreeLevelRefs();

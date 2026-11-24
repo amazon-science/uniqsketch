@@ -245,6 +245,16 @@ int main(int argc, char** argv) {
     if (!validateFiles(refFiles, "reference file")) {
         exit(EXIT_FAILURE);
     }
+    {
+        bool bad = false;
+        for (const std::string& f : refFiles) {
+            if (const char* format = unsupportedCompression(f)) {
+                std::cerr << "Error: " << f << " is " << format << "-compressed; references must be plain or gzip-compressed\n";
+                bad = true;
+            }
+        }
+        if (bad) exit(EXIT_FAILURE);
+    }
 
     // A reference is named by its file's base name, in the sketch and in the
     // candidate file it gets under -f. Two references with the same base name
@@ -261,6 +271,21 @@ int main(int argc, char** argv) {
             }
         }
         if (clash) exit(EXIT_FAILURE);
+    }
+    // The stat file names one candidate file per reference and is read back split
+    // at white space, like the sketch itself: a reference whose file name holds a
+    // blank was cut there, reported as "not a uniqsketch candidate file" and left
+    // out of the sketch, with exit status 0. (-f cannot hold one: option values
+    // are read up to the first blank.)
+    {
+        bool bad = false;
+        for (const std::string& f : refFiles) {
+            if (getBaseId(f).find_first_of(" \t") != std::string::npos) {
+                std::cerr << "Error: the name of a reference file cannot contain white space: " << f << "\n";
+                bad = true;
+            }
+        }
+        if (bad) exit(EXIT_FAILURE);
     }
 
     mkdir(cfg.outdir.c_str(), 0777);

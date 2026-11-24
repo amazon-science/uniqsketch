@@ -560,6 +560,7 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
     std::condition_variable cvFull, cvEmpty;
     std::deque<std::unique_ptr<Batch>> ready, spare;
     size_t filesDone = 0;           // files whose last batch has been taken (under mu)
+    std::vector<std::string> readErrors;   // files that ended on an error, not at their end (under mu)
     // One batch in hand per consumer, plus QUEUE_DEPTH per reader to fill ahead.
     const size_t queueDepth = static_cast<size_t>(maxThreads) + QUEUE_DEPTH * sampleFiles.size();
     for (size_t i = 0; i < queueDepth; i++) spare.emplace_back(new Batch);
@@ -582,7 +583,23 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
                 b->seq.clear();
                 b->name.clear();
                 for (size_t i = 0; i < BATCH_SIZE; ++i) {
-                    if (kseq_read(ks) < 0) {
+                    const int rc = static_cast<int>(kseq_read(ks));
+                    if (rc < 0) {
+                        // -1 is the end of the file, -2 a record without (all of) its
+                        // quality line, -3 a read error. zlib ends a gzip stream that
+                        // was cut short like a complete one and says so only when
+                        // asked. The reads up to there used to be counted as the sample.
+                        int zcode = Z_OK;
+                        const char* zmsg = fp ? gzerror(fp, &zcode) : "cannot open";
+                        const bool zfailed = !fp || (zcode != Z_OK && zcode != Z_STREAM_END);
+                        if (rc != -1 || zfailed) {
+                            // zlib's message names the file itself.
+                            std::string what = zfailed && zmsg && *zmsg ? std::string(zmsg) :
+                                               rc == -2 ? std::string("incomplete or malformed FASTQ record") : std::string("read error");
+                            if (what.find(path) != 0) what = path + ": " + what;
+                            std::lock_guard<std::mutex> lk(mu);
+                            readErrors.push_back(what);
+                        }
                         eof = true;
                         break;
                     }
@@ -675,6 +692,11 @@ void queryReads(const QuerySketchConfig& cfg, const std::vector<std::string>& sa
         }
     }
     for (std::thread& t : readers) t.join();
+    if (!readErrors.empty()) {
+        for (const std::string& e : readErrors)
+            std::cerr << "Error: " << e << " (unreadable, truncated or corrupt file?)\n";
+        exit(EXIT_FAILURE);
+    }
 
     // Distinct read names per target. Two reads with the same name (mates named
     // alike, say) are one read here, as they were when names went straight into

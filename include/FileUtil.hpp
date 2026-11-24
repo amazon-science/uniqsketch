@@ -41,6 +41,16 @@ public:
     /** False if the file could not be opened. */
     explicit operator bool() const { return fp_ != nullptr; }
 
+    /**
+     * True when reading stopped on an error rather than at the end of the file: a
+     * gzip stream cut short (zlib hands over what decompressed, then reports
+     * Z_BUF_ERROR), corrupt data, or a path that cannot be read. getline() is
+     * false from then on, exactly as at the end of a file, so a caller that does
+     * not ask reads a truncated file as a short one; error() is zlib's message.
+     */
+    bool failed() const { return !error_.empty(); }
+    const std::string& error() const { return error_; }
+
     bool getline(std::string& line) {
         line.clear();
         bool any = false;
@@ -63,13 +73,19 @@ private:
     bool fill() {
         if (!fp_) return false;
         int n = gzread(fp_, buf_.data(), static_cast<unsigned>(buf_.size()));
-        if (n <= 0) return false;
+        if (n <= 0) {
+            int code = Z_OK;
+            const char* msg = gzerror(fp_, &code);
+            if (n < 0 || (code != Z_OK && code != Z_STREAM_END)) error_ = (msg && *msg) ? msg : "read error";
+            return false;
+        }
         pos_ = 0;
         len_ = static_cast<size_t>(n);
         return true;
     }
 
     gzFile fp_;
+    std::string error_;
     std::vector<char> buf_ = std::vector<char>(1 << 16);
     size_t pos_ = 0, len_ = 0;
 };
@@ -104,6 +120,26 @@ inline size_t uncompressedSize(const std::string& path) {
     for (int n; (n = gzread(fp, buf.data(), static_cast<unsigned>(buf.size()))) > 0;) total += static_cast<size_t>(n);
     gzclose(fp);
     return total ? total : compressed;
+}
+
+/**
+ * The compression format of a file the tools cannot read, from its first bytes:
+ * "bzip2", "xz" or "zip"; nullptr for anything else (plain text and gzip, which
+ * zlib reads, included). zlib passes what is not gzip through as it is, so such
+ * a file was read as text that holds no sequence: a query of bzip2 reads gave an
+ * empty table and exit status 0. Only a regular file is looked at: reading the
+ * first bytes of a pipe (reads given as <(zcat ...)) would take them from it.
+ */
+inline const char* unsupportedCompression(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return nullptr;
+    std::ifstream in(path, std::ios::binary);
+    unsigned char m[6] = {0, 0, 0, 0, 0, 0};
+    in.read(reinterpret_cast<char*>(m), 6);
+    if (m[0] == 'B' && m[1] == 'Z' && m[2] == 'h') return "bzip2";
+    if (m[0] == 0xFD && m[1] == '7' && m[2] == 'z' && m[3] == 'X' && m[4] == 'Z' && m[5] == 0) return "xz";
+    if (m[0] == 'P' && m[1] == 'K' && m[2] == 3 && m[3] == 4) return "zip";
+    return nullptr;
 }
 
 /**
