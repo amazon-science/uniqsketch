@@ -121,6 +121,8 @@ int main(int argc, char** argv) {
     bool centralRepresentative = true;   // --node-representative=central|largest
     int explicitCov = 0;            // -c
     bool covGiven = false;
+    bool clusterGiven = false;      // --cluster
+    std::vector<std::string> treeOnly;   // options given that only a --tree build reads
 
     bool die = false;
     int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
@@ -140,7 +142,7 @@ int main(int argc, char** argv) {
         case 'f': arg >> cfg.outdir;           break;
         case 'r': arg >> cfg.refstat;          break;
         case 'e': arg >> cfg.entropyThreshold; break;
-        case OPT_CLUSTER: arg >> clusterThreshold; break;
+        case OPT_CLUSTER: arg >> clusterThreshold; clusterGiven = true; break;
         case OPT_MINMARGIN: arg >> cfg.minMargin; marginGiven = true; break;
         case OPT_EXACT: useExactCluster = true; break;
         case OPT_TREE: {
@@ -160,9 +162,10 @@ int main(int argc, char** argv) {
         case OPT_CIRCULAR: cfg.circular = true; break;
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
         case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
-        case OPT_NOGROUPSIGS: groupSignatures = false; break;
-        case OPT_NODECARRIERS: arg >> nodeCarriers; break;
+        case OPT_NOGROUPSIGS: groupSignatures = false; treeOnly.push_back("--no-group-signatures"); break;
+        case OPT_NODECARRIERS: arg >> nodeCarriers; treeOnly.push_back("--node-carriers"); break;
         case OPT_NODEREP: {
+            treeOnly.push_back("--node-representative");
             std::string which;
             arg >> which;
             if (which == "central") centralRepresentative = true;
@@ -227,6 +230,29 @@ int main(int argc, char** argv) {
                          "(pass --min-margin=1 to select signatures without a margin)\n";
         cfg.strictMargin = true;
     }
+
+    // Values no build can use. They were taken as given: -k 0, -b 0 or -d 0 ran
+    // to the end and wrote an empty sketch, -c 0 and below one signature per
+    // reference, all with exit status 0.
+    if (cfg.kmerLen < 1 || cfg.bits < 1 || cfg.nhash1 < 1 || cfg.nhash2 < 1 || cfg.sketchnum < 1) {
+        std::cerr << PROGRAM ": -k, -b, -d, -s and -c must be at least 1\n";
+        die = true;
+    }
+    // --cluster reduces the reference list to cluster representatives after the tree
+    // is built, so the leaf sketch named fewer references than the tree has leaves
+    // and numbered them differently: a query of such an index reported a member's
+    // reads under another member's name.
+    if (!treeThresholds.empty() && clusterGiven && clusterThreshold > 0) {
+        std::cerr << PROGRAM ": --cluster cannot be combined with --tree (the tree keeps every reference; "
+                     "its nodes are the clusters)\n";
+        die = true;
+    }
+    // Options that do nothing in this mode were ignored without a word.
+    if (treeThresholds.empty())
+        for (const std::string& o : treeOnly)
+            std::cerr << PROGRAM ": warning: " << o << " has no effect without --tree\n";
+    if (useExactCluster && clusterThreshold == 0)
+        std::cerr << PROGRAM ": warning: --exact has no effect without --cluster\n";
 
     if (argc - optind < 1) {
         std::cerr << PROGRAM ": missing arguments\n";
@@ -618,6 +644,17 @@ int main(int argc, char** argv) {
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     identifyUniqKmers(cfg, refFiles, dbFilter);
     buildSketch(cfg, cfg.refstat, dbFilter);
+    // A flat index without a single signature can report nothing (a k too small
+    // for any k-mer to be unique, references that are all copies of one another):
+    // the warnings above say why, and the build used to end with exit status 0.
+    // A tree index may still report every reference through its nodes.
+    if (tree.empty()) {
+        struct stat st;
+        if (stat(cfg.outfile.c_str(), &st) == 0 && st.st_size == 0) {
+            std::cerr << "Error: no reference got a signature; the sketch " << cfg.outfile << " is empty\n";
+            exit(EXIT_FAILURE);
+        }
+    }
 
     // Within-group leaf signatures (see GroupSketchUtil.hpp). Built after the
     // leaf sketch so that refIds match it and its signatures are not repeated,

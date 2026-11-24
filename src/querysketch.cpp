@@ -1120,6 +1120,8 @@ int main(int argc, char* const argv[]) {
     bool readCutoffGiven = false;  // --rcutoff passed explicitly (tree mode picks a default otherwise)
     int explicitHit = 0;           // -h
     bool hitGiven = false;
+    bool breadthGiven = false;     // --breadth (the flat query's floor)
+    std::vector<std::string> treeOnly;   // options given that only a --tree query reads
 
     bool die = false;
     int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
@@ -1138,11 +1140,11 @@ int main(int argc, char* const argv[]) {
         case 'a': arg >> cfg.abundanceCutoff; break;
         case 's': arg >> cfg.readCutoff; readCutoffGiven = true; break;
         case 'b': arg >> cfg.bits;            break;
-        case OPT_BREADTH: arg >> cfg.breadth; break;
+        case OPT_BREADTH: arg >> cfg.breadth; breadthGiven = true; break;
         case OPT_TREE: arg >> treeDir;         break;
-        case OPT_TREEPRUNE: arg >> cfg.treePruneHit; break;
-        case OPT_TREEBREADTH: arg >> cfg.treeBreadth; break;
-        case OPT_NOGROUPSIGS: cfg.noGroupSignatures = true; break;
+        case OPT_TREEPRUNE: arg >> cfg.treePruneHit; treeOnly.push_back("--tree-prune"); break;
+        case OPT_TREEBREADTH: arg >> cfg.treeBreadth; treeOnly.push_back("--tree-breadth"); break;
+        case OPT_NOGROUPSIGS: cfg.noGroupSignatures = true; treeOnly.push_back("--no-group-signatures"); break;
         case OPT_HELP:
             std::cerr << USAGE_MESSAGE;
             exit(EXIT_SUCCESS);
@@ -1164,6 +1166,20 @@ int main(int argc, char* const argv[]) {
     if (hitGiven && g_sketchHit && g_sketchHit != explicitHit)
         std::cerr << PROGRAM ": -h " << explicitHit << " given; --sensitive / --very-sensitive ignored\n";
     cfg.solid = g_solid;
+
+    // A negative -h or -s is compared as a huge unsigned number: nothing was
+    // reported, with exit status 0.
+    if (cfg.sketchHit < 0 || cfg.readCutoff < 0) {
+        std::cerr << PROGRAM ": -h and -s cannot be negative\n";
+        die = true;
+    }
+    // Options that do nothing in this mode were ignored without a word: --breadth=0
+    // with --tree left the tree's floor at 0.5.
+    if (!treeDir.empty() && breadthGiven)
+        std::cerr << PROGRAM ": warning: --breadth has no effect with --tree; the tree query's floor is --tree-breadth\n";
+    if (treeDir.empty())
+        for (const std::string& o : treeOnly)
+            std::cerr << PROGRAM ": warning: " << o << " has no effect without --tree\n";
 
     if (cfg.r1.empty()) {
         std::cerr << "Error: no input file r1 provided.\n";
