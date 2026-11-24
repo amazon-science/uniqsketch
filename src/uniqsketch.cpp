@@ -43,6 +43,7 @@ static const char USAGE_MESSAGE[] =
     "  -e, --entropy\t\tsets the aggregate entropy rate threshold [0.65]\n"
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
     "      --tree=T1,T2,..\tbuild hierarchical tree index with comma-separated thresholds\n"
+    "\t\t\t(k-mer counts as plain integers, e.g. 1000000,300000; the list is required)\n"
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
@@ -136,10 +137,12 @@ int main(int argc, char** argv) {
         case OPT_TREE: {
             std::string treeArg;
             arg >> treeArg;
-            std::istringstream ts(treeArg);
-            std::string token;
-            while (std::getline(ts, token, ',')) {
-                if (!token.empty()) treeThresholds.push_back(std::stoi(token));
+            const std::string problem = parseTreeThresholds(treeArg, treeThresholds);
+            if (!problem.empty()) {
+                std::cerr << PROGRAM ": --tree=" << treeArg << ": " << problem
+                          << "\n  --tree takes a list of thresholds (there is no default list): k-mer counts as plain "
+                             "integers, comma-separated, e.g. --tree=1000000,300000,100000,10000\n";
+                exit(EXIT_FAILURE);
             }
             // Sort descending (coarsest first)
             std::sort(treeThresholds.begin(), treeThresholds.end(), std::greater<unsigned>());
@@ -316,6 +319,14 @@ int main(int argc, char** argv) {
         tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
                                           cfg.nhash1, cfg.bits,
                                           estimateMaxGenomeSize(refFiles), treeFile);
+        // No two references merged at any threshold: the tree is its leaves and the
+        // index will have no node level. That is what a list written with thousands
+        // separators (1,000,000 is the thresholds 1, 0 and 0) or in another unit
+        // builds, and it was said only in passing ("0 internal nodes").
+        if (std::none_of(tree.begin(), tree.end(), [](const TreeNode& n) { return !n.isLeaf; }))
+            std::cerr << PROGRAM ": warning: no two references merged at any --tree threshold (largest: "
+                      << treeThresholds.front() << "); the index has no node level, so no family rows. "
+                         "Thresholds are counts of distinguishing k-mers between genomes\n";
 
         // Every level's sketch is built over the complete partition of the leaves
         // at that level (see treeLevelPartition), so its signatures are unique

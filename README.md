@@ -260,6 +260,7 @@ A list of files containing file names in each row can be passed with @ prefix.
   -e, --entropy         sets the aggregate entropy rate threshold [0.65]
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
       --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
+                        (k-mer counts as plain integers, e.g. 1000000,300000; the list is required)
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]

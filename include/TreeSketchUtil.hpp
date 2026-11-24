@@ -323,6 +323,35 @@ getTreeLevelRefs(const std::vector<TreeNode>& tree) {
 }
 
 /**
+ * Parse the list given to --tree: comma-separated thresholds, each a count of
+ * distinguishing k-mers written as a plain non-negative integer, appended to
+ * `out` in the order given. Returns an empty string, or what is wrong.
+ *
+ * The tokens used to go through std::stoi, which converts the leading digits and
+ * stops: 1e6 was 1, 1,000,000 was 1,0,0, 10k was 10 and -5 became 4294967291 in
+ * the unsigned list, each building a tree nobody asked for with exit status 0.
+ * abc, a value above 2^31 and --tree given without a list (it then takes the next
+ * option as its list) threw, and the tool died on the uncaught exception. An
+ * empty list switched the tree off without a word and left a flat index.
+ */
+inline std::string parseTreeThresholds(const std::string& arg, std::vector<unsigned>& out) {
+    std::istringstream ts(arg);
+    std::string token;
+    size_t parsed = 0;
+    while (std::getline(ts, token, ',')) {
+        if (token.empty()) continue;        // a doubled or trailing comma, as before
+        if (token.find_first_not_of("0123456789") != std::string::npos)
+            return "`" + token + "' is not a plain integer";
+        if (token.size() > 10 || std::stoull(token) > UINT_MAX)
+            return "`" + token + "' is too large (at most " + std::to_string(UINT_MAX) + ")";
+        out.push_back(static_cast<unsigned>(std::stoull(token)));
+        ++parsed;
+    }
+    if (parsed == 0) return "no threshold given";
+    return std::string();
+}
+
+/**
  * Signature-selection parameters recorded next to a tree index
  * (<outdir>/build_params.tsv, one `key<TAB>value` per line).
  *

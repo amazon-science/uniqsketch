@@ -97,6 +97,27 @@ void testTreeDefect() {
     std::cerr << "PASSED: Test treeDefect\n";
 }
 
+// parseTreeThresholds: what --tree accepts. Everything refused here used to build
+// some other tree with exit status 0, or end in an uncaught std::stoi exception.
+void testParseTreeThresholds() {
+    std::cerr << "START: Test parseTreeThresholds... \t";
+    std::vector<unsigned> t;
+    assert(parseTreeThresholds("1000000,300000,100000,10000", t).empty());
+    assert(t == std::vector<unsigned>({1000000, 300000, 100000, 10000}));
+    t.clear();
+    assert(parseTreeThresholds("100,,5000,", t).empty());            // empty tokens are skipped, order is kept
+    assert(t == std::vector<unsigned>({100, 5000}));
+    t.clear();
+    assert(parseTreeThresholds("4294967295,0", t).empty());          // the range of the unsigned threshold
+    assert(t == std::vector<unsigned>({4294967295u, 0}));
+    for (const char* bad : {"1e6,1e5", "10k", "-5", "+5", "abc", "4000,abc", "1.5", "0x10", "4294967296",
+                            "99999999999", "", ",", "-c500"}) {
+        t.clear();
+        assert(!parseTreeThresholds(bad, t).empty());
+    }
+    std::cerr << "PASSED: Test parseTreeThresholds\n";
+}
+
 void testBuildParamsRoundTrip() {
     std::cerr << "START: Test build params round trip... \t";
     const char* dir = ".";
@@ -923,6 +944,7 @@ void testCardinalitySamples() {
 int main() {
     testLoadTree();
     testTreeDefect();
+    testParseTreeThresholds();
     testBuildParamsRoundTrip();
     testTreeLeavesRoundTrip();
     testGetTreeLevelRefs();
