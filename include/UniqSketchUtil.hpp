@@ -94,21 +94,31 @@ using SketchHash = std::unordered_map<std::string, unsigned>;
  * one of them means the same base to all of them. The line handling is the one
  * the scanners had when each carried its own copy of the loop, kept exactly:
  * a header line of just ">" leaves the previous header in force, and an empty
- * line inside a record is skipped.
+ * line inside a record is skipped. A carriage return before the line feed is
+ * part of the line ending (a FASTA written on Windows): left in, it sat inside
+ * the sequence, so every k-mer spanning a line break was lost (all of them at
+ * k = 81 with 60-column lines: the reference got no signatures) and every
+ * position was shifted by the line breaks before it. The k-mer counts and the
+ * tree's sketches, which read through kseq, never saw it.
  */
 template <typename Fn>
 inline void scanFasta(const std::string& fPath, Fn fn, unsigned padK = 0) {
     GzLineReader refFile(fPath);          // plain or gzip
     std::string line;
-    bool good = refFile.getline(line);
+    auto getLine = [&refFile](std::string& l) {
+        const bool more = refFile.getline(l);
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        return more;
+    };
+    bool good = getLine(line);
     std::string header = line.empty() ? std::string() : line.substr(1);
     std::replace(header.begin(), header.end(), ' ', '_');
     while (good) {
         std::string faSeq;
-        good = refFile.getline(line);
+        good = getLine(line);
         while (good && line[0] != '>') {
             faSeq += line;
-            good = refFile.getline(line);
+            good = getLine(line);
         }
         // A circular molecule rendered linearly loses the k-1 k-mers that span
         // its end-to-start join: they are in the genome but not in the file.

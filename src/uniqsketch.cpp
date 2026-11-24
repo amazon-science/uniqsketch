@@ -243,6 +243,10 @@ int main(int argc, char** argv) {
             std::string inName;
             std::ifstream inList(listPath);
             while (std::getline(inList, inName)) {
+                // A list saved with CRLF line endings: the carriage return became
+                // part of the path, and every file was "not found" under a name that
+                // looks right on the terminal.
+                if (!inName.empty() && inName.back() == '\r') inName.pop_back();
                 if (!inName.empty()) {
                     refFiles.push_back(inName);
                 }

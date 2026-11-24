@@ -331,6 +331,28 @@ void testOutputProbes() {
     std::cerr << "PASSED: Test output probes\n";
 }
 
+// scanFasta reads a FASTA with CRLF line endings as the same contigs: the
+// carriage return is part of the line ending, not of the header or the sequence.
+void testScanFastaLineEndings() {
+    std::cerr << "START: Test scanFasta line endings... \t";
+    const std::string lf = ">c1 first\nACGTAC\nGTTGCA\n>c2\nTTTTGG\n";
+    std::string crlf;
+    for (char c : lf) { if (c == '\n') crlf += '\r'; crlf += c; }
+    { std::ofstream o("scan_lf.fa", std::ios::binary); o << lf; }
+    { std::ofstream o("scan_crlf.fa", std::ios::binary); o << crlf; }
+    auto contigs = [](const char* path) {
+        std::vector<std::pair<std::string, std::string>> got;
+        scanFasta(path, [&](const std::string& header, std::string& seq, size_t) { got.emplace_back(header, seq); });
+        return got;
+    };
+    const std::vector<std::pair<std::string, std::string>> expect = {{"c1_first", "ACGTACGTTGCA"}, {"c2", "TTTTGG"}};
+    assert(contigs("scan_lf.fa") == expect);
+    assert(contigs("scan_crlf.fa") == expect);
+    std::remove("scan_lf.fa");
+    std::remove("scan_crlf.fa");
+    std::cerr << "PASSED: Test scanFasta line endings\n";
+}
+
 // GzLineReader has std::getline's contract on plain and gzip files alike:
 // empty lines are lines, the last line needs no newline, a trailing newline
 // does not make an extra empty line, and a line longer than the read buffer
@@ -833,6 +855,7 @@ int main() {
     testKmerLookAhead();
     testGzLineReader();
     testOutputProbes();
+    testScanFastaLineEndings();
     testGzipReference(cfg);
     testCandidateFile();
     testBuildSketch(cfg);

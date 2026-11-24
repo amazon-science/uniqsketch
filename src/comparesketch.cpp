@@ -123,10 +123,14 @@ int main(int argc, char** argv) {
     std::ifstream inList1(argv[optind]);
     std::ifstream inList2(argv[optind + 1]);
 
+    // A carriage return before the line feed (a list saved with CRLF line endings)
+    // is not part of the path.
     while (std::getline(inList1, inName)) {
+        if (!inName.empty() && inName.back() == '\r') inName.pop_back();
         if (!inName.empty()) refSet1.push_back(inName);
     }
     while (std::getline(inList2, inName)) {
+        if (!inName.empty() && inName.back() == '\r') inName.pop_back();
         if (!inName.empty()) refSet2.push_back(inName);
     }
 
