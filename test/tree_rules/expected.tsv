@@ -75,7 +75,7 @@ V_no_params_S19	no_params	S19_D_b1read2.fq	-	0	D:strain	no build_params.tsv: the
 V_margin1_S19	margin1	S19_D_b1read2.fq	-	0	D:strain	an index without a strict margin: the read cutoff stays at 2
 V_no_group_S12	no_group	S12_W.fq	-	0	cluster_L1_W:family:V|W	no sketch_group.tsv: W falls back to its family
 V_no_leaves_S02	no_leaves	S02_X3.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	no leaves.tsv: unnamed leaves are kept in play, coarser row
-V_short_leaves_S12	short_leaves	S12_W.fq	-	0	W:strain	a leaves.tsv of the wrong length is ignored
+V_short_leaves_S12	short_leaves	S12_W.fq	-	1	*	a leaves.tsv of the wrong length: --ref does not number the tree's leaves, a message and exit 1
 V_no_carriers_S02	no_carriers	S02_X3.fq	-	0	cluster_L1_X1:family:X1|X1s|X2|X3	level sketches without the carriers column: every signature is the node's
 V_largest_rep_S16	largest_rep	S16_PP_locus.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	an index with the largest member as representative: family rows are not held to the breadth floor
 V_other_bf_S12	other_bf	S12_W.fq	-	0	W:strain	another Bloom filter layout: a warning only

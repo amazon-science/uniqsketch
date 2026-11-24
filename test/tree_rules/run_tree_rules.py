@@ -404,7 +404,7 @@ def rule_checks(R, facts, ix):
          "%s vs %s" % (a, b))
     for case, text in (("V_no_ancestor_S16", "has no ancestor_signatures.tsv"), ("V_no_params_S19", "predates build_params.tsv"),
                        ("V_margin1_S19", "built without a strict margin"), ("V_no_group_S12", "has no within-group signatures"),
-                       ("V_no_leaves_S02", "unnamed and kept in play"), ("V_short_leaves_S12", "ignoring it"),
+                       ("V_no_leaves_S02", "unnamed and kept in play"), ("V_short_leaves_S12", "is not the leaf sketch of the tree index"),
                        ("V_largest_rep_S16", "largest member as node representative"), ("V_other_bf_S12", "Bloom filter"),
                        ("V_no_tree_S12", "tree index file not found"), ("O_solid_empty", "insufficient k-mer content")):
         rule(case, "stderr says: %s" % text, text in R[case].err)

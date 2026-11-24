@@ -1,4 +1,5 @@
 #include <getopt.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <atomic>
@@ -246,6 +247,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         const unsigned inner = std::max(1u, cfg.threads / outer);
         std::vector<std::thread> loaders;
         std::atomic<size_t> next{0};
+        std::vector<unsigned> levelK(levelSketches.size(), 0);     // k of each sketch (0: no line)
         for (unsigned t = 0; t < outer; t++) {
             loaders.emplace_back([&] {
                 for (size_t li = next++; li < levelSketches.size(); li = next++) {
@@ -254,10 +256,46 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                     levels[li].level = levelSketches[li].first;
                     loadSketch(local, levelSketches[li].second, levelHash[li], levels[li].ref, levels[li].sig,
                                leaf ? nullptr : &levelCarriers[li], inner, leaf ? &leafPositions : nullptr);
+                    levelK[li] = local.kmerLen;
                 }
             });
         }
         for (std::thread& t : loaders) t.join();
+
+        // --ref must be the leaf sketch the build wrote with this tree. Only the
+        // existence of the two was checked: a level sketch or the within-group
+        // sketch of the same index, a sketch of another k, a flat sketch of the
+        // same genomes were all loaded as the leaf level, and the query returned 0
+        // with rows for the wrong references (see leafSketchMismatch).
+        auto notTheLeafSketch = [&](const std::string& why) {
+            std::cerr << "Error: --ref " << cfg.ref << " is not the leaf sketch of the tree index " << treeDir
+                      << ": " << why << "\n  --ref takes the sketch (-o) written by the uniqsketch --tree build "
+                         "that wrote the directory\n";
+            exit(EXIT_FAILURE);
+        };
+        struct stat refStat, other;
+        const bool haveRefStat = stat(cfg.ref.c_str(), &refStat) == 0;
+        auto sameFile = [&](const std::string& path) {
+            return haveRefStat && stat(path.c_str(), &other) == 0 &&
+                   refStat.st_dev == other.st_dev && refStat.st_ino == other.st_ino;
+        };
+        for (size_t li = 0; li + 1 < levelSketches.size(); li++)
+            if (sameFile(levelSketches[li].second))
+                notTheLeafSketch("it is the index's level " + std::to_string(levelSketches[li].first) + " sketch");
+        if (sameFile(groupSketchPath(treeDir))) notTheLeafSketch("it is the index's within-group sketch");
+        unsigned k = bp.loaded ? bp.kmerLen : 0;
+        for (size_t li = 0; li < levelSketches.size(); li++) {
+            if (!levelK[li]) continue;
+            if (!k) k = levelK[li];
+            if (levelK[li] == k) continue;
+            const std::string what = "its signatures are " + std::to_string(levelK[li]) + "-mers, the index's " +
+                                     std::to_string(k) + "-mers";
+            if (li + 1 == levelSketches.size()) notTheLeafSketch(what);
+            std::cerr << "Error: " << levelSketches[li].second << ": " << what << " (damaged or mixed index?)\n";
+            exit(EXIT_FAILURE);
+        }
+        const std::string mismatch = leafSketchMismatch(levels.back().ref, loadTreeLeaves(treeLeavesPath(treeDir)), tree);
+        if (!mismatch.empty()) notTheLeafSketch(mismatch);
     }
     {
         // k, as loadSketch would have recorded it: the length of the first signature,

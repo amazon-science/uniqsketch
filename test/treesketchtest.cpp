@@ -118,6 +118,29 @@ void testParseTreeThresholds() {
     std::cerr << "PASSED: Test parseTreeThresholds\n";
 }
 
+// leafSketchMismatch: what ties --ref to --tree.
+void testLeafSketchIdentity() {
+    std::cerr << "START: Test leaf sketch identity... \t";
+    auto leaf = [](unsigned id, const std::string& path) {
+        TreeNode n;
+        n.id = id; n.name = getBaseId(path); n.level = 1; n.parentId = -1; n.isLeaf = true; n.filePath = path;
+        return n;
+    };
+    const std::vector<TreeNode> tree = {leaf(0, "/d/A.fa"), leaf(1, "/d/B.fa"), leaf(2, "/d/C.fa")};
+    const std::vector<std::string> recorded = {"B", "A", "C"};               // the build's numbering
+    assert(leafSketchMismatch({"B", "A", "C"}, recorded, tree).empty());
+    assert(leafSketchMismatch({"B", "", "C"}, recorded, tree).empty());      // a leaf without signatures has no name
+    assert(leafSketchMismatch({}, recorded, tree).empty());                  // no leaf has a signature
+    assert(!leafSketchMismatch({"A", "B", "C"}, recorded, tree).empty());    // same genomes, another order (a flat build)
+    assert(!leafSketchMismatch({"B", "A"}, recorded, tree).empty());         // fewer references (a level sketch)
+    assert(!leafSketchMismatch({"B", "A", "C", "D"}, recorded, tree).empty());
+    // An index older than leaves.tsv: the names must be leaves of the tree.
+    assert(leafSketchMismatch({"A", "B", "C"}, {}, tree).empty());
+    assert(leafSketchMismatch({"C", "", "A"}, {}, tree).empty());
+    assert(!leafSketchMismatch({"A", "B", "X"}, {}, tree).empty());
+    std::cerr << "PASSED: Test leaf sketch identity\n";
+}
+
 void testBuildParamsRoundTrip() {
     std::cerr << "START: Test build params round trip... \t";
     const char* dir = ".";
@@ -945,6 +968,7 @@ int main() {
     testLoadTree();
     testTreeDefect();
     testParseTreeThresholds();
+    testLeafSketchIdentity();
     testBuildParamsRoundTrip();
     testTreeLeavesRoundTrip();
     testGetTreeLevelRefs();

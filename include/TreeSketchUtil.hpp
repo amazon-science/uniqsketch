@@ -417,6 +417,40 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
 }
 
 /**
+ * Does the sketch given as --ref number the leaves of this tree? `leafRef` is
+ * refId -> name as loadSketch read it (empty for a leaf without signatures),
+ * `recorded` the names in leaves.tsv (empty for an index older than that file).
+ * Returns an empty string, or what does not fit.
+ *
+ * The within-group sketch, its carriers and the query's leaf bookkeeping all go
+ * by the leaf sketch's refIds. A sketch with another numbering (a level sketch of
+ * the same index, a flat sketch of the same genomes, whose order is the command
+ * line's) used to be accepted with at most "ignoring it" for leaves.tsv, and the
+ * rows that followed carried one reference's name with another's signatures.
+ */
+inline std::string leafSketchMismatch(const std::vector<std::string>& leafRef,
+                                      const std::vector<std::string>& recorded,
+                                      const std::vector<TreeNode>& tree) {
+    if (leafRef.empty()) return std::string();        // no leaf has a signature of its own
+    if (!recorded.empty()) {
+        if (leafRef.size() != recorded.size())
+            return "it numbers " + std::to_string(leafRef.size()) + " references, the tree has " +
+                   std::to_string(recorded.size()) + " leaves (leaves.tsv)";
+        for (size_t i = 0; i < leafRef.size(); i++)
+            if (!leafRef[i].empty() && leafRef[i] != recorded[i])
+                return "its reference " + std::to_string(i) + " is " + leafRef[i] + ", leaf " +
+                       std::to_string(i) + " of the tree is " + recorded[i] + " (leaves.tsv)";
+        return std::string();
+    }
+    std::unordered_set<std::string> leaves;
+    for (const TreeNode& n : tree)
+        if (n.isLeaf) leaves.insert(getBaseId(n.filePath));
+    for (const std::string& name : leafRef)
+        if (!name.empty() && !leaves.count(name)) return "its reference " + name + " is not a leaf of the tree";
+    return std::string();
+}
+
+/**
  * The leaf numbering of a tree index: `<outdir>/leaves.tsv`, one row per leaf
  * reference in refId order (`ref_id`, `name`, `file_path`).
  *
