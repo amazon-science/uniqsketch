@@ -60,6 +60,7 @@ struct UniqSketchConfig {
     unsigned maxHomopolymer = 0;                        // max homopolymer run in a signature (0 = off)
     bool strictMargin = false;                          // --min-margin is a hard requirement (no fallback)
     bool circular = false;                              // --circular: references are circular molecules
+    bool keepCandidates = true;                         // false with --discard-candidates: remove each candidate file once selected from
     // Build context, for messages only (set by uniqsketch.cpp): whether this sketch
     // is part of a --tree build, and which coarse level it is for ("tree level N";
     // empty for the leaf sketch and for a flat build).
@@ -1453,6 +1454,13 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
             totalFill += ft.selected;
             refsFilled += ft.selected > 0;
             refsShort += st.selected < quota;
+        }
+        // The candidate files are scratch from here on: nothing in the build reads
+        // them again and no query opens them (41 % of a 5 493-genome index directory,
+        // 24 119 of its 25 259 files).
+        if (!cfg.keepCandidates) {
+            std::remove(sketchPath.c_str());
+            std::remove(carriedPath.c_str());
         }
         refSelected[i] = st.selected;
         refCandidates[i] = sketchCount;

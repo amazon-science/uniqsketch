@@ -505,6 +505,19 @@ void testBuildSketch(const UniqSketchConfig& cfg) {
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     buildSketch(cfg, "expected_db_uniq_count.tsv", dbFilter);
     assert(compareFiles(cfg.outfile, "expected_out_uniqsketch.txt") == true);
+    assert(std::ifstream("expected_ref_test_1.cand").good() && std::ifstream("expected_ref_test_2.cand").good());
+
+    // --discard-candidates: the same sketch, and each candidate file gone once it
+    // has been selected from. The files are written again for the tests that follow.
+    UniqSketchConfig discard = cfg;
+    discard.keepCandidates = false;
+    discard.outfile = "test_out_uniqsketch_discard.txt";
+    buildSketch(discard, "expected_db_uniq_count.tsv", dbFilter);
+    assert(compareFiles(discard.outfile, "expected_out_uniqsketch.txt") == true);
+    assert(!std::ifstream("expected_ref_test_1.cand").good() && !std::ifstream("expected_ref_test_2.cand").good());
+    std::remove(discard.outfile.c_str());
+    candidatesFromText("expected_ref_test_1.tsv", "ref_test_1.fa", "expected_ref_test_1.cand", cfg.kmerLen);
+    candidatesFromText("expected_ref_test_2.tsv", "ref_test_2.fa", "expected_ref_test_2.cand", cfg.kmerLen);
 
     std::cerr << "PASSED: Test buildSketch\n";
 }

@@ -55,6 +55,8 @@ static const char USAGE_MESSAGE[] =
     "\t\t\tsets them aside when a carrier is present) [min(50, leaves/10); 0=off]\n"
     "      --node-representative=WHICH\tthe member a tree node's signatures come from: central (the one whose\n"
     "\t\t\tnode-unique k-mers the other members carry) or largest [central]\n"
+    "      --discard-candidates\tremove each reference's candidate file (<name>.cand, .carried under -f) once its\n"
+    "\t\t\tsignatures are selected; they are scratch for the build and no query reads them\n"
     "      --sensitive\tsets sensitivity parameter c to 100 (an explicit -c wins)\n"
     "      --very-sensitive\tsets sensitivity parameter c to 1000 (an explicit -c wins)\n"
     "      --help\t\tdisplay this help and exit\n"
@@ -64,7 +66,7 @@ static const char USAGE_MESSAGE[] =
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
-       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP };
+       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP, OPT_DISCARDCAND };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -98,6 +100,7 @@ static const struct option longopts[] = {
     {"no-group-signatures", no_argument,  nullptr, OPT_NOGROUPSIGS},
     {"node-carriers",  required_argument, nullptr, OPT_NODECARRIERS},
     {"node-representative", required_argument, nullptr, OPT_NODEREP},
+    {"discard-candidates", no_argument,   nullptr, OPT_DISCARDCAND},
     {"sensitive",      no_argument, &g_sketchnum, 100},
     {"very-sensitive", no_argument, &g_sketchnum, 1000},
     {"help",           no_argument,       nullptr, OPT_HELP},
@@ -160,6 +163,7 @@ int main(int argc, char** argv) {
             break;
         }
         case OPT_CIRCULAR: cfg.circular = true; break;
+        case OPT_DISCARDCAND: cfg.keepCandidates = false; break;
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
         case OPT_STRICTMARGIN: cfg.strictMargin = true; break;
         case OPT_NOGROUPSIGS: groupSignatures = false; treeOnly.push_back("--no-group-signatures"); break;

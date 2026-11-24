@@ -403,6 +403,7 @@ inline size_t buildGroupSketch(const UniqSketchConfig& cfg, const std::vector<Tr
         const SelectJob& sj = selectJobs[j];
         std::string candPath = candidatePath(gcfg[sj.group].outdir, refFiles[sj.leaf]);
         totalSelected += getUniqSet(cfg, candPath, sj.leaf, picked[j], universeDbf).selected;
+        if (!cfg.keepCandidates) std::remove(candPath.c_str());   // scratch from here on (buildSketch)
     }
 
     std::vector<GroupSignature> all;
