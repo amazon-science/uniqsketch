@@ -965,6 +965,58 @@ inline double breadthRatio(size_t count, size_t sigsHit, size_t sigsTotal) {
 struct FamilyBreadth { double ratio; size_t carried; };
 
 /**
+ * What a carrier's own lineage says about it, apart from the ancestors it shares
+ * with the node whose carried signatures are being settled (runTreeQuery):
+ * ATTESTED when a representative covering it, and not the node, clears the
+ * reporting threshold on two or more reads (or the carrier itself was seen); TRACE
+ * when one has any hit at the pruning floor; SILENT when it has such
+ * representatives and none was hit; NONE when every representative covering it
+ * also covers the node, so nothing in the index can speak for it alone.
+ */
+enum class CarrierLineage : char { NONE, SILENT, TRACE, ATTESTED };
+enum class CarrierStatus : char { ABSENT, PRESENT, POSSIBLE };
+
+/**
+ * The own-loci exclusion of the carried-signature settlement: could this carrier
+ * be the source of the hits on the node signatures it carries? At the coverage
+ * those hits imply for it (hits per carried signature it carries) its own
+ * signature loci would have collected `expected` reads; it is excluded when that
+ * is `excludeReads` or more and none was seen. The number of loci, not of
+ * signatures: a strain a few substitutions from its relatives has all its
+ * signatures at those sites.
+ */
+inline bool carrierExcludedOnLoci(unsigned hits, unsigned carried, unsigned ownLoci, double excludeReads) {
+    if (carried == 0) return false;
+    const double perSig = static_cast<double>(hits) / static_cast<double>(carried);
+    return perSig * static_cast<double>(ownLoci) >= excludeReads;
+}
+
+/**
+ * Status of one carrier of a node's carried signatures, from what the tallies
+ * hold before any admission.
+ *
+ * The lineage is asked first: a carrier that was seen, or whose own lineage is
+ * attested, is present, and only an unattested one is put to the loci test
+ * (`excludedOnLoci` is false for an attested carrier).
+ *
+ * @param nodeHit         any of the node's carried signatures was hit
+ * @param hasSignatures   the carrier has signatures of its own, leaf or within-group
+ * @param excludedOnLoci  carrierExcludedOnLoci, for a carrier that has signatures,
+ *                        is not attested, and whose node was hit; false otherwise
+ * @param lineage         ATTESTED for a carrier that was seen
+ */
+inline CarrierStatus carrierStatus(bool nodeHit, bool hasSignatures, bool excludedOnLoci, CarrierLineage lineage) {
+    if (lineage == CarrierLineage::ATTESTED) return CarrierStatus::PRESENT;
+    if (excludedOnLoci) return CarrierStatus::ABSENT;
+    if (!nodeHit) return CarrierStatus::ABSENT;        // nothing to explain; the node's signatures are idle
+    // No signature of any kind: it cannot be seen or excluded. Absent when a lineage
+    // of its own was silent; possibly present on a trace, or with no lineage apart
+    // from the node's.
+    if (!hasSignatures) return lineage == CarrierLineage::SILENT ? CarrierStatus::ABSENT : CarrierStatus::POSSIBLE;
+    return CarrierStatus::POSSIBLE;
+}
+
+/**
  * The breadth of a family call, judged against the signatures a member carries.
  *
  * A present member can hit only the node signatures its genome contains, which the

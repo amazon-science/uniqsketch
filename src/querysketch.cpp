@@ -635,17 +635,17 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // one has any hit at the pruning floor; SILENT when it has such
         // representatives and none was hit; NONE when every representative covering
         // it also covers the node, so nothing in the index can speak for it alone.
-        enum Lineage : char { NONE, SILENT, TRACE, ATTESTED };
+        using Lineage = CarrierLineage;
         auto lineage = [&](unsigned c, const std::string& nodeRep) {
-            Lineage best = NONE;
+            Lineage best = Lineage::NONE;
             for (size_t li = 0; li < leafIdx; li++) {
                 auto it = cover[li].find(leafName[c]);
                 if (it == cover[li].end()) continue;
                 auto nt = cover[li].find(nodeRep);
                 if (nt != cover[li].end() && nt->second == it->second) continue;   // common ancestor
-                if (nodeEvidence[li][it->second]) return ATTESTED;
-                if (nodeTrace[li][it->second]) best = TRACE;
-                else if (best == NONE) best = SILENT;
+                if (nodeEvidence[li][it->second]) return Lineage::ATTESTED;
+                if (nodeTrace[li][it->second]) best = Lineage::TRACE;
+                else if (best == Lineage::NONE) best = Lineage::SILENT;
             }
             return best;
         };
@@ -660,7 +660,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // on that sibling node, which it is not in, through the 45 filled
         // signatures it carries; the parent's row, which covers it, was then
         // suppressed as the coarser of two nested calls.
-        enum Status : char { ABSENT, PRESENT, POSSIBLE };
+        using Status = CarrierStatus;
         size_t used = 0, hit = 0, asidePresent = 0, asidePossible = 0, asideHit = 0;
         size_t carriersSeen = 0, carriersExcluded = 0, carriersPossible = 0, carriersUntestable = 0,
                carriersUntestablePossible = 0;
@@ -670,7 +670,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
         // (a map keyed by carrier, with 2 M carried signatures of up to 50
         // carriers each, took 3 s of the 5 493-genome query).
         std::vector<unsigned> carriedOf(nLeaves, 0), hitsOf(nLeaves, 0);
-        std::vector<Status> status(nLeaves, ABSENT);
+        std::vector<Status> status(nLeaves, Status::ABSENT);
         std::vector<unsigned> touched;
         for (const auto& [node, sigs] : byNode) {
             Level& L = levels[node.first];
@@ -686,35 +686,31 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 }
             }
             for (unsigned c : touched) {
-                Status st;
-                const Lineage ln = seen[c] ? ATTESTED : lineage(c, nodeRep);
-                if (ln == ATTESTED) { st = PRESENT; carriersSeen += anyHit; }
-                else if (!anyHit) { st = ABSENT; }     // nothing to explain; the node's signatures are idle
-                else if (ownSigs[c] == 0) {
-                    st = (ln == SILENT) ? ABSENT : POSSIBLE;
+                const Lineage ln = seen[c] ? Lineage::ATTESTED : lineage(c, nodeRep);
+                const bool excluded = ln != Lineage::ATTESTED && anyHit && ownSigs[c] > 0 &&
+                    carrierExcludedOnLoci(hitsOf[c], carriedOf[c], loci[c], cfg.carrierExcludeReads);
+                const Status st = carrierStatus(anyHit, ownSigs[c] > 0, excluded, ln);
+                if (st == Status::PRESENT) carriersSeen += anyHit;
+                else if (excluded) ++carriersExcluded;
+                else if (anyHit && ownSigs[c] == 0) {
                     ++carriersUntestable;
-                    carriersUntestablePossible += st == POSSIBLE;
-                } else {
-                    const double perSig = static_cast<double>(hitsOf[c]) / static_cast<double>(carriedOf[c]);
-                    const double expectedReads = perSig * static_cast<double>(loci[c]);
-                    if (expectedReads >= cfg.carrierExcludeReads) { st = ABSENT; ++carriersExcluded; }
-                    else { st = POSSIBLE; ++carriersPossible; }
-                }
+                    carriersUntestablePossible += st == Status::POSSIBLE;
+                } else if (st == Status::POSSIBLE) ++carriersPossible;
                 status[c] = st;
             }
             for (unsigned j : sigs) {
                 const CarriedSig& s = carriedSigs[j];
                 const unsigned t = carriedBase + j;
-                Status worst = ABSENT;
+                Status worst = Status::ABSENT;
                 for (unsigned c : s.carriers) {
                     if (c >= nLeaves) continue;
                     const Status st = status[c];
-                    if (st == PRESENT) { worst = PRESENT; break; }
-                    if (st == POSSIBLE) worst = POSSIBLE;
+                    if (st == Status::PRESENT) { worst = Status::PRESENT; break; }
+                    if (st == Status::POSSIBLE) worst = Status::POSSIBLE;
                 }
                 auto it = L.sig[s.ref].find(*s.seq);
-                if (worst != ABSENT) {
-                    if (worst == PRESENT) ++asidePresent; else ++asidePossible;
+                if (worst != Status::ABSENT) {
+                    if (worst == Status::PRESENT) ++asidePresent; else ++asidePossible;
                     asideHit += tally.count[t] > 0;
                     if (it != L.sig[s.ref].end()) L.sig[s.ref].erase(it);   // s.seq is not read again
                     continue;
@@ -728,7 +724,7 @@ static void runTreeQuery(QuerySketchConfig& cfg, const std::string& treeDir,
                 if (it != L.sig[s.ref].end()) it->second += tally.count[t];
                 nodesUsing.insert(node);
             }
-            for (unsigned c : touched) { carriedOf[c] = 0; hitsOf[c] = 0; status[c] = ABSENT; }
+            for (unsigned c : touched) { carriedOf[c] = 0; hitsOf[c] = 0; status[c] = Status::ABSENT; }
             touched.clear();
         }
         std::cerr << "Tree query: carried node signatures: " << carriedSigs.size() << " in the index, "

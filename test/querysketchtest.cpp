@@ -400,6 +400,37 @@ void testReadPass(QuerySketchConfig cfg) {
     std::cerr << "PASSED: Test read pass hash loop and blocks\n";
 }
 
+void testCarrierStatus() {
+    std::cerr << "START: Test carrierStatus... \t";
+    using L = CarrierLineage;
+    using S = CarrierStatus;
+    // The loci test: hits per carried signature times own loci against the read floor.
+    assert(!carrierExcludedOnLoci(12, 2000, 1000, 8.0));        // 0.006 x 1000 = 6
+    assert(carrierExcludedOnLoci(12, 2000, 1500, 8.0));         // 0.006 x 1500 = 9
+    assert(!carrierExcludedOnLoci(0, 2000, 1500, 8.0));
+    assert(!carrierExcludedOnLoci(5, 0, 1500, 8.0));            // carries nothing of the node
+    // A seen carrier is handed in as ATTESTED and never as excluded: present.
+    assert(carrierStatus(true, true, false, L::ATTESTED) == S::PRESENT);
+    assert(carrierStatus(false, true, false, L::ATTESTED) == S::PRESENT);
+    // An unseen carrier, node hit, own loci silent where they would have been lit:
+    // absent whatever its lineage shows (unless its lineage is attested: the attestation is asked first).
+    assert(carrierStatus(true, true, true, L::ATTESTED) == S::PRESENT);
+    assert(carrierStatus(true, true, true, L::TRACE) == S::ABSENT);
+    assert(carrierStatus(true, true, true, L::NONE) == S::ABSENT);
+    // Not excluded: the lineage decides between present and possible.
+    assert(carrierStatus(true, true, false, L::TRACE) == S::POSSIBLE);
+    assert(carrierStatus(true, true, false, L::SILENT) == S::POSSIBLE);
+    assert(carrierStatus(true, true, false, L::NONE) == S::POSSIBLE);
+    // Nothing of the node hit: nothing to explain.
+    assert(carrierStatus(false, true, false, L::TRACE) == S::ABSENT);
+    assert(carrierStatus(false, false, false, L::NONE) == S::ABSENT);
+    // No signature of any kind: absent only when a lineage of its own was silent.
+    assert(carrierStatus(true, false, false, L::SILENT) == S::ABSENT);
+    assert(carrierStatus(true, false, false, L::TRACE) == S::POSSIBLE);
+    assert(carrierStatus(true, false, false, L::NONE) == S::POSSIBLE);
+    std::cerr << "PASSED\n";
+}
+
 int main() {
     QuerySketchConfig cfg;
     cfg.ref = "expected_out_uniqsketch.txt";
@@ -423,6 +454,7 @@ int main() {
     testFamilyBreadth(cfg);
     testChunkedLoad(cfg);
     testReadPass(cfg);
+    testCarrierStatus();
 
     std::cerr << "QuerySketch: All tests PASSED!\n\n";
     return 0;
