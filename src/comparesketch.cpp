@@ -48,6 +48,7 @@ static const struct option longopts[] = {
     {"threads", required_argument, nullptr, 't'},
     {"kmer",    required_argument, nullptr, 'k'},
     {"hash",    required_argument, nullptr, 'd'},
+    {"bit",     required_argument, nullptr, 'b'},
     {"bits",    required_argument, nullptr, 'b'},
     {"gsize",   required_argument, nullptr, 'g'},
     {"out",     required_argument, nullptr, 'o'},
@@ -68,7 +69,8 @@ int main(int argc, char** argv) {
 
     CompareSketchConfig cfg;
     bool die = false;
-    for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
+    int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
+    for (int c; (c = getopt_long(argc, argv, shortopts, longopts, &longIndex)) != -1; longIndex = -1) {
         std::istringstream arg(optarg != nullptr ? optarg : "");
         switch (c) {
         case '?':
@@ -93,8 +95,11 @@ int main(int argc, char** argv) {
             exit(EXIT_SUCCESS);
         }
         if (optarg != nullptr && !arg.eof()) {
-            std::cerr << PROGRAM ": invalid option: `-"
-                      << static_cast<char>(c) << optarg << "'\n";
+            // By name: a long option without a short form has a code below 32, which
+            // printed as a control character.
+            if (longIndex >= 0) std::cerr << PROGRAM ": invalid value for --" << longopts[longIndex].name;
+            else std::cerr << PROGRAM ": invalid value for -" << static_cast<char>(c);
+            std::cerr << ": `" << optarg << "'\n";
             exit(EXIT_FAILURE);
         }
     }

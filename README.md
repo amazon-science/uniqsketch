@@ -257,7 +257,7 @@ A list of files containing file names in each row can be passed with @ prefix.
   -f, --outdir=STRING   dir for universe unique k-mers [outdir_uniqsketch]
   -o, --out=STRING      the output sketch file name [sketch_uniq.tsv]
   -r, --stat=STRING     the output unique kmer stat file name [db_uniq_count.tsv]
-  -e, --entropy         sets the aggregate entropy rate threshold [0.65]
+  -e, --entropy=F       sets the aggregate entropy rate threshold [0.65]
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
       --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
                         (k-mer counts as plain integers, e.g. 1000000,300000; the list is required)

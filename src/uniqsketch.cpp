@@ -40,7 +40,7 @@ static const char USAGE_MESSAGE[] =
     "  -f, --outdir=STRING\tdir for universe unique k-mers [outdir_uniqsketch]\n"
     "  -o, --out=STRING\tthe output sketch file name [sketch_uniq.tsv]\n"
     "  -r, --stat=STRING\tthe output unique kmer stat file name [db_uniq_count.tsv]\n"
-    "  -e, --entropy\t\tsets the aggregate entropy rate threshold [0.65]\n"
+    "  -e, --entropy=F\tsets the aggregate entropy rate threshold [0.65]\n"
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
     "      --tree=T1,T2,..\tbuild hierarchical tree index with comma-separated thresholds\n"
     "\t\t\t(k-mer counts as plain integers, e.g. 1000000,300000; the list is required)\n"
@@ -74,6 +74,7 @@ static int g_sketchnum = 100;
 static const struct option longopts[] = {
     {"threads",        required_argument, nullptr, 't'},
     {"kmer",           required_argument, nullptr, 'k'},
+    {"bit",            required_argument, nullptr, 'b'},
     {"bits",           required_argument, nullptr, 'b'},
     {"hash1",          required_argument, nullptr, 'd'},
     {"hash2",          required_argument, nullptr, 's'},
@@ -81,7 +82,10 @@ static const struct option longopts[] = {
     {"outdir",         required_argument, nullptr, 'f'},
     {"out",            required_argument, nullptr, 'o'},
     {"stat",           required_argument, nullptr, 'r'},
-    {"entropy",        no_argument,       nullptr, 'e'},
+    // --entropy was declared without an argument while -e takes one: --entropy=0.9
+    // was refused, "--entropy 0.9" read 0.9 as a reference file, and a bare
+    // --entropy did nothing.
+    {"entropy",        required_argument, nullptr, 'e'},
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
     {"tree",           required_argument, nullptr, OPT_TREE},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
@@ -115,7 +119,8 @@ int main(int argc, char** argv) {
     bool centralRepresentative = true;   // --node-representative=central|largest
 
     bool die = false;
-    for (int c; (c = getopt_long(argc, argv, shortopts, longopts, nullptr)) != -1;) {
+    int longIndex = -1;     // set by getopt_long for a long option only, so reset for every option
+    for (int c; (c = getopt_long(argc, argv, shortopts, longopts, &longIndex)) != -1; longIndex = -1) {
         std::istringstream arg(optarg != nullptr ? optarg : "");
         switch (c) {
         case '?':
@@ -169,8 +174,11 @@ int main(int argc, char** argv) {
             exit(EXIT_SUCCESS);
         }
         if (optarg != nullptr && !arg.eof()) {
-            std::cerr << PROGRAM ": invalid option: `-"
-                      << static_cast<char>(c) << optarg << "'\n";
+            // By name: a long option without a short form has a code below 32, which
+            // printed as a control character.
+            if (longIndex >= 0) std::cerr << PROGRAM ": invalid value for --" << longopts[longIndex].name;
+            else std::cerr << PROGRAM ": invalid value for -" << static_cast<char>(c);
+            std::cerr << ": `" << optarg << "'\n";
             exit(EXIT_FAILURE);
         }
     }
