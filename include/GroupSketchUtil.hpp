@@ -192,10 +192,10 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
 
     // Per genome, the signatures it carries, as a list. This was a bit per (genome,
     // signature), held for every genome to the end and then walked on one thread:
-    // genomes x signatures bits and as many tests (3.85 GB and 3.1e10 on 5 493 E. coli,
-    // both growing with the square of the index), where the lists hold the carriers
-    // found (3.1e8 there). `mark` stays, private to the genome's thread, so that a
-    // k-mer the genome has twice is listed once.
+    // genomes x signatures bits and as many tests (3.84 GB and 3.1e10 on 5 493 E. coli,
+    // both growing as the power 1.75 to 1.96 of the index), where the lists hold the
+    // carriers found (3.1e8 there). `mark` stays, private to the genome's thread, so
+    // that a k-mer the genome has twice is listed once.
     std::vector<std::vector<uint32_t>> hit(refFiles.size());
     #pragma omp parallel for schedule(dynamic)
     for (unsigned g = 0; g < refFiles.size(); g++) {

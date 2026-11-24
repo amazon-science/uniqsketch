@@ -360,9 +360,12 @@ void testReadPass(QuerySketchConfig cfg) {
 
     /*
     A read is hashed and probed 256 positions at a time. Signatures on both sides of
-    the block boundaries, at the read's first and last position, in both orientations,
-    and next to an N: each is hit once by the read and once by its reverse complement,
-    and nothing else is.
+    the forward read's first block boundary (255, 256, 257), at the read's first and
+    last position and next to an N, the read given in both orientations: each is hit
+    once by the read and once by its reverse complement, and nothing else is. The N
+    takes 21 positions out of the read, so the later boundaries fall between 532 and
+    533 and between 788 and 789: the signatures at 511 to 513, 767 and 768 sit inside
+    blocks, and the reverse complement has none at a boundary.
     */
     const unsigned k = 21;
     std::string read = randDNA(1000, 4242);

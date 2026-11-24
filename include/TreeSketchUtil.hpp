@@ -331,7 +331,7 @@ getTreeLevelRefs(const std::vector<TreeNode>& tree) {
  * stops: 1e6 was 1, 1,000,000 was 1,0,0, 10k was 10 and -5 became 4294967291 in
  * the unsigned list, each building a tree nobody asked for with exit status 0.
  * abc, a value above 2^31 and --tree given without a list (it then takes the next
- * option as its list) threw, and the tool died on the uncaught exception. An
+ * argument as its list) threw, and the tool died on the uncaught exception. An
  * empty list switched the tree off without a word and left a flat index.
  */
 inline std::string parseTreeThresholds(const std::string& arg, std::vector<unsigned>& out) {

@@ -509,8 +509,8 @@ struct QueryIndex {
      * Ask for the prefilter word of `h` ahead of find(h). On an index of thousands of
      * genomes the prefilter is larger than the cache (128 MB at 5 493 E. coli), so the
      * probe that decides nearly every position is a memory access of its own, and the
-     * time of the read pass is the time of those accesses taken one or two at a time.
-     * Asked for a few hundred positions ahead they overlap.
+     * pass made those accesses one position after another. Asked for a few hundred
+     * positions ahead they overlap.
      */
     void prefetch(uint64_t h) const {
         __builtin_prefetch(&prefilter[(h >> prefilterShift) >> 6], 0, 0);

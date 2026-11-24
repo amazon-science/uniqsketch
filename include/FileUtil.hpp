@@ -191,11 +191,13 @@ inline bool validateFiles(const std::vector<std::string>& files, const std::stri
  * A path that exists and is not a regular file (a pipe, /dev/stdout) is asked
  * about, not opened: opening a pipe would be seen by its reader.
  *
- * The tools write their results when the work is over (the sketch at the end of
- * a build, the table at the end of a query) and opened them without a check: a
- * path in a missing or read-only directory cost the whole run, 47 minutes for
- * the 5 493-genome build, left nothing behind and returned 0. Each tool asks
- * this of its outputs before it starts.
+ * uniqsketch and querysketch write their results late (the sketch once the leaf
+ * signatures of a build are selected, the table at the end of a query),
+ * comparesketch as the comparison runs, and all three opened them without a
+ * check: a path in a missing or read-only directory cost the whole run (47
+ * minutes for the 5 493-genome build at the time), left no sketch or table, or a
+ * 0-byte sketch, and returned 0. Each tool asks this of its outputs before it
+ * starts.
  */
 inline bool canWriteFile(const std::string& path) {
     struct stat st;

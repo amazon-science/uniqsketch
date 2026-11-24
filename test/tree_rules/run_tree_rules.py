@@ -8,13 +8,13 @@ runTreeQuery lives in src/querysketch.cpp and no unit test can call it, so the
 rules it applies after the read pass (carried-signature settlement, pruning and
 rejoin, leaf rescue and its single-read rule, the within-group mask, family rows
 and their suppression, the breadth floors) were exercised only by the validation
-sweeps, which take hours and live outside the repository. This test builds a
-16-genome synthetic index in which each of those rules has a structure of its own
-(gen_fixture.py), queries it with samples that each make one rule decide the
-result (gen_reads.py), and compares the rows with expected.tsv. It also runs the
-index variants an older uniqsketch would have written, so the fallbacks stay
-exercised. Nothing is committed but the generators and the expectations; the
-whole run takes about ten seconds.
+sweeps, which take most of an hour and live outside the repository. This test
+builds a 16-genome synthetic index in which each of those rules has a structure
+of its own (gen_fixture.py), queries it with samples that each make one rule
+decide the result (gen_reads.py), and compares the rows with expected.tsv. It
+also runs the index variants an older uniqsketch would have written, so the
+fallbacks stay exercised. Nothing is committed but the generators and the
+expectations; the whole run takes a few seconds.
 
 Three stages, so that a failure says what moved:
   INDEX  the index holds the structures the samples rely on (read from the index
@@ -157,8 +157,10 @@ def index_digest(work, path):
     """One line per index file the query reads (and the build's two reports): sha256 and name.
 
     The index is built from relative paths, so two builds of one source are expected
-    to give the same lines whatever the machine, compiler or standard library; `diff`
-    of two such files names what differs.
+    to give the same lines whatever the machine or compiler, under one standard
+    library (at 99d4462, 9 of the 11 lines differed between the runtimes of GCC 7.3.1
+    and GCC 10.5, the query tables being the same); `diff` of two such files names
+    what differs.
     """
     idx = os.path.join(work, "idx")
     names = ["sketch_uniq.tsv"] + sorted(os.path.join("outdir", f) for f in os.listdir(os.path.join(idx, "outdir"))

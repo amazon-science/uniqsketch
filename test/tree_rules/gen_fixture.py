@@ -3,7 +3,7 @@
 
 usage: gen_fixture.py WORKDIR
 
-Writes WORKDIR/genomes/<name>.fa (16 genomes, 13 to 40 kb, 444 kb in all) and
+Writes WORKDIR/genomes/<name>.fa (16 genomes, 13 to 40 kb, 443 kb in all) and
 WORKDIR/list.txt. The list holds paths relative to WORKDIR, and the index is
 built from inside WORKDIR, so the path strings the build sees are the same
 wherever the repository is checked out (the leaf numbering follows them). No

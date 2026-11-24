@@ -724,9 +724,12 @@ inline std::vector<std::string> identifyGroupUniqKmersCarried(
     size_t members = 0;
     for (const auto& g : groups) members += g.size();
     // The members containing a k-mer are counted in 16 bits (NodeKmers::inNode, a
-    // plain fetch_add in the member scan below). A node of more members would wrap
-    // the count, fail the half-of-the-members test and lose its carried pool
-    // without a word; the carriage counter beside it saturates at the same value.
+    // plain fetch_add in the member scan below). In a node of more members the
+    // count would wrap for the k-mers 65 536 or more of them hold: those would fail
+    // the half-of-the-members test and the node would lose that part of its carried
+    // pool, the part it shares most widely, without a word; from 131 071 members
+    // on, no count reaches half the members and that part is the whole pool. The
+    // carriage counter beside it saturates at 65 535.
     if (cap > 0)
         for (const auto& g : groups)
             if (g.size() > UINT16_MAX) {

@@ -255,11 +255,12 @@ inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
  * species share are 6 % of an E. coli sketch at nine references in ten and 40 % at
  * one in three, so above 20 000 references every distance estimate rose by that
  * share of a genome and the tree lost its levels without a word: with the cap at
- * 950 of 1 000 E. coli the two finest levels are empty, at 500 five nodes are
- * left of 195. They are counted now, through one bit per reference and popular
- * hash: a pair's AND gives how many of them it shares and, the bits being in walk
- * order, the first. The result is the uncapped loop's map in the uncapped loop's
- * order whatever `cap` and `denseMaxRefs` are, so both are costs only. No hash can
+ * 950 of 1 000 E. coli the two finest levels are empty, at 500 the tree has five
+ * nodes of two or three genomes, all at the coarsest level, in place of its 195.
+ * They are counted now, through one bit per reference and popular hash: a pair's
+ * AND gives how many of them it shares and, the bits being in walk order, the
+ * first. The result is the uncapped loop's map in the uncapped loop's order
+ * whatever `cap` and `denseMaxRefs` are, so both are costs only. No hash can
  * exceed the cap while the references do not, and such a set takes the path it
  * took before.
  */

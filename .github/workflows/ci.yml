@@ -59,11 +59,12 @@ jobs:
           fi
 
       - name: Test suites keep their assertions under NDEBUG
-        # Every check in test/*.cpp is an assert(). A build that defines NDEBUG
+        # The checks of the suites in test/*.cpp are assert() calls (headerstest
+        # alone has none and returns 1 on a failure). A build that defines NDEBUG
         # (CMake's RelWithDebInfo and MinSizeRel, a packager's CPPFLAGS) compiled
         # all of them out and each suite still printed PASSED and exited 0, so the
-        # suites undefine NDEBUG before their first include. This step keeps a new
-        # or edited suite from losing that line.
+        # six that assert undefine NDEBUG before their first include. This step
+        # keeps a new or edited suite from losing that line.
         run: |
           for f in test/*.cpp; do
             grep -q 'assert(' "$f" || continue
@@ -98,7 +99,7 @@ jobs:
   sanitizers:
     # AddressSanitizer and UndefinedBehaviorSanitizer over the seven suites and the
     # tree rule-stack test, which runs the real uniqsketch and querysketch through
-    # an index build and some 70 queries (test/tree_rules). The first such run found a
+    # an index build and 69 queries (test/tree_rules). The first such run found a
     # use-after-free on every --tree build that renames a node, a test reading
     # past its strings, and an integer conversion of NaN on an empty --solid
     # sample; none of them changed a result, and none was visible to the matrix
@@ -111,8 +112,9 @@ jobs:
       SAN_CXX: g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
       ASAN_OPTIONS: detect_leaks=1
       UBSAN_OPTIONS: print_stacktrace=1
-      # The suites and tools take the machine's thread count from OpenMP; four is
-      # what the runner has, stated so that a larger runner does not change the test.
+      # The suites take the machine's thread count from OpenMP (the rule-stack test
+      # gives the tools their -t); four is what GitHub's standard runner has for a
+      # public repository, stated so that another runner does not change the test.
       OMP_NUM_THREADS: 4
     steps:
       - uses: actions/checkout@v4

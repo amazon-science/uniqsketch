@@ -1456,7 +1456,7 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
             refsShort += st.selected < quota;
         }
         // The candidate files are scratch from here on: nothing in the build reads
-        // them again and no query opens them (41 % of a 5 493-genome index directory,
+        // them again and no query opens them (45 % of a 5 493-genome index directory,
         // 24 119 of its 25 259 files).
         if (!cfg.keepCandidates) {
             std::remove(sketchPath.c_str());

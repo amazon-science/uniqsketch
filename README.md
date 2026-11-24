@@ -118,7 +118,7 @@ make test
 ```
 Both run the seven unit suites and the tree query's rule-stack test (`test/tree_rules/`), which builds a
 small synthetic tree index with the freshly built binaries and checks 69 queries against
-`test/tree_rules/expected.tsv`; it needs `python3` and takes about ten seconds.
+`test/tree_rules/expected.tsv`; that test needs `python3` and takes a few seconds.
 
 ## Quick Start
 
@@ -154,7 +154,7 @@ querysketch --r1 r1.fq.gz --r2 r2.fq.gz --ref sketch_index.tsv --out out_sample.
 
 ### uniqsketch
 * `sketch_uniq.tsv`: primary output — tab-separated file storing the final set of signatures for each reference.
-* `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it, a 5 493-genome one 6.4 GB in 24 119 files (41 % of the index directory). Nothing reads them after selection and no query opens them: `--discard-candidates` removes each one once its signatures are selected, and deleting `*.cand` and `*.carried` from an existing index directory is equally safe.
+* `outdir_uniqsketch/`: folder containing a file per reference (`<name>.cand`) with all signature candidates: the positions of the reference's unique k-mers, per contig, in a compact binary form (`UQSKCAND` header, then per contig its name, length and a `uint32` position list). Scratch for the build, about 4 bytes per candidate; a 120-genome tree index writes under 1 GB of it, a 5 493-genome one 6.4 GB in 24 119 files (45 % of the `-f` directory, 41 % of the index with its leaf sketch), the nodes' `.carried` pools among them. Nothing reads them after selection and no query opens them: `--discard-candidates` removes each one once its signatures are selected, and deleting `*.cand` and `*.carried` from an existing index directory is equally safe.
 * `db_uniq_count.tsv`: tab-separated summary of all references and total number of candidate signatures.
 * `clusters.tsv` (when `--cluster` is used): tab-separated file mapping each reference to its cluster representative, with columns: `cluster_id`, `representative`, `member`, `num_kmers`.
 * With `--tree`, inside the `-f` output directory: `tree_index.tsv` (the hierarchy), `sketch_level_<L>.tsv` (one coarse sketch per level: the six signature columns, then `carriers`, the leaf ids of the genomes outside the node that contain the k-mer or `-`; the column is absent when the index was built with `--node-carriers=0`), `build_params.tsv` (how signatures were selected, `node_carriers` and `node_representative` included; read by `querysketch --tree`), `node_representatives.tsv` (per node: level, name, leaves, the genome the tree named, the member its signatures come from, whether it moved, the rule that chose it, `reached`, `fill`, and the pool estimates), `sketch_group.tsv` (within-group leaf signatures: `seq`, `refId`, `refName`, `numRef`, `contig`, `pos`, `carriers` as comma-separated refIds or `-`, `node`; absent with `--no-group-signatures`), `groups/g<i>/` with each group's candidate files, and two tables on what each reference can be reported through: `reachability.tsv` (per reference: leaf and within-group signature counts, its ancestor node at every level with how many of that node's signatures its genome carries, and a status `own`, `group`, `family` or `none`) and `ancestor_signatures.tsv` (the same per (reference, ancestor node) pair). A reference with status `none` carries no signature at any level and cannot be reported by any query; the build names them on stderr.
@@ -272,6 +272,8 @@ A list of files containing file names in each row can be passed with @ prefix.
                         sets them aside when a carrier is present) [min(50, leaves/10); 0=off]
       --node-representative=WHICH  the member a tree node's signatures come from: central (the one
                         whose node-unique k-mers the other members carry) or largest [central]
+      --discard-candidates  remove each reference's candidate file (<name>.cand, .carried under -f) once its
+                        signatures are selected; they are scratch for the build and no query reads them
       --sensitive       sets sensitivity parameter c to 100 (an explicit -c wins)
       --very-sensitive  sets sensitivity parameter c to 1000 (an explicit -c wins)
       --help            display this help and exit
@@ -288,8 +290,9 @@ leaves selection unchanged. Pass `--strict-margin` to remove that fallback: slot
 with no 2-safe candidate are left empty, so every signature meets the requested
 margin, at the cost of a smaller sketch.
 
-`--tree` builds default to `--min-margin=2 --strict-margin` (pass `--min-margin=1`
-to opt out); flat builds keep `--min-margin=1`. The reason is measured rather than
+`--tree` builds default to `--min-margin=2 --strict-margin`, and a margin of 2
+spelled out is strict there too (pass `--min-margin=1` to opt out); flat builds
+keep `--min-margin=1`. The reason is measured rather than
 theoretical. A tree index exists to separate close relatives, and a margin-1
 signature of one relative is hit by every read of an abundant sibling that carries a
 sequencing error at the distinguishing base. With the sibling at ~2700× coverage and
