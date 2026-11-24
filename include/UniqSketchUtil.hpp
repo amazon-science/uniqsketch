@@ -1419,6 +1419,12 @@ void buildSketch(const UniqSketchConfig& cfg, const std::string& statFile, const
     std::ofstream out(cfg.outfile);
     for (const auto& buf : perRef) out << buf.str();
     out.close();
+    if (!out) {
+        // The product of the build: a sketch that is missing or cut short (a full
+        // disk) must not end in exit status 0.
+        std::cerr << "Error: could not write the sketch " << cfg.outfile << "\n";
+        exit(EXIT_FAILURE);
+    }
 
     if (totalFill || refsShort) {
         std::cout << "Node carriers: " << totalFill << " signatures from carried candidates fill "

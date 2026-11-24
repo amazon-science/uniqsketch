@@ -265,6 +265,26 @@ int main(int argc, char** argv) {
 
     mkdir(cfg.outdir.c_str(), 0777);
 
+    // Everything the build writes goes under -f, to -o and to -r, and none of them
+    // was checked: with -o in a missing directory the build ran to the end, wrote
+    // no sketch and returned 0; with -f or -r unwritable it left an empty sketch.
+    {
+        bool bad = false;
+        if (!canWriteDir(cfg.outdir)) {
+            std::cerr << "Error: cannot create or write the output directory (-f): " << cfg.outdir << "\n";
+            bad = true;
+        }
+        if (!canWriteFile(cfg.outfile)) {
+            std::cerr << "Error: cannot write the sketch file (-o): " << cfg.outfile << "\n";
+            bad = true;
+        }
+        if (!canWriteFile(cfg.refstat)) {
+            std::cerr << "Error: cannot write the stat file (-r): " << cfg.refstat << "\n";
+            bad = true;
+        }
+        if (bad) exit(EXIT_FAILURE);
+    }
+
     // Optional: build hierarchical tree index with per-level sketches
     if (!treeThresholds.empty()) {
         std::string treeFile = cfg.outdir + "/tree_index.tsv";

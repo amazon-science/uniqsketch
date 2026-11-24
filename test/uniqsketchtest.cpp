@@ -308,6 +308,24 @@ static std::string slurp(const std::string& path) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// canWriteFile / canWriteDir: what the tools ask of their outputs before they
+// start. A probe must neither empty an existing file nor leave one behind.
+void testOutputProbes() {
+    std::cerr << "START: Test output probes... \t";
+    { std::ofstream f("probe_existing.txt"); f << "kept\n"; }
+    assert(canWriteFile("probe_existing.txt"));
+    assert(fileLines("probe_existing.txt") == std::vector<std::string>({"kept"}));
+    assert(canWriteFile("probe_new.txt"));
+    assert(!fileExists("probe_new.txt"));                   // the probe's own file is gone again
+    assert(!canWriteFile("probe_no_such_dir/out.tsv"));     // a missing directory
+    assert(!canWriteFile("."));                             // a directory is not a file
+    assert(canWriteDir("."));
+    assert(!canWriteDir("probe_no_such_dir"));
+    assert(!canWriteDir("probe_existing.txt"));             // a file is not a directory
+    std::remove("probe_existing.txt");
+    std::cerr << "PASSED: Test output probes\n";
+}
+
 // GzLineReader has std::getline's contract on plain and gzip files alike:
 // empty lines are lines, the last line needs no newline, a trailing newline
 // does not make an extra empty line, and a line longer than the read buffer
@@ -769,6 +787,7 @@ int main() {
     testGroupScanIdentical();
     testKmerLookAhead();
     testGzLineReader();
+    testOutputProbes();
     testGzipReference(cfg);
     testCandidateFile();
     testBuildSketch(cfg);

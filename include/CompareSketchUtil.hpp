@@ -200,6 +200,10 @@ void identifyDifference(const CompareSketchConfig& cfg, const std::vector<std::s
         }
     }
     simOut.close();
+    if (!simOut) {
+        std::cerr << "Error: could not write " << cfg.outfile << "\n";
+        exit(EXIT_FAILURE);
+    }
 }
 
 #endif // COMPARESKETCHUTIL_HPP_

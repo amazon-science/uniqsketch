@@ -35,7 +35,7 @@ static const char USAGE_MESSAGE[] =
     "\n"
     "  -t, --threads=N\tuse N parallel threads [1]\n"
     "  -b, --bit=N\t\tuse N bits per element in Bloom filter [64]\n"
-    "  -o, --out=STRING\tthe output file name\n"
+    "  -o, --out=STRING\tthe output file name [out_sketch.tsv]\n"
     "  -l, --r1=STRING\tinput read 1\n"
     "  -r, --r2=STRING\tinput read 2\n"
     "  -g, --ref=STRING\tinput uniqsketch reference\n"
@@ -1114,6 +1114,12 @@ int main(int argc, char* const argv[]) {
     if (!validateFile(cfg.r1, "read file r1")) die = true;
     if (!cfg.r2.empty() && !validateFile(cfg.r2, "read file r2")) die = true;
     if (!validateFile(cfg.ref, "sketch reference file")) die = true;
+    // The table is written when the query is over. A path that cannot be written
+    // used to cost the whole query, print nothing and return 0.
+    if (!canWriteFile(cfg.out)) {
+        std::cerr << "Error: cannot write the output file (--out): " << cfg.out << "\n";
+        die = true;
+    }
     if (die) {
         exit(EXIT_FAILURE);
     }

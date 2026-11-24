@@ -141,6 +141,11 @@ int main(int argc, char** argv) {
 
     if (!validateFiles(refSet1, "reference file (list 1)")) exit(EXIT_FAILURE);
     if (!validateFiles(refSet2, "reference file (list 2)")) exit(EXIT_FAILURE);
+    // Written as the comparison runs, and opened without a check before.
+    if (!canWriteFile(cfg.outfile)) {
+        std::cerr << "Error: cannot write the output file (-o): " << cfg.outfile << "\n";
+        exit(EXIT_FAILURE);
+    }
 
 #ifdef _OPENMP
     omp_set_num_threads(cfg.threads);

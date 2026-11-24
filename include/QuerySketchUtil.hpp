@@ -1168,6 +1168,10 @@ void generateTreeQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>
         }
     }
     outFile.close();
+    if (!outFile) {
+        std::cerr << "Error: could not write the result table " << cfg.out << "\n";
+        exit(EXIT_FAILURE);
+    }
 
     if (reportedFamilies.size() > besideResolved.size()) {
         std::cerr << "Tree query: " << reportedFamilies.size() - besideResolved.size()
@@ -1317,6 +1321,10 @@ void generateQueryResult(const QuerySketchConfig& cfg, std::vector<unsigned>& sk
         }
     }
     outFile.close();
+    if (!outFile) {
+        std::cerr << "Error: could not write the result table " << cfg.out << "\n";
+        exit(EXIT_FAILURE);
+    }
 
     if (!withheld.empty()) {
         std::cerr << withheld.size() << " call(s) withheld, hits confined to a few signatures "
