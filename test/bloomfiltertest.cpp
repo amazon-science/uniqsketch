@@ -1,3 +1,7 @@
+// The suites check with assert(); with NDEBUG defined (CMake's RelWithDebInfo and
+// MinSizeRel, a packager's CPPFLAGS) every check compiled away, calls made inside
+// an assert were not made at all, and the suite still printed PASSED and exited 0.
+#undef NDEBUG
 #include <iostream>
 #include <algorithm>
 #include <cstdio>
@@ -33,8 +37,11 @@ void testInsertContain() {
     assert(bFilter.contains(hVec1) == true);
     assert(bFilter.contains(hVec2) == false);
 
-    std::string kmer1("GCCTAGCTAGCTTTTAGCTGGGATTTTTT");
-    std::string kmer2("ATTTAGCTAGCGCTAAGCTGGGACCCTGC");
+    // k-mers of opt::k = 32 bases: the filter hashes k characters from the pointer
+    // (at 29 it read past the end of the strings).
+    std::string kmer1("GCCTAGCTAGCTTTTAGCTGGGATTTTTTACG");
+    std::string kmer2("ATTTAGCTAGCGCTAAGCTGGGACCCTGCTTA");
+    assert(kmer1.size() == opt::k && kmer2.size() == opt::k);
 
     bFilter.insert(kmer1.c_str());
     assert(bFilter.contains(kmer1.c_str()) == true);

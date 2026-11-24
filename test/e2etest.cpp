@@ -1,3 +1,7 @@
+// The suites check with assert(); with NDEBUG defined (CMake's RelWithDebInfo and
+// MinSizeRel, a packager's CPPFLAGS) every check compiled away, calls made inside
+// an assert were not made at all, and the suite still printed PASSED and exited 0.
+#undef NDEBUG
 // End-to-end test: build an index from synthetic genomes, query synthetic reads
 // against it in-process, and check the result against known ground truth.
 //

@@ -113,6 +113,16 @@ void compEst(const uint16_t* t_Counter, double& F0Mean, std::vector<double>& fMe
     pMean0 /= static_cast<double>(opt::nSamp);
     pMean1 /= static_cast<double>(opt::nSamp);
 
+    // No sampled k-mer (an empty sample, or one too small to reach the sample):
+    // every counter is zero, the estimate below is 0 * NaN cast to an integer,
+    // which is undefined. Nothing to estimate; the callers fall back to the exact
+    // k-mer count (resolveBloomSizes) or report an input without k-mers.
+    if (pMean0 >= static_cast<double>(opt::rBuck)) {
+        F0Mean = 0.0;
+        fMean[1] = 0.0;
+        return;
+    }
+
     F0Mean = static_cast<double>(
         (opt::rBits * std::log(2) - std::log(pMean0)) *
         (static_cast<size_t>(1) << (opt::sBits + opt::rBits)));
@@ -256,6 +266,11 @@ inline void estimateCardinality(const std::vector<const CardinalitySample*>& par
     }
     pMean0 /= static_cast<double>(opt::nSamp);
     pMean1 /= static_cast<double>(opt::nSamp);
+    if (pMean0 >= static_cast<double>(opt::rBuck)) {   // nothing sampled: see compEst
+        dbsize = 0;
+        sbsize = 0;
+        return;
+    }
     const double F0Mean = static_cast<double>(
         (opt::rBits * std::log(2) - std::log(pMean0)) *
         (static_cast<size_t>(1) << (opt::sBits + opt::rBits)));
