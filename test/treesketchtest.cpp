@@ -266,6 +266,62 @@ void testGroupSignatures() {
     std::cerr << "PASSED: Test within-group signature groups and carriers\n";
 }
 
+// SignatureIndex against the map it replaced: for every signature's hash, the
+// signatures with that hash in ascending order (a sequence listed twice, and a
+// sequence and its reverse complement, share a hash and so a run); nothing for a
+// hash that is no signature's; and scanSignatures reports, for a genome, exactly
+// the (signature, position) pairs a plain scan against the map finds, in order.
+void testSignatureIndex() {
+    std::cerr << "START: Test signature index and scan... \t";
+    const unsigned k = 21;
+    const std::string g = randDNA(3000, 5151);
+    std::vector<std::string> sigSeq;
+    for (size_t pos : {10u, 500u, 501u, 1200u, 10u, 2900u}) sigSeq.push_back(g.substr(pos, k));   // 10 twice
+    std::string rc(g.substr(500, k));                       // reverse complement of signature 1
+    std::reverse(rc.begin(), rc.end());
+    for (char& ch : rc) ch = (ch == 'A') ? 'T' : (ch == 'T') ? 'A' : (ch == 'C') ? 'G' : 'C';
+    sigSeq.push_back(rc);
+    sigSeq.push_back(randDNA(k, 777));                      // in no genome
+    const SignatureIndex index(sigSeq.size(), k, [&](size_t i) -> const std::string& { return sigSeq[i]; });
+    std::unordered_map<uint64_t, std::vector<unsigned>> byHash;
+    for (unsigned i = 0; i < sigSeq.size(); i++) byHash[NTC64(sigSeq[i].c_str(), k)].push_back(i);
+    for (const auto& kv : byHash) {
+        const auto run = index.find(kv.first);
+        assert(std::vector<unsigned>(run.first, run.second) == kv.second);
+    }
+    assert(byHash[NTC64(sigSeq[0].c_str(), k)] == std::vector<unsigned>({0, 4}));
+    assert(byHash[NTC64(sigSeq[1].c_str(), k)] == std::vector<unsigned>({1, 6}));
+    const auto none = index.find(NTC64(randDNA(k, 31337).c_str(), k));
+    assert(none.first == none.second);
+    const SignatureIndex empty(0, k, [&](size_t i) -> const std::string& { return sigSeq[i]; });
+    const auto nothing = empty.find(NTC64(sigSeq[0].c_str(), k));
+    assert(nothing.first == nothing.second);
+
+    // A genome that holds the signatures' neighbourhood twice and a short contig.
+    {
+        std::ofstream o("sigidx_G.fa");
+        o << ">one\n" << g << "\n>short\nACGT\n>two\n" << g.substr(480, 60) << randDNA(100, 88) << "\n";
+    }
+    UniqSketchConfig cfg;
+    cfg.kmerLen = k;
+    std::vector<std::pair<unsigned, std::string>> expect, got;   // (signature, the k-mer as it stands in the genome)
+    scanFasta("sigidx_G.fa", [&](const std::string&, const std::string& seq, size_t) {
+        if (seq.size() < k) return;
+        for (ntHashIterator itr(seq, 1, k); itr != itr.end(); ++itr) {
+            auto it = byHash.find((*itr)[0]);
+            if (it == byHash.end()) continue;
+            for (unsigned idx : it->second) expect.push_back({idx, seq.substr(itr.get_pos(), k)});
+        }
+    });
+    scanSignatures(cfg, "sigidx_G.fa", index, [&](uint32_t idx, const char* kp) {
+        got.push_back({idx, std::string(kp, k)});
+    });
+    assert(got == expect);
+    assert(got.size() == 7 + 3);                            // `one`: 10 and 500 for two signatures each, 501, 1200, 2900; `two`: 500 (two) and 501
+    std::remove("sigidx_G.fa");
+    std::cerr << "PASSED: Test signature index and scan\n";
+}
+
 // buildGroupSketch end to end, on the same fixture: A and B differ at two sites,
 // D carries A's neighbourhood around the first. A's k-mers spanning site 1 are
 // therefore unique within the group {A, B} but not globally, and are the only
@@ -823,6 +879,7 @@ int main() {
     testGetTreeLevelRefs();
     testTreeLevelPartition();
     testGroupSignatures();
+    testSignatureIndex();
     testBuildGroupSketch();
     testNodeCarriers();
     testBuildHierarchicalTree();

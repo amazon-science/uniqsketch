@@ -520,6 +520,51 @@ void testSubstitutionHash() {
     std::cerr << "PASSED: Test NTMC64sub matches NTMC64 (" << checked << " substitutions)\n";
 }
 
+// forEachKmerAhead must hand use() exactly what a plain ntHashIterator loop
+// yields: the same k-mers, hash values and positions, in the same order, each one
+// requested before it is used and never more than KMER_LOOKAHEAD requests ahead.
+// The passes rewritten with it rely on that to perform the same operations in the
+// same order. Sequences shorter than k, of exactly k, around the look-ahead
+// distance, with runs of N (the iterator skips them) and lower case.
+void testKmerLookAhead() {
+    std::cerr << "START: Test k-mer look-ahead keeps the order of a plain scan... \t";
+    uint64_t x = 99;
+    auto next = [&x]() { x = x * 6364136223846793005ULL + 1442695040888963407ULL; return x >> 33; };
+    auto dna = [&](size_t n) { std::string d(n, 'A'); for (char& c : d) c = "ACGT"[next() % 4]; return d; };
+    const unsigned k = 21;
+    std::vector<std::string> seqs = {"", dna(k - 1), dna(k), dna(k + 1)};
+    for (size_t extra : {KMER_LOOKAHEAD - 1, KMER_LOOKAHEAD, KMER_LOOKAHEAD + 1, 2 * KMER_LOOKAHEAD + 3, 5000u})
+        seqs.push_back(dna(k + extra - 1));                // `extra` k-mers
+    seqs.push_back(dna(300) + std::string(40, 'N') + dna(10) + "N" + dna(200));
+    seqs.push_back(std::string(k, 'N'));
+    std::string lower = dna(400);
+    for (size_t i = 100; i < 200; i++) lower[i] = static_cast<char>(std::tolower(lower[i]));
+    seqs.push_back(lower);
+    size_t kmers = 0;
+    for (const std::string& seq : seqs) {
+        for (unsigned nh : {1u, 4u, 5u}) {
+            std::vector<std::pair<size_t, std::vector<uint64_t>>> expect, requested, used;
+            for (ntHashIterator itr(seq, nh, k); itr != itr.end(); ++itr)
+                expect.push_back({itr.get_pos(), std::vector<uint64_t>(*itr, *itr + nh)});
+            forEachKmerAhead(seq, nh, k,
+                [&](const uint64_t* hVal) {
+                    requested.push_back({0, std::vector<uint64_t>(hVal, hVal + nh)});
+                    assert(requested.size() - used.size() <= KMER_LOOKAHEAD);
+                },
+                [&](const uint64_t* hVal, size_t pos) {
+                    used.push_back({pos, std::vector<uint64_t>(hVal, hVal + nh)});
+                    assert(used.size() <= requested.size());                      // requested first
+                    assert(requested[used.size() - 1].second == used.back().second);
+                });
+            assert(used == expect);
+            assert(requested.size() == expect.size());
+            kmers += expect.size();
+        }
+    }
+    assert(kmers > 15000);
+    std::cerr << "PASSED: Test k-mer look-ahead keeps the order of a plain scan\n";
+}
+
 // isTwoSafe against a brute-force definition on a small universe: a candidate
 // is 2-safe iff none of its Hamming-1 neighbours is in the universe. The
 // filter is sized so that false positives cannot occur at this scale.
@@ -704,6 +749,7 @@ int main() {
     testIdentifyUniqKmers(cfg, refFiles);
     testGroupRepeatExclusion(cfg);
     testGroupScanIdentical();
+    testKmerLookAhead();
     testGzLineReader();
     testGzipReference(cfg);
     testCandidateFile();

@@ -129,6 +129,45 @@ inline unsigned wrapPad(const UniqSketchConfig& cfg) {
     return cfg.circular && cfg.kmerLen > 1 ? cfg.kmerLen - 1 : 0;
 }
 
+/**
+ * The k-mers of a sequence in position order, each announced before it is used.
+ *
+ * The build's passes over the genomes ask one question per k-mer of a table far
+ * larger than the cache: a Bloom filter block, four counters of the carriage
+ * filter, a slot of a hash table. Asked one k-mer at a time, every question waits
+ * for its own memory round trip and the processor has nothing else to do, since
+ * the next k-mer's address is not known until the next hash is computed. Here a
+ * k-mer is hashed, request(hVal) is called so the caller can ask for the lines it
+ * will touch (BloomFilter::prefetch and the like), and use(hVal, pos) is called
+ * KMER_LOOKAHEAD k-mers later, by which time the lines have arrived; the round
+ * trips of sixteen k-mers overlap instead of queueing.
+ *
+ * use() sees exactly the k-mers a plain ntHashIterator loop yields, with the same
+ * hash values and positions, in the same order (a ring, first in first out, drained
+ * at the end of the sequence), so a pass rewritten with this performs the same
+ * operations in the same order; request() must not read or write anything the
+ * result depends on. `hVal` points at the `nh` hash values of the k-mer and is valid
+ * for the duration of the call.
+ */
+static constexpr unsigned KMER_LOOKAHEAD = 16;
+
+template <typename Request, typename Use>
+inline void forEachKmerAhead(const std::string& seq, unsigned nh, unsigned k, Request request, Use use) {
+    std::vector<uint64_t> ring(static_cast<size_t>(KMER_LOOKAHEAD) * nh);
+    size_t pos[KMER_LOOKAHEAD];
+    size_t n = 0;                                     // k-mers hashed so far
+    for (ntHashIterator itr(seq, nh, k); itr != itr.end(); ++itr, ++n) {
+        const size_t slot = n % KMER_LOOKAHEAD;
+        uint64_t* hVal = &ring[slot * nh];
+        if (n >= KMER_LOOKAHEAD) use(static_cast<const uint64_t*>(hVal), pos[slot]);   // hashed KMER_LOOKAHEAD ago
+        std::memcpy(hVal, *itr, nh * sizeof(uint64_t));
+        pos[slot] = itr.get_pos();
+        request(static_cast<const uint64_t*>(hVal));
+    }
+    for (size_t i = n > KMER_LOOKAHEAD ? n - KMER_LOOKAHEAD : 0; i < n; i++)             // the tail, oldest first
+        use(static_cast<const uint64_t*>(&ring[(i % KMER_LOOKAHEAD) * nh]), pos[i % KMER_LOOKAHEAD]);
+}
+
 /** Candidate file of a reference: <outdir>/<basename without extension>.cand. */
 inline std::string candidatePath(const std::string& outdir, const std::string& refPath) {
     return outdir + "/" + getBaseId(refPath) + ".cand";
@@ -313,15 +352,17 @@ void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
         // so a wrap pad can never be mistaken for sequence by a reader of the
         // candidate file or by the window layout in getUniqSet.
         cand.beginContig(header, trueLen);
-        ntHashIterator itr(faSeq, cfg.nhash2, cfg.kmerLen);
-        while (itr != itr.end()) {
-            ++countAll;
-            if (!sbFilter.contains(*itr)) {
-                ++countUnique;
-                cand.add(static_cast<uint32_t>(itr.get_pos()));
-            }
-            ++itr;
-        }
+        // One probe of the solid filter per k-mer, its block asked for ahead
+        // (forEachKmerAhead); the candidates are added in position order as before.
+        forEachKmerAhead(faSeq, cfg.nhash2, cfg.kmerLen,
+            [&](const uint64_t* hVal) { sbFilter.prefetch(hVal[0]); },
+            [&](const uint64_t* hVal, size_t pos) {
+                ++countAll;
+                if (!sbFilter.contains(hVal)) {
+                    ++countUnique;
+                    cand.add(static_cast<uint32_t>(pos));
+                }
+            });
         cand.endContig();
     }, wrapPad(cfg));
     // A reference that contributes nothing is almost always an input problem
@@ -581,6 +622,18 @@ private:
             }
         }
         // One thread per partition: its blocks of every filter, nobody else's.
+        // A partition's slice of the filters is megabytes to tens of megabytes on a
+        // set of hundreds of genomes or more, well beyond the cache, so the blocks of
+        // the k-mer KMER_LOOKAHEAD places further on are asked for while this one is
+        // replayed (BloomFilter::prefetch); the order of the operations is untouched.
+        auto request = [&](uint64_t h0) {
+            dbFilter.prefetch(h0);
+            sbFilter.prefetch(h0);
+            if (seen) {
+                seen->prefetch(h0);
+                if (isRep) repSeen->prefetch(h0);
+            }
+        };
         #pragma omp parallel for schedule(dynamic)
         for (unsigned p = 0; p < P; p++) {
             uint64_t hVal[nh];
@@ -588,7 +641,9 @@ private:
                 const uint32_t* off = &off_[i * (P + 1)];
                 const uint64_t* from = h0_.data() + pieces[i].base + off[p];
                 const uint64_t* to = h0_.data() + pieces[i].base + off[p + 1];
+                for (const uint64_t* q = from; q != to && q - from < static_cast<std::ptrdiff_t>(KMER_LOOKAHEAD); ++q) request(*q);
                 for (; from != to; ++from) {
+                    if (to - from > static_cast<std::ptrdiff_t>(KMER_LOOKAHEAD)) request(from[KMER_LOOKAHEAD]);
                     const uint64_t h0 = *from;
                     hVal[0] = h0;
                     for (unsigned j = 1; j < nh; j++) hVal[j] = NTE64(h0, k, j);

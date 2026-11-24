@@ -216,6 +216,9 @@ public:
     }
     bool insert_make_change_exclusive(const uint64_t* hVal) { return insert_make_change(hVal); }
     void insert_exclusive(const uint64_t* hVal) { insert(hVal); }
+    // The blocked filter's look-ahead hint. A k-mer's bits are one line per hash
+    // here, so there is no single block to ask for; callers compile against either.
+    void prefetch(uint64_t) const {}
 
 private:
     /**

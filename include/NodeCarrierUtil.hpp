@@ -207,6 +207,10 @@ public:
     }
     size_t size() const { return size_; }
     size_t bytes() const { return size_ * sizeof(uint16_t); }
+    /** Ask for the four counters add() or count() will touch for this k-mer (a hint, see forEachKmerAhead). */
+    void prefetch(const uint64_t* hVal) const {
+        for (unsigned h = 0; h < HASHES; h++) __builtin_prefetch(&counters_[hVal[h] & mask_]);
+    }
     /** Count one genome for the k-mer with these HASHES hash values. */
     void add(const uint64_t* hVal) {
         for (unsigned h = 0; h < HASHES; h++) {
@@ -238,6 +242,13 @@ private:
  * once (a per-genome seen filter at 64 bits per base keeps a repeat within the genome
  * from counting twice). Genomes in parallel; the counter is a sum, so the result does
  * not depend on the order.
+ *
+ * Every k-mer is a block of the genome's seen filter and four counters spread over a
+ * table of gigabytes, all of them out of cache, so the pass is bound by memory round
+ * trips: the lines are asked for when the k-mer is hashed and it is counted sixteen
+ * k-mers later, in the same order (forEachKmerAhead). The seen filter belongs to this
+ * genome's thread alone, so the exclusive insert is the same test-and-set without
+ * the stripe lock, which is shared by every filter and every thread of the process.
  */
 inline void countCarriage(const UniqSketchConfig& cfg, const std::vector<std::string>& refFiles,
                           CarriageCounter& cc) {
@@ -247,11 +258,9 @@ inline void countCarriage(const UniqSketchConfig& cfg, const std::vector<std::st
                          CarriageCounter::HASHES, cfg.kmerLen);
         scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
             if (seq.size() < cfg.kmerLen) return;
-            ntHashIterator itr(seq, CarriageCounter::HASHES, cfg.kmerLen);
-            while (itr != itr.end()) {
-                if (seen.insert_make_change(*itr)) cc.add(*itr);
-                ++itr;
-            }
+            forEachKmerAhead(seq, CarriageCounter::HASHES, cfg.kmerLen,
+                [&](const uint64_t* hVal) { seen.prefetch(hVal[0]); cc.prefetch(hVal); },
+                [&](const uint64_t* hVal, size_t) { if (seen.insert_make_change_exclusive(hVal)) cc.add(hVal); });
         }, wrapPad(cfg));
     }
 }
@@ -289,6 +298,8 @@ public:
     }
     size_t size() const { return size_; }
     size_t capacity() const { return slots_.size(); }
+    /** Ask for the slot find(key) or findOrInsert(key) will look at first (a hint, see forEachKmerAhead). */
+    void prefetch(uint64_t key) const { __builtin_prefetch(&slots_[slotOf(key)]); }
     /** The value of `key`, or nullptr. */
     const uint32_t* find(uint64_t key) const {
         for (size_t i = slotOf(key);; i = (i + 1 == slots_.size()) ? 0 : i + 1) {
@@ -629,25 +640,32 @@ inline std::pair<size_t, size_t> checkRefCarried(const UniqSketchConfig& cfg, co
         scanFasta(repPath, [&](const std::string& header, const std::string& faSeq, size_t trueLen) {
             cand.beginContig(header, trueLen);
             carr.beginContig(header, trueLen);
-            ntHashIterator itr(faSeq, std::max<unsigned>(cfg.nhash2, CarriageCounter::HASHES), cfg.kmerLen);
-            while (itr != itr.end()) {
-                ++all;
-                if (!sbFilter.contains(*itr)) {
-                    ++plain;
-                    cand.add(static_cast<uint32_t>(itr.get_pos()));
-                } else {
-                    const uint32_t* v = cc && cap > 0 ? nk.index.find((*itr)[0]) : nullptr;
-                    if (v && nk.repMult[*v] == 1) {
-                        const unsigned in = nk.inNode[*v].load(std::memory_order_relaxed);
-                        const unsigned total = cc->count(*itr);
-                        if (in >= halfMembers && total >= in && total - in <= cap) {
-                            ++carried;
-                            carr.add(static_cast<uint32_t>(itr.get_pos()));
+            // The solid block, the table slot and the four carriage counters of a k-mer
+            // are asked for when it is hashed, and it is judged sixteen k-mers later, in
+            // position order as before (forEachKmerAhead).
+            const bool useCarriage = cc && cap > 0;
+            forEachKmerAhead(faSeq, std::max<unsigned>(cfg.nhash2, CarriageCounter::HASHES), cfg.kmerLen,
+                [&](const uint64_t* hVal) {
+                    sbFilter.prefetch(hVal[0]);
+                    if (useCarriage) { nk.index.prefetch(hVal[0]); cc->prefetch(hVal); }
+                },
+                [&](const uint64_t* hVal, size_t pos) {
+                    ++all;
+                    if (!sbFilter.contains(hVal)) {
+                        ++plain;
+                        cand.add(static_cast<uint32_t>(pos));
+                    } else {
+                        const uint32_t* v = useCarriage ? nk.index.find(hVal[0]) : nullptr;
+                        if (v && nk.repMult[*v] == 1) {
+                            const unsigned in = nk.inNode[*v].load(std::memory_order_relaxed);
+                            const unsigned total = cc->count(hVal);
+                            if (in >= halfMembers && total >= in && total - in <= cap) {
+                                ++carried;
+                                carr.add(static_cast<uint32_t>(pos));
+                            }
                         }
                     }
-                }
-                ++itr;
-            }
+                });
             cand.endContig();
             carr.endContig();
         }, wrapPad(cfg));
@@ -767,14 +785,16 @@ inline std::vector<std::string> identifyGroupUniqKmersCarried(
             std::vector<uint16_t> mult;
             scanFasta(groups[batch[j]][0], [&](const std::string&, const std::string& seq, size_t) {
                 if (seq.size() < cfg.kmerLen) return;
-                ntHashIterator itr(seq, 1, cfg.kmerLen);
-                while (itr != itr.end()) {
-                    bool inserted = false;
-                    const uint32_t v = n.index.findOrInsert((*itr)[0], static_cast<uint32_t>(mult.size()), inserted);
-                    if (inserted) mult.push_back(1);
-                    else if (mult[v] < UINT16_MAX) mult[v]++;
-                    ++itr;
-                }
+                // The slot is asked for when the k-mer is hashed and filled sixteen k-mers
+                // later, in the same order: the order numbers the k-mers (forEachKmerAhead).
+                forEachKmerAhead(seq, 1, cfg.kmerLen,
+                    [&](const uint64_t* hVal) { n.index.prefetch(hVal[0]); },
+                    [&](const uint64_t* hVal, size_t) {
+                        bool inserted = false;
+                        const uint32_t v = n.index.findOrInsert(hVal[0], static_cast<uint32_t>(mult.size()), inserted);
+                        if (inserted) mult.push_back(1);
+                        else if (mult[v] < UINT16_MAX) mult[v]++;
+                    });
             }, wrapPad(cfg));
             n.repMult = std::move(mult);
             std::vector<std::atomic<uint16_t>> in(n.repMult.size());
@@ -795,15 +815,35 @@ inline std::vector<std::string> identifyGroupUniqKmersCarried(
             std::vector<bool> seen(n.repMult.size(), false);
             scanFasta(groups[batch[jobs[t].first]][jobs[t].second], [&](const std::string&, const std::string& seq, size_t) {
                 if (seq.size() < cfg.kmerLen) return;
-                ntHashIterator itr(seq, 1, cfg.kmerLen);
-                while (itr != itr.end()) {
-                    const uint32_t* v = n.index.find((*itr)[0]);
-                    if (v && !seen[*v]) {
-                        seen[*v] = true;
-                        n.inNode[*v].fetch_add(1, std::memory_order_relaxed);
+                // A member k-mer is a probe of the representative's table (a hundred
+                // megabytes) and, when found there, an add to a counter the other
+                // members' threads are adding to as well. Two steps of look-ahead: the
+                // table slot is asked for when the k-mer is hashed and looked up sixteen
+                // k-mers later (forEachKmerAhead), which asks for the counter; the count
+                // is made sixteen found k-mers after that. The k-mers are still counted
+                // in genome order (the count is a sum over members, each marking a k-mer
+                // once, so the order would not matter either).
+                uint32_t found[KMER_LOOKAHEAD];
+                size_t nFound = 0;
+                auto count = [&](uint32_t v) {
+                    if (!seen[v]) {
+                        seen[v] = true;
+                        n.inNode[v].fetch_add(1, std::memory_order_relaxed);
                     }
-                    ++itr;
-                }
+                };
+                forEachKmerAhead(seq, 1, cfg.kmerLen,
+                    [&](const uint64_t* hVal) { n.index.prefetch(hVal[0]); },
+                    [&](const uint64_t* hVal, size_t) {
+                        const uint32_t* v = n.index.find(hVal[0]);
+                        if (!v) return;
+                        uint32_t& slot = found[nFound % KMER_LOOKAHEAD];
+                        if (nFound >= KMER_LOOKAHEAD) count(slot);
+                        slot = *v;
+                        __builtin_prefetch(&n.inNode[*v]);
+                        ++nFound;
+                    });
+                for (size_t i = nFound > KMER_LOOKAHEAD ? nFound - KMER_LOOKAHEAD : 0; i < nFound; i++)
+                    count(found[i % KMER_LOOKAHEAD]);
             }, wrapPad(cfg));
         }
         memberGenomes += jobs.size();

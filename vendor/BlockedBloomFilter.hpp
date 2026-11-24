@@ -179,6 +179,14 @@ public:
         file.write(reinterpret_cast<const char*>(m_filter), m_blocks * BLOCK_BYTES);
     }
 
+    /**
+     * Ask the processor for the block of the k-mer with leading hash h0, for a
+     * caller that will probe or insert that k-mer a few k-mers from now (see
+     * forEachKmerAhead in UniqSketchUtil.hpp). A hint only: nothing of the filter
+     * is read into the program or written, so it cannot change a result.
+     */
+    void prefetch(uint64_t h0) const { __builtin_prefetch(block(h0)); }
+
     /** Number of set bits. */
     size_t get_pop() const {
         size_t pop = 0;

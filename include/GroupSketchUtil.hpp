@@ -23,6 +23,7 @@
 #include "QuerySketchUtil.hpp"
 #include "TreeSketchUtil.hpp"
 #include "FileUtil.hpp"
+#include "NodeCarrierUtil.hpp"
 #include "ntcard.hpp"
 
 /**
@@ -119,6 +120,66 @@ inline std::vector<SignatureGroup> signatureGroups(const std::vector<TreeNode>& 
 }
 
 /**
+ * Signatures by canonical hash, for the passes that ask of every k-mer of every
+ * genome whether it is a signature (findCarriers, reportReachability): one flat
+ * table from the hash to a run of signature indices, ascending, where there was an
+ * unordered_map of vectors. A probe is one cache line instead of a bucket, a node
+ * and a vector's storage, and its address is known from the hash alone, so it can
+ * be asked for ahead of its use (scanSignatures).
+ */
+class SignatureIndex {
+public:
+    /** @param seqOf  seqOf(i) is the sequence of signature i, for i < n. */
+    template <typename SeqOf>
+    SignatureIndex(size_t n, unsigned k, SeqOf seqOf) : table_(n) {
+        std::vector<uint32_t> runOf(n);               // signature -> its run (one per distinct hash)
+        std::vector<uint32_t> count;                  // run -> signatures in it
+        for (size_t i = 0; i < n; i++) {
+            bool inserted = false;
+            runOf[i] = table_.findOrInsert(NTC64(seqOf(i).c_str(), k), static_cast<uint32_t>(count.size()), inserted);
+            if (inserted) count.push_back(0);
+            count[runOf[i]]++;
+        }
+        start_.assign(count.size() + 1, 0);
+        for (size_t r = 0; r < count.size(); r++) start_[r + 1] = start_[r] + count[r];
+        members_.resize(n);
+        std::vector<uint32_t> next(start_.begin(), start_.end() - 1);
+        for (size_t i = 0; i < n; i++) members_[next[runOf[i]]++] = static_cast<uint32_t>(i);
+    }
+    /** Ask for the slot find(h) will look at (a hint, see forEachKmerAhead). */
+    void prefetch(uint64_t h) const { table_.prefetch(h); }
+    /** The signatures whose hash is h, as [first, last), ascending; empty when there are none. */
+    std::pair<const uint32_t*, const uint32_t*> find(uint64_t h) const {
+        const uint32_t* run = table_.find(h);
+        if (!run) return {nullptr, nullptr};
+        return {members_.data() + start_[*run], members_.data() + start_[*run + 1]};
+    }
+private:
+    KmerTable table_;                                 // hash -> run
+    std::vector<uint32_t> start_, members_;           // run r is members_[start_[r] .. start_[r + 1])
+};
+
+/**
+ * fn(signature index, pointer to the k-mer in the genome) for every k-mer of the
+ * genome at `path` whose hash is a signature's, in genome order and, for one k-mer,
+ * in signature order: the loop findCarriers and reportReachability each had, with the
+ * table slot asked for when the k-mer is hashed and probed sixteen k-mers later
+ * (forEachKmerAhead). The caller confirms the sequence (kmerMatches), as before.
+ */
+template <typename Fn>
+inline void scanSignatures(const UniqSketchConfig& cfg, const std::string& path, const SignatureIndex& index, Fn fn) {
+    scanFasta(path, [&](const std::string&, const std::string& seq, size_t) {
+        if (seq.size() < cfg.kmerLen) return;
+        forEachKmerAhead(seq, 1, cfg.kmerLen,
+            [&](const uint64_t* hVal) { index.prefetch(hVal[0]); },
+            [&](const uint64_t* hVal, size_t pos) {
+                const auto run = index.find(hVal[0]);
+                for (const uint32_t* q = run.first; q != run.second; ++q) fn(*q, seq.c_str() + pos);
+            });
+    }, wrapPad(cfg));
+}
+
+/**
  * Fill in the carriers of every signature: each genome of the index other than
  * the signature's own leaf that contains the k-mer. One pass over each genome,
  * probing a hash-keyed view of the signatures and confirming the sequence on a
@@ -127,10 +188,7 @@ inline std::vector<SignatureGroup> signatureGroups(const std::vector<TreeNode>& 
 inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature>& sigs,
                          const std::vector<std::string>& refFiles) {
     if (sigs.empty()) return;
-    std::unordered_map<uint64_t, std::vector<unsigned>> index;
-    index.reserve(sigs.size());
-    for (unsigned i = 0; i < sigs.size(); i++)
-        index[NTC64(sigs[i].seq.c_str(), cfg.kmerLen)].push_back(i);
+    const SignatureIndex index(sigs.size(), cfg.kmerLen, [&](size_t i) -> const std::string& { return sigs[i].seq; });
 
     // Per genome, the signatures it carries, as a list. This was a bit per (genome,
     // signature), held for every genome to the end and then walked on one thread:
@@ -143,22 +201,12 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
     for (unsigned g = 0; g < refFiles.size(); g++) {
         std::vector<bool> mark(sigs.size(), false);
         std::vector<uint32_t> mine;
-        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
-            if (seq.size() < cfg.kmerLen) return;
-            ntHashIterator itr(seq, 1, cfg.kmerLen);
-            while (itr != itr.end()) {
-                auto it = index.find((*itr)[0]);
-                if (it != index.end()) {
-                    const char* kp = seq.c_str() + itr.get_pos();
-                    for (unsigned idx : it->second)
-                        if (sigs[idx].refId != g && !mark[idx] && kmerMatches(kp, sigs[idx].seq)) {
-                            mark[idx] = true;
-                            mine.push_back(idx);
-                        }
-                }
-                ++itr;
+        scanSignatures(cfg, refFiles[g], index, [&](uint32_t idx, const char* kp) {
+            if (sigs[idx].refId != g && !mark[idx] && kmerMatches(kp, sigs[idx].seq)) {
+                mark[idx] = true;
+                mine.push_back(idx);
             }
-        }, wrapPad(cfg));
+        });
         std::sort(mine.begin(), mine.end());      // signature order, for the walk below
         hit[g] = std::move(mine);
     }
@@ -606,10 +654,7 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
             nodeTotal[li][it->second]++;
         }
     }
-    std::unordered_map<uint64_t, std::vector<unsigned>> index;
-    index.reserve(sigSeq.size());
-    for (unsigned i = 0; i < sigSeq.size(); i++)
-        index[NTC64(sigSeq[i].c_str(), cfg.kmerLen)].push_back(i);
+    const SignatureIndex index(sigSeq.size(), cfg.kmerLen, [&](size_t i) -> const std::string& { return sigSeq[i]; });
 
     // One pass per genome: distinct signatures of each ancestor that the genome carries,
     // and, when asked, the genomes outside a signature's node that contain it (its
@@ -620,24 +665,13 @@ inline void reportReachability(const UniqSketchConfig& cfg, const std::vector<Tr
     for (unsigned g = 0; g < numRef; g++) {
         std::vector<bool> seen(sigSeq.size(), false);
         std::vector<unsigned> outside;                    // signatures of other nodes this genome carries
-        scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
-            if (seq.size() < cfg.kmerLen) return;
-            ntHashIterator itr(seq, 1, cfg.kmerLen);
-            while (itr != itr.end()) {
-                auto it = index.find((*itr)[0]);
-                if (it != index.end()) {
-                    const char* kp = seq.c_str() + itr.get_pos();
-                    for (unsigned idx : it->second) {
-                        if (seen[idx] || !kmerMatches(kp, sigSeq[idx])) continue;
-                        seen[idx] = true;
-                        const unsigned li = sigLevel[idx];
-                        if (leafEntry[li][g] == static_cast<int>(sigEntry[idx])) carried[g][li]++;
-                        else if (writeCarriers) outside.push_back(idx);
-                    }
-                }
-                ++itr;
-            }
-        }, wrapPad(cfg));
+        scanSignatures(cfg, refFiles[g], index, [&](uint32_t idx, const char* kp) {
+            if (seen[idx] || !kmerMatches(kp, sigSeq[idx])) return;
+            seen[idx] = true;
+            const unsigned li = sigLevel[idx];
+            if (leafEntry[li][g] == static_cast<int>(sigEntry[idx])) carried[g][li]++;
+            else if (writeCarriers) outside.push_back(idx);
+        });
         if (writeCarriers && !outside.empty()) {
             #pragma omp critical(sigCarriers)
             for (unsigned idx : outside) sigCarriers[idx].push_back(g);
