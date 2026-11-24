@@ -234,6 +234,25 @@ void testGroupSignatures() {
     assert(sigs[1].carriers.empty());
     assert(sigs[2].carriers == std::vector<unsigned>({1}));
 
+    // A second carrier that holds the site-1 neighbourhood twice, once on each
+    // strand: it is listed once, after D (carriers are in leaf order), and the
+    // signature's own leaf is never among them.
+    {
+        std::string rc(a.substr(340, 120));
+        std::reverse(rc.begin(), rc.end());
+        for (char& ch : rc) ch = (ch == 'A') ? 'T' : (ch == 'T') ? 'A' : (ch == 'C') ? 'G' : 'C';
+        writeFasta("grp_E.fa", randDNA(500, 1313) + a.substr(340, 120) + randDNA(300, 1717) + rc);
+        std::vector<std::string> refs5 = refs;
+        refs5.push_back("grp_E.fa");
+        std::vector<GroupSignature> again = sigs;
+        for (GroupSignature& s : again) s.carriers.clear();
+        findCarriers(cfg, again, refs5);
+        assert(again[0].carriers == std::vector<unsigned>({3, 4}));
+        assert(again[1].carriers.empty());
+        assert(again[2].carriers == std::vector<unsigned>({1}));
+        std::remove("grp_E.fa");
+    }
+
     // Round trip through the index file.
     writeGroupSketch("grp_sketch.tsv", sigs, 4);
     auto back = loadGroupSketch("grp_sketch.tsv");

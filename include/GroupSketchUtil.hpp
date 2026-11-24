@@ -132,10 +132,17 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
     for (unsigned i = 0; i < sigs.size(); i++)
         index[NTC64(sigs[i].seq.c_str(), cfg.kmerLen)].push_back(i);
 
-    std::vector<std::vector<bool>> hit(refFiles.size());
+    // Per genome, the signatures it carries, as a list. This was a bit per (genome,
+    // signature), held for every genome to the end and then walked on one thread:
+    // genomes x signatures bits and as many tests (3.85 GB and 3.1e10 on 5 493 E. coli,
+    // both growing with the square of the index), where the lists hold the carriers
+    // found (3.1e8 there). `mark` stays, private to the genome's thread, so that a
+    // k-mer the genome has twice is listed once.
+    std::vector<std::vector<uint32_t>> hit(refFiles.size());
     #pragma omp parallel for schedule(dynamic)
     for (unsigned g = 0; g < refFiles.size(); g++) {
         std::vector<bool> mark(sigs.size(), false);
+        std::vector<uint32_t> mine;
         scanFasta(refFiles[g], [&](const std::string&, const std::string& seq, size_t) {
             if (seq.size() < cfg.kmerLen) return;
             ntHashIterator itr(seq, 1, cfg.kmerLen);
@@ -144,16 +151,23 @@ inline void findCarriers(const UniqSketchConfig& cfg, std::vector<GroupSignature
                 if (it != index.end()) {
                     const char* kp = seq.c_str() + itr.get_pos();
                     for (unsigned idx : it->second)
-                        if (sigs[idx].refId != g && kmerMatches(kp, sigs[idx].seq)) mark[idx] = true;
+                        if (sigs[idx].refId != g && !mark[idx] && kmerMatches(kp, sigs[idx].seq)) {
+                            mark[idx] = true;
+                            mine.push_back(idx);
+                        }
                 }
                 ++itr;
             }
         }, wrapPad(cfg));
-        hit[g] = std::move(mark);
+        std::sort(mine.begin(), mine.end());      // signature order, for the walk below
+        hit[g] = std::move(mine);
     }
-    for (unsigned g = 0; g < refFiles.size(); g++)
-        for (unsigned i = 0; i < sigs.size(); i++)
-            if (hit[g][i]) sigs[i].carriers.push_back(g);
+    // Genome by genome in id order, so every signature's carriers are ascending, as
+    // they were.
+    for (unsigned g = 0; g < refFiles.size(); g++) {
+        for (uint32_t i : hit[g]) sigs[i].carriers.push_back(g);
+        std::vector<uint32_t>().swap(hit[g]);
+    }
 }
 
 inline std::string groupSketchPath(const std::string& outdir) {
