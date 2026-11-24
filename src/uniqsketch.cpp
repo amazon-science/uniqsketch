@@ -47,7 +47,7 @@ static const char USAGE_MESSAGE[] =
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
-    "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree]\n"
+    "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree unless --min-margin=1]\n"
     "      --circular\treferences are circular: also take the k-1 k-mers spanning each contig's end-to-start join\n"
     "      --no-group-signatures\tdo not build within-group leaf signatures (with --tree; see README)\n"
     "      --node-carriers=N\tfill a tree node's signature quota, when its node-unique k-mers leave it short,\n"
@@ -187,18 +187,30 @@ int main(int argc, char** argv) {
     // 8-phage benchmark, reads landing on absent references fell from 2093 to 2
     // over 28 samples) while keeping most of the candidate pool. Strict mode is
     // needed for that guarantee; the soft fallback would refill empty slots with
-    // the very signatures being excluded. An explicit --min-margin wins.
-    if (!treeThresholds.empty() && !marginGiven) {
-        cfg.minMargin = 2;
-        cfg.strictMargin = true;
-        std::cerr << PROGRAM ": --tree defaults to --min-margin=2 --strict-margin "
-                     "(pass --min-margin=1 to select signatures without a margin)\n";
-    }
+    // the very signatures being excluded. An explicit --min-margin=1 wins.
+    if (!treeThresholds.empty() && !marginGiven) cfg.minMargin = 2;
 
     if (cfg.minMargin < 1) cfg.minMargin = 1;
     if (cfg.minMargin > 2) {
         std::cerr << PROGRAM ": --min-margin > 2 is not supported; using 2\n";
         cfg.minMargin = 2;
+    }
+
+    // A margin of 2 is strict under --tree whether it is the default or spelled
+    // out. Only the absence of --min-margin used to switch the strict margin on,
+    // so --tree with --min-margin=2, the value the usage text gives as the tree
+    // default, built a soft-margin index without a word: margin-1 signatures in
+    // the slots no 2-safe one filled (228 of 3 004 on the 8-phage set), and a
+    // query kept at --rcutoff=2 (236 false rows over the 280 phage mixtures
+    // against 2, and 36 contaminants found at 0.01 % against 44).
+    if (!treeThresholds.empty() && cfg.minMargin >= 2) {
+        if (!marginGiven)
+            std::cerr << PROGRAM ": --tree defaults to --min-margin=2 --strict-margin "
+                         "(pass --min-margin=1 to select signatures without a margin)\n";
+        else if (!cfg.strictMargin)
+            std::cerr << PROGRAM ": --tree enforces --min-margin=2 strictly, as its default does "
+                         "(pass --min-margin=1 to select signatures without a margin)\n";
+        cfg.strictMargin = true;
     }
 
     if (argc - optind < 1) {

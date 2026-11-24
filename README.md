@@ -264,7 +264,7 @@ A list of files containing file names in each row can be passed with @ prefix.
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
-      --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree]
+      --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree unless --min-margin=1]
       --circular        references are circular: also take the k-1 k-mers spanning each contig's end-to-start join
       --no-group-signatures  do not build within-group leaf signatures (with --tree)
       --node-carriers=N fill a tree node's signature quota, when its node-unique k-mers leave it short,
