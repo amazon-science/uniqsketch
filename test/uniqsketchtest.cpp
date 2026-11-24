@@ -83,8 +83,13 @@ void testIdentifyUniqKmers(const UniqSketchConfig& cfg,
     ref_test_1: {AGGCTACAAA, GAGACTGAAC, AGACTGAACT}
     ref_test_2: {CTCAGCTAAG, CCTCAGCTAA, AGGCTACAAC}
     */
+    // A carried pool left beside a candidate file by an earlier build in the same
+    // directory must not survive the scan: selection takes its existence as the
+    // sign that one was made for this reference, and would draw from it.
+    { std::ofstream stale("ref_test_1.carried"); stale << "left by an earlier build\n"; }
     BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
     identifyUniqKmers(cfg, refFiles, dbFilter);
+    assert(!std::ifstream("ref_test_1.carried").good());
 
     assert(candidateLines("ref_test_1.cand") == fileLines("expected_ref_test_1.tsv"));
     assert(candidateLines("ref_test_2.cand") == fileLines("expected_ref_test_2.tsv"));

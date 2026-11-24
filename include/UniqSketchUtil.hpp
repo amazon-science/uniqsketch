@@ -357,6 +357,13 @@ void loadBFfa(const UniqSketchConfig& cfg, const std::string& fPath, BloomFilter
 void checkRef(const UniqSketchConfig& cfg, const std::string& fPath, int refId,
               const BloomFilter& sbFilter, std::vector<int>& refCount) {
     const std::string candPath = candidatePath(cfg.outdir, fPath);
+    // A reference scanned by this rule has no carried pool, and buildSketch takes
+    // the existence of <name>.carried as the sign that one was made for it
+    // (checkRefCarried writes or removes its own). One left in the directory by an
+    // earlier build would be drawn from: rebuilding the 8-phage index over a
+    // directory holding such a file gave a single leaf 500 level signatures for
+    // 496, with carriers off.
+    std::remove(carriedCandidatePath(candPath).c_str());
     CandidateWriter cand(candPath, cfg.kmerLen, fPath);
     size_t countUnique = 0, countAll = 0;
     scanFasta(fPath, [&](const std::string& header, const std::string& faSeq, size_t trueLen) {
