@@ -816,23 +816,45 @@ struct SketchStat {
  * from it in O(1) with NTMC64sub (ntHash is an XOR of per-base terms), so a
  * candidate costs one O(k) hash plus 3k Bloom probes instead of 3k O(k) hashes.
  *
+ * The answer is a property of the k-mer and the filter, so the order in which the
+ * neighbors are probed cannot change it, and a caller walking overlapping candidates
+ * can say where to look first. A candidate one substitution away from a relative's
+ * k-mer fails at the base where the two genomes differ, and so does every candidate
+ * beside it that covers the same base. `failedAt` carries that base from one call to
+ * the next as an offset into `sig` (-1: none): its three neighbors are probed before
+ * the others, and on return it is the offset at which a neighbor was found, or -1
+ * when the k-mer is 2-safe. A hint that is wrong costs three probes.
+ *
  * @param sig  Candidate signature (length cfg.kmerLen).
  * @param dbFilter  Distinct Bloom filter over all universe k-mers.
+ * @param failedAt  Optional, in and out: the offset to probe first / the offset that failed.
  * @return True if no Hamming-1 neighbor is present in the universe.
  */
-bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomFilter& dbFilter) {
+bool isTwoSafe(const UniqSketchConfig& cfg, const std::string& sig, const BloomFilter& dbFilter,
+               int* failedAt = nullptr) {
     static const char BASES[4] = {'A', 'C', 'G', 'T'};
     uint64_t fhVal = 0, rhVal = 0;
     NTC64(sig.c_str(), cfg.kmerLen, fhVal, rhVal);
     uint64_t hVal[cfg.nhash1];
-    for (unsigned i = 0; i < cfg.kmerLen; ++i) {
+    auto neighborPresent = [&](unsigned i) {
         const char orig = sig[i];
         for (char b : BASES) {
             if (b == orig) continue;
             NTMC64sub(fhVal, rhVal, i, orig, b, cfg.kmerLen, cfg.nhash1, hVal);
-            if (dbFilter.contains(hVal)) return false;
+            if (dbFilter.contains(hVal)) return true;
+        }
+        return false;
+    };
+    const int first = (failedAt && *failedAt >= 0 && static_cast<unsigned>(*failedAt) < cfg.kmerLen) ? *failedAt : -1;
+    if (first >= 0 && neighborPresent(static_cast<unsigned>(first))) return false;
+    for (unsigned i = 0; i < cfg.kmerLen; ++i) {
+        if (static_cast<int>(i) == first) continue;
+        if (neighborPresent(i)) {
+            if (failedAt) *failedAt = static_cast<int>(i);
+            return false;
         }
     }
+    if (failedAt) *failedAt = -1;
     return true;
 }
 
@@ -975,8 +997,9 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     //
     // Candidates are examined lazily, and only as far as needed: a window is
     // walked in position order until one candidate is usable (low-complexity
-    // and homopolymer filters, then the margin when cfg.minMargin >= 2), so a
-    // dense window costs one margin check and a sparse one at most its size.
+    // and homopolymer filters, and the margin when cfg.minMargin >= 2; see
+    // examine for the order they are tested in), so a dense window costs one
+    // margin check and a sparse one at most its size.
     // In soft-margin mode a window with no 2-safe candidate takes its first
     // margin-1 one; strict mode leaves it empty.
     const size_t total = cands.size();
@@ -1013,13 +1036,42 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     picks.reserve(std::min(quota, total));
     std::vector<char> noSafeLeft(windows, 0);       // a full walk of the window found no 2-safe candidate
 
+    // Where the last margin failure was, as (contig, base): the next candidate that
+    // covers that base probes it first (isTwoSafe's hint).
+    uint32_t failRun = UINT32_MAX;
+    uint64_t failBase = 0;
     // 0: unusable; 1: usable, margin 1 (or margin not required); 2: usable, 2-safe.
-    auto examine = [&](size_t i, bool checkMargin, std::string& useq) -> int {
+    //
+    // `exact` says whether the caller needs to tell 0 from 1 when the margin is
+    // checked. It does only while it is looking for a soft-margin fallback; in strict
+    // mode, and once a fallback is in hand, a candidate matters only if it is usable
+    // AND 2-safe, and then any value other than 2 means "not this one". The two
+    // conditions are independent, so they are then tested cheapest-to-refute first:
+    // the margin, which the hint settles in three probes for a candidate beside one
+    // that failed (most of a dense lineage's candidates), before the entropy, which
+    // is five k'-mer spectra and a few hundred logarithms per candidate and used to
+    // be computed for every candidate the margin then rejected. The candidates
+    // picked are the same.
+    auto examine = [&](size_t i, bool checkMargin, bool exact, std::string& useq) -> int {
         const Cand& c = cands[i];
-        useq = get_canonical(contigs[c.run].substr(c.pos, cfg.kmerLen));
-        if (lowComplexity(cfg, useq) || hasLongHomopolymer(cfg, useq)) return 0;
-        if (!checkMargin) return 1;
-        return isTwoSafe(cfg, useq, dbFilter) ? 2 : 1;
+        const std::string fwd = contigs[c.run].substr(c.pos, cfg.kmerLen);
+        useq = get_canonical(fwd);
+        auto unusable = [&]() { return lowComplexity(cfg, useq) || hasLongHomopolymer(cfg, useq); };
+        if (!checkMargin) return unusable() ? 0 : 1;
+        if (exact && unusable()) return 0;
+        // The signature is the canonical k-mer: an offset into it counts from the
+        // other end of the candidate when the canonical form is the reverse complement.
+        const bool rc = (useq != fwd);
+        const int last = static_cast<int>(cfg.kmerLen) - 1;
+        int at = -1;
+        if (failRun == c.run && failBase >= c.pos && failBase - c.pos < cfg.kmerLen) {
+            const int off = static_cast<int>(failBase - c.pos);
+            at = rc ? last - off : off;
+        }
+        if (isTwoSafe(cfg, useq, dbFilter, &at)) return (exact || !unusable()) ? 2 : 0;
+        failRun = c.run;
+        failBase = c.pos + static_cast<uint64_t>(rc ? last - at : at);
+        return 1;
     };
     // Take the first usable candidate in [a, b), a range inside window w, or
     // report that it has none. On the window's first call, in soft-margin mode,
@@ -1028,17 +1080,23 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
     // candidate is not probed for the margin again.
     auto takeIn = [&](size_t w, size_t a, size_t b) -> bool {
         const bool wantSafe = useMargin && !noSafeLeft[w];
+        const bool wholeWindow = (a == wBegin[w] && b == wBegin[w + 1]);
+        // The margin-1 fallback is taken only from a walk of the whole window in
+        // soft-margin mode, and it is the first one: until it is found the walk
+        // needs examine's exact answer, afterwards (and everywhere else) it does not.
+        const bool wantFallback = wantSafe && wholeWindow && !cfg.strictMargin;
         size_t fallback = total;
         std::string fallbackSeq, useq;
         for (size_t i = a; i < b; i++) {
-            const int v = examine(i, wantSafe, useq);
+            const bool exact = wantFallback && fallback == total;
+            const int v = examine(i, wantSafe, exact, useq);
             if (v == 2 || (v == 1 && !wantSafe)) {
                 picks.push_back({i, useq, v == 2});
                 return true;
             }
-            if (v == 1 && fallback == total) { fallback = i; fallbackSeq = useq; }
+            if (exact && v == 1) { fallback = i; fallbackSeq = useq; }
         }
-        if (wantSafe && a == wBegin[w] && b == wBegin[w + 1]) {
+        if (wantSafe && wholeWindow) {
             noSafeLeft[w] = 1;
             if (!cfg.strictMargin && fallback != total) {
                 picks.push_back({fallback, fallbackSeq, false});

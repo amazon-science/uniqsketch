@@ -537,6 +537,7 @@ void testIsTwoSafe() {
     // Universe: 200 random k-mers plus, for 50 further candidates, exactly one
     // Hamming-1 neighbour each (at a random position, random other base).
     std::vector<std::string> safe, unsafe;
+    std::vector<unsigned> plantedAt;                       // the neighbour's position, per unsafe candidate
     for (int i = 0; i < 200; i++) { std::string u = randKmer(); dbf.insert(u.c_str()); safe.push_back(u); }
     for (int i = 0; i < 50; i++) {
         std::string c = randKmer(), n = c;
@@ -545,6 +546,7 @@ void testIsTwoSafe() {
         n[pos] = b;
         dbf.insert(n.c_str());
         unsafe.push_back(c);
+        plantedAt.push_back(pos);
     }
     // A universe k-mer's own presence is not a neighbour; a random 31-mer has
     // no neighbour in a 250-k-mer universe, so the first set is 2-safe ...
@@ -557,7 +559,131 @@ void testIsTwoSafe() {
         for (auto& c : rc) c = (c == 'A') ? 'T' : (c == 'T') ? 'A' : (c == 'C') ? 'G' : 'C';
         assert(!isTwoSafe(cfg, rc, dbf));
     }
+    // The hint says where to probe first and never changes the answer: with every
+    // offset, with none (-1) and with one past the k-mer, a candidate is judged as
+    // without a hint. On a failure the hint comes back as the offset whose neighbour
+    // is present (there is exactly one, the planted one), on success as -1.
+    for (size_t i = 0; i < unsafe.size(); i++) {
+        for (int h = -1; h <= static_cast<int>(cfg.kmerLen); h++) {
+            int at = h;
+            assert(!isTwoSafe(cfg, unsafe[i], dbf, &at));
+            assert(at == static_cast<int>(plantedAt[i]));
+        }
+    }
+    for (size_t i = 0; i < 20; i++) {
+        for (int h = -1; h <= static_cast<int>(cfg.kmerLen); h++) {
+            int at = h;
+            assert(isTwoSafe(cfg, safe[i], dbf, &at));
+            assert(at == -1);
+        }
+    }
     std::cerr << "PASSED: Test isTwoSafe\n";
+}
+
+// The order in which selection tests a candidate (margin before entropy, see
+// examine in getUniqSet) must not change what it picks. With a quota of one the
+// genome is a single window and the rule is short enough to state here: the first
+// candidate that is usable (entropy, homopolymer) and 2-safe; failing that, in
+// soft-margin mode, the first usable one; without a margin, the first usable one.
+// The genomes put the cases selection could confuse ahead of the candidate it must
+// take: a low-complexity stretch that is 2-safe (unusable, and not a fallback
+// either), a stretch a substitution away from the other reference (usable, fails
+// the margin), then ordinary sequence. Each expectation is computed from the
+// candidate file with the filters called one at a time.
+void testSelectionFilterOrder() {
+    std::cerr << "START: Test selection picks the same candidate whatever the filter order... \t";
+    uint64_t x = 424242;
+    auto next = [&x]() { x = x * 6364136223846793005ULL + 1442695040888963407ULL; return x >> 33; };
+    auto dna = [&](size_t n) { std::string d(n, 'A'); for (char& c : d) c = "ACGT"[next() % 4]; return d; };
+    // Low entropy but not periodic, so its k-mers are distinct: A with a C, G or T
+    // at irregular intervals.
+    auto lowEntropy = [&](size_t n) {
+        std::string d(n, 'A');
+        for (size_t i = 5; i < n; i += 9 + next() % 7) d[i] = "CGT"[next() % 3];
+        return d;
+    };
+    UniqSketchConfig cfg;
+    cfg.kmerLen = 31;
+    cfg.bits = 128;
+    cfg.dbfSize = 20000;
+    cfg.sbfSize = 2000;
+    cfg.sketchnum = 1;                                      // one window: the whole genome
+    cfg.outdir = ".";
+    cfg.refstat = "sel_db_uniq_count.tsv";
+    cfg.outfile = "sel_sketch.tsv";
+
+    // A copy with one substitution every k bases: every k-mer of the original then
+    // has exactly one base different from the copy's k-mer at the same place, so
+    // none of them is 2-safe once the copy is in the universe.
+    auto relative = [&](std::string d) {
+        for (size_t i = cfg.kmerLen / 2; i < d.size(); i += cfg.kmerLen) d[i] = (d[i] == 'A') ? 'C' : 'A';
+        return d;
+    };
+    // sel_A: a low-complexity stretch (2-safe), a stretch the relative makes fail
+    //        the margin, then ordinary sequence.
+    // sel_B: a low-complexity stretch and ordinary sequence, all of it one
+    //        substitution from the relative: nothing 2-safe, and the first
+    //        candidates are unusable as well as margin-failing.
+    // sel_C: the relative.
+    const std::string low = lowEntropy(200), near = dna(300), plain = dna(400);
+    const std::string wholeB = lowEntropy(200) + dna(300);
+    const std::vector<std::string> refs = {"sel_A.fa", "sel_B.fa", "sel_C.fa"};
+    { std::ofstream o(refs[0]); o << ">a\n" << low << near << plain << "\n"; }
+    { std::ofstream o(refs[1]); o << ">b\n" << wholeB << "\n"; }
+    { std::ofstream o(refs[2]); o << ">c\n" << relative(near) << dna(60) << relative(wholeB) << "\n"; }
+    cfg.numRef = refs.size();
+
+    for (int mode = 0; mode < 3; mode++) {                  // 0: no margin, 1: soft margin 2, 2: strict margin 2
+        cfg.minMargin = mode == 0 ? 1 : 2;
+        cfg.strictMargin = mode == 2;
+        BloomFilter dbFilter(cfg.m1(), cfg.nhash1, cfg.kmerLen);
+        identifyUniqKmers(cfg, refs, dbFilter);
+        buildSketch(cfg, cfg.refstat, dbFilter);
+        std::map<std::string, std::string> got;             // reference -> its one signature
+        for (const std::string& line : fileLines(cfg.outfile)) {
+            std::istringstream ls(line);
+            std::string seq, id, name;
+            ls >> seq >> id >> name;
+            assert(!got.count(name));
+            got[name] = seq;
+        }
+        size_t unusableSafe = 0, usableUnsafe = 0;
+        for (const std::string& ref : refs) {
+            CandidateSet cand;
+            assert(readCandidates(candidatePath(cfg.outdir, ref), cand));
+            std::string contig;
+            scanFasta(ref, [&](const std::string&, std::string& seq, size_t) { contig = seq; });
+            std::string firstSafe, firstUsable;
+            for (uint32_t pos : cand.runs.at(0).pos) {
+                const std::string kmer = get_canonical(contig.substr(pos, cfg.kmerLen));
+                const bool usable = !lowComplexity(cfg, kmer) && !hasLongHomopolymer(cfg, kmer);
+                const bool safeKmer = isTwoSafe(cfg, kmer, dbFilter);
+                unusableSafe += !usable && safeKmer;
+                usableUnsafe += usable && !safeKmer;
+                if (usable && firstUsable.empty()) firstUsable = kmer;
+                if (usable && safeKmer && firstSafe.empty()) firstSafe = kmer;
+            }
+            const std::string expect = mode == 0 ? firstUsable
+                                     : mode == 1 ? (firstSafe.empty() ? firstUsable : firstSafe)
+                                     : firstSafe;
+            const std::string name = getBaseId(ref);
+            assert((expect.empty() && !got.count(name)) || (got.count(name) && got[name] == expect));
+        }
+        // The fixture holds what it is meant to: candidates each filter alone rejects.
+        assert(unusableSafe > 0 && usableUnsafe > 0);
+        // sel_B has no 2-safe k-mer: nothing in strict mode, and in soft mode its
+        // first usable candidate, which is not its first candidate.
+        if (mode == 2) assert(!got.count("sel_B") && got.count("sel_A"));
+        if (mode == 1) assert(got.count("sel_B") && !lowComplexity(cfg, got["sel_B"]) &&
+                              got["sel_B"] != get_canonical(wholeB.substr(0, cfg.kmerLen)));
+    }
+    for (const std::string& ref : refs) {
+        std::remove(ref.c_str());
+        std::remove(candidatePath(cfg.outdir, ref).c_str());
+    }
+    std::remove(cfg.refstat.c_str());
+    std::remove(cfg.outfile.c_str());
+    std::cerr << "PASSED: Test selection picks the same candidate whatever the filter order\n";
 }
 
 int main() {
@@ -588,6 +714,7 @@ int main() {
     testGetBaseId();
     testSubstitutionHash();
     testIsTwoSafe();
+    testSelectionFilterOrder();
 
     std::cerr << "UniqSketch: All tests PASSED!\n\n";
     return 0;
