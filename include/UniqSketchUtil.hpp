@@ -120,6 +120,12 @@ inline void scanFasta(const std::string& fPath, Fn fn, unsigned padK = 0) {
             faSeq += line;
             good = getLine(line);
         }
+        // Soft-masked (lower-case) sequence is sequence. get_canonical folds the
+        // case only of a k-mer it reverse-complements, so a signature spanning a
+        // case boundary was written with lower-case letters, which no read k-mer
+        // equalled; upper-case here and every scanner sees one alphabet.
+        for (char& c : faSeq)
+            if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
         // A circular molecule rendered linearly loses the k-1 k-mers that span
         // its end-to-start join: they are in the genome but not in the file.
         // Appending the first k-1 bases restores exactly those k-mers and no

@@ -348,6 +348,10 @@ void testScanFastaLineEndings() {
     const std::vector<std::pair<std::string, std::string>> expect = {{"c1_first", "ACGTACGTTGCA"}, {"c2", "TTTTGG"}};
     assert(contigs("scan_lf.fa") == expect);
     assert(contigs("scan_crlf.fa") == expect);
+    // Soft-masked sequence comes back upper-case; the header keeps its case.
+    { std::ofstream o("scan_masked.fa", std::ios::binary); o << ">c1 first\nACGtac\ngttGCA\n>c2\nttttgg\n"; }
+    assert(contigs("scan_masked.fa") == expect);
+    std::remove("scan_masked.fa");
     std::remove("scan_lf.fa");
     std::remove("scan_crlf.fa");
     std::cerr << "PASSED: Test scanFasta line endings\n";

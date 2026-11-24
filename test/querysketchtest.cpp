@@ -18,6 +18,26 @@
 #include "QuerySketchUtil.hpp"
 #include "GroupSketchUtil.hpp"
 
+// kmerMatches: a read k-mer equals a signature in either orientation and in
+// either case. Lower-case reads used to match in one orientation only.
+void testKmerMatchesCase() {
+    std::cerr << "START: Test kmerMatches case... \t";
+    const std::string sig = "ACGGTTCA";                 // reverse complement: TGAACCGT
+    assert(kmerMatches("ACGGTTCA", sig));
+    assert(kmerMatches("TGAACCGT", sig));
+    assert(kmerMatches("acggttca", sig));              // forward, lower case: the one that failed
+    assert(kmerMatches("tgaaccgt", sig));
+    assert(kmerMatches("AcGgTtCa", sig));
+    assert(!kmerMatches("ACGGTTCC", sig));
+    assert(!kmerMatches("acggttcc", sig));
+    assert(!kmerMatches("ACGGNTCA", sig));
+    const std::string masked = "ACGGttca";              // as an older index stored a soft-masked k-mer
+    assert(kmerMatches("ACGGTTCA", masked));
+    assert(kmerMatches("TGAACCGT", masked));
+    assert(!kmerMatches("TGAACCGA", masked));
+    std::cerr << "PASSED: Test kmerMatches case\n";
+}
+
 void testQuerySampleBatch(QuerySketchConfig cfg, const std::vector<std::string>& sampleFiles) {
     std::cerr << "START: Test querySample... \t";
 
@@ -313,6 +333,7 @@ int main() {
 
     // testQuerySampleBatch takes cfg by value: loadSketch sets kmerLen from the
     // index, and that must not leak into the second test.
+    testKmerMatchesCase();
     testQuerySampleBatch(cfg, sampleFiles);
     testGenerateQueryResult(cfg);
     testAbundanceIsHitsPerSignature(cfg);

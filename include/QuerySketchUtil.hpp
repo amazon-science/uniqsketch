@@ -290,6 +290,17 @@ void loadSketch(QuerySketchConfig& cfg, const std::string& fPath, SketchHash& sk
 inline bool kmerMatches(const char* kp, const std::string& sig) {
     const size_t k = sig.size();
     if (std::memcmp(kp, sig.data(), k) == 0) return true;
+    // Case does not matter, here as in the hash that led here (ntHash's tables
+    // fold it); for a base, `& 0xDF` is its upper case. The forward test used to
+    // be exact while the reverse-complement test folded the read's case, so a
+    // lower-case read k-mer matched a signature in one orientation only: lower-
+    // case reads lost half of their hits, and with them the breadth a call needs
+    // (a main at 96 % of a sample was withheld). A signature stored with lower-
+    // case letters (a soft-masked reference, in an index built before scanFasta
+    // folded case) could not be hit at all.
+    size_t f = 0;
+    while (f < k && (kp[f] & 0xDF) == (sig[f] & 0xDF)) ++f;
+    if (f == k) return true;
     for (size_t i = 0; i < k; i++) {
         char c;
         switch (kp[k - 1 - i]) {
@@ -299,7 +310,7 @@ inline bool kmerMatches(const char* kp, const std::string& sig) {
             case 'T': case 't': c = 'A'; break;
             default: return false;
         }
-        if (c != sig[i]) return false;
+        if (c != (sig[i] & 0xDF)) return false;
     }
     return true;
 }
