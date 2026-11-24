@@ -79,3 +79,45 @@ jobs:
           "$BIN/uniqsketch"    --version
           "$BIN/querysketch"   --version
           "$BIN/comparesketch" --version
+
+  sanitizers:
+    # AddressSanitizer and UndefinedBehaviorSanitizer over the seven suites and the
+    # tree rule-stack test, which runs the real uniqsketch and querysketch through
+    # an index build and some 70 queries (test/tree_rules). The first such run found a
+    # use-after-free on every --tree build that renames a node, a test reading
+    # past its strings, and an integer conversion of NaN on an empty --solid
+    # sample; none of them changed a result, and none was visible to the matrix
+    # above. -fno-sanitize-recover makes an undefined-behaviour report fatal, so
+    # the exit status of `make test` is the verdict. -O1 keeps the instrumented
+    # suites to a few minutes.
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    env:
+      SAN_CXX: g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: print_stacktrace=1
+      # The suites and tools take the machine's thread count from OpenMP; four is
+      # what the runner has, stated so that a larger runner does not change the test.
+      OMP_NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends \
+                 build-essential zlib1g-dev; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in 60 s"
+            sleep 60
+          done
+          exit 1
+
+      - name: Build the tools with the sanitizers
+        # OPTFLAGS is overridden so that the Makefile's -O3 does not replace -O1.
+        run: make CXX="$SAN_CXX" OPTFLAGS="-fopenmp"
+
+      - name: Unit suites and tree rule-stack test under the sanitizers
+        run: make test CXX="$SAN_CXX" OPTFLAGS="-fopenmp"
