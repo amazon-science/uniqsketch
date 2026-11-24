@@ -119,6 +119,15 @@ inline void scanFasta(const std::string& fPath, Fn fn, unsigned padK = 0) {
         // nothing downstream needs to translate them. The true length is passed
         // separately so the padding cannot leak into a genome length.
         const size_t trueLen = faSeq.size();
+        // Positions are 32-bit wherever they are kept (candidate files, the sketch,
+        // the selection's windows). A longer sequence would wrap them, and a wrapped
+        // position names another k-mer, which selection would then write as a
+        // signature. Every scanner passes here, so this is the one place to stop.
+        if (trueLen > UINT32_MAX) {
+            std::cerr << "Error: " + fPath + ": a sequence of " + std::to_string(trueLen) +
+                         " bases; positions are 32-bit, the longest sequence is 4 294 967 295 bases\n";
+            exit(EXIT_FAILURE);
+        }
         if (padK != 0 && trueLen != 0) faSeq += faSeq.substr(0, std::min<size_t>(padK, trueLen));
         fn(header, faSeq, trueLen);
         if (line.size() > 1) {

@@ -723,6 +723,18 @@ inline std::vector<std::string> identifyGroupUniqKmersCarried(
     if (!cc) cap = 0;
     size_t members = 0;
     for (const auto& g : groups) members += g.size();
+    // The members containing a k-mer are counted in 16 bits (NodeKmers::inNode, a
+    // plain fetch_add in the member scan below). A node of more members would wrap
+    // the count, fail the half-of-the-members test and lose its carried pool
+    // without a word; the carriage counter beside it saturates at the same value.
+    if (cap > 0)
+        for (const auto& g : groups)
+            if (g.size() > UINT16_MAX) {
+                std::cerr << "Error: a tree node of " << g.size() << " genomes; carried node signatures count a "
+                             "node's members in 16 bits (65 535 at most). Use finer --tree thresholds or "
+                             "--node-carriers=0\n";
+                exit(EXIT_FAILURE);
+            }
     std::cout << "k-mer length: " << cfg.kmerLen << "\n"
               << "Groups: " << groups.size() << " over " << members << " genomes\n";
     using Clock = std::chrono::steady_clock;
