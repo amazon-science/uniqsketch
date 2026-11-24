@@ -1295,8 +1295,13 @@ SketchStat getUniqSet(const UniqSketchConfig& cfg, const std::string& fPath, uns
         // with sum(min(candShare, L)) <= quota, and the remainder as one more to
         // the first windows (in position order) still above L. The sum reaches
         // the quota whenever the candidate shares do, which they always do (they
-        // are rounded up), so a reference falls short of the quota only when its
-        // windows run out of usable candidates, never through rounding.
+        // are rounded up), so rounding never costs a reference its quota. The
+        // picks can still fall short of it with usable candidates left: a share
+        // is laid out below as equal runs of the window's candidates, and a run
+        // gives its first usable candidate or nothing. A run whose candidates
+        // all fail the margin loses its place; a run of usable ones gives one.
+        // On 5 493 E. coli one leaf reaches -c5000, and 3 468 leaves with 5 000
+        // candidates or more hold fewer signatures (median 1 638).
         std::vector<size_t> candShare(windows, 0);
         size_t maxShare = 1;
         for (size_t w : active) {
