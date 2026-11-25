@@ -60,20 +60,21 @@ inline void writeTreeIndex(const std::vector<TreeNode>& tree, const std::string&
  * @param bits  Bits per element in Bloom filter.
  * @param dbfSize  Approximate genome size for BF sizing.
  * @param treeFile  Output TSV path for the tree structure.
+ * @param sketchSize  Hashes in a reference's sketch (--minhash-size; see MINHASH_SKETCH_SIZE).
  * @return Vector of TreeNode describing the full hierarchy.
  */
 inline std::vector<TreeNode> buildHierarchicalTree(
         const std::vector<std::string>& refFiles,
         const std::vector<unsigned>& thresholds,
         unsigned kmerLen, unsigned nhash, unsigned bits, size_t dbfSize,
-        const std::string& treeFile) {
+        const std::string& treeFile,
+        unsigned sketchSize = MINHASH_SKETCH_SIZE) {
 
     size_t n = refFiles.size();
     (void) nhash; (void) bits; (void) dbfSize;  // sizing is internal to the MinHash sketch
 
     // MinHash sketch (bottom-s) + exact k-mer count per reference (near-linear;
     // replaces the previous all-pairs O(n^2 * genome) unique-k-mer computation).
-    const unsigned sketchSize = MINHASH_SKETCH_SIZE;
     std::vector<std::vector<uint64_t>> sketches(n);
     std::vector<size_t> kmerCount(n, 0);
     std::vector<std::string> names(n);
@@ -82,6 +83,17 @@ inline std::vector<TreeNode> buildHierarchicalTree(
     for (unsigned i = 0; i < n; i++) {
         sketches[i] = clusterMinhashSketch(refFiles[i], kmerLen, sketchSize, kmerCount[i]);
         names[i] = getBaseId(refFiles[i]);
+    }
+    // A reference with fewer distinct k-mers than the sketch is sketched whole and its
+    // estimates mean something else (see MINHASH_SKETCH_SIZE). Said for another size
+    // than the default only, so that the stderr of a default build is what it was.
+    if (sketchSize != MINHASH_SKETCH_SIZE) {
+        size_t whole = 0;
+        for (const std::vector<uint64_t>& sketch : sketches) whole += sketch.size() < sketchSize;
+        if (whole)
+            std::cerr << "Warning: " << whole << " of " << n << " references have fewer than " << sketchSize
+                      << " distinct k-mers and are sketched whole (--minhash-size); the distance "
+                         "estimates of their pairs mean something else (see README)\n";
     }
 
     // Candidate distinguishing-k-mer estimates: only pairs that share sketch hashes
@@ -352,6 +364,28 @@ inline std::string parseTreeThresholds(const std::string& arg, std::vector<unsig
 }
 
 /**
+ * Parse the value given to --minhash-size, the number of hashes in a reference's
+ * MinHash sketch (MINHASH_SKETCH_SIZE, ClusterUtil.hpp): a plain positive integer,
+ * stored in `out`. Returns an empty string, or what is wrong, and then leaves `out`
+ * as it was.
+ *
+ * The function is here, after parseTreeThresholds, and not beside the constant in
+ * ClusterUtil.hpp: placed there it changed the querysketch binary (g++ 7.3.1),
+ * which compiles both headers and calls neither parser; here it does not.
+ */
+inline std::string parseMinhashSize(const std::string& arg, unsigned& out) {
+    if (arg.empty()) return "no number given";
+    if (arg.find_first_not_of("0123456789") != std::string::npos)
+        return "`" + arg + "' is not a plain integer";
+    const size_t first = arg.find_first_not_of('0');       // leading zeros do not make a number large
+    if (first == std::string::npos) return "a sketch holds at least one hash";
+    if (arg.size() - first > 10 || std::stoull(arg) > UINT_MAX)
+        return "`" + arg + "' is too large (at most " + std::to_string(UINT_MAX) + ")";
+    out = static_cast<unsigned>(std::stoull(arg));
+    return std::string();
+}
+
+/**
  * Signature-selection parameters recorded next to a tree index
  * (<outdir>/build_params.tsv, one `key<TAB>value` per line).
  *
@@ -414,6 +448,19 @@ inline void writeTreeBuildParams(const std::string& path, const TreeBuildParams&
         << "group_signatures\t" << (p.groupSignatures ? 1 : 0) << "\n"
         << "tree\t" << p.thresholds << "\n"
         << "bloom_filter\t" << p.bloomFilter << "\n";
+}
+
+/**
+ * Record in build_params.tsv that the tree was clustered from MinHash sketches of
+ * `sketchSize` hashes: one line, `minhash_size<TAB>N`, after those
+ * writeTreeBuildParams wrote. The build calls this only for a size that is not the
+ * default (--minhash-size), so the file of a default build is the one it always
+ * was. The line has no reader: loadTreeBuildParams passes over a key it does not
+ * know, so it changes nothing for querysketch, this one or an earlier one.
+ */
+inline void recordMinhashSize(const std::string& buildParamsPath, unsigned sketchSize) {
+    std::ofstream out(buildParamsPath, std::ios::app);
+    out << "minhash_size\t" << sketchSize << "\n";
 }
 
 /**

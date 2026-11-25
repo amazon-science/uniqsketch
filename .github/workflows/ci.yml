@@ -99,7 +99,7 @@ jobs:
   sanitizers:
     # AddressSanitizer and UndefinedBehaviorSanitizer over the seven suites and the
     # tree rule-stack test, which runs the real uniqsketch and querysketch through
-    # two index builds and 71 queries (test/tree_rules). The first such run found a
+    # five index builds and 71 queries (test/tree_rules). The first such run found a
     # use-after-free on every --tree build that renames a node, a test reading
     # past its strings, and an integer conversion of NaN on an empty --solid
     # sample; none of them changed a result, and none was visible to the matrix

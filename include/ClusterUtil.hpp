@@ -177,7 +177,34 @@ inline std::vector<std::string> clusterReferencesExact(
     return representatives;
 }
 
-// Default MinHash sketch size (bottom-s). Larger = finer similarity resolution.
+/**
+ * Default size of the bottom-s MinHash sketch from which --cluster and --tree
+ * estimate the distance between two references: the s smallest distinct k-mer
+ * hashes of each. `uniqsketch --minhash-size=N` hands another size to the two
+ * functions that sketch, clusterReferencesMinHash and buildHierarchicalTree, which
+ * take this one when none is given; uniqsketch reads it as the option's default.
+ *
+ * The estimate of a pair moves in steps of one sketch hash, and one hash stands
+ * for the smaller genome's k-mers divided by s: on the 120 E. coli genomes of the
+ * validation index 2 507 k-mers at 2 000 (2 264 to 2 840 over the pairs) and 251
+ * at 20 000, where the finest threshold of that index's tree is 10 000. A larger
+ * sketch costs time in the tree step: on those genomes the sketch pass takes 35
+ * to 37 ms per genome at 2 000 and 56 to 62 at 20 000 on one thread, the pair
+ * counting 0.02 s and 0.21 to 0.24 s; a sketch is 8 bytes a hash.
+ *
+ * A reference with fewer distinct k-mers than s is sketched whole
+ * (clusterMinhashSketch returns every hash it has), and its estimates then mean
+ * something else. Between two full sketches the estimate follows the k-mers the
+ * larger genome has and the smaller lacks; with both sketched whole it is the
+ * k-mers the smaller has and the larger lacks, and a value in between with one of
+ * them whole. A 3 000-base genome that is part of a 5 000-base one (k = 21,
+ * testMinhashSketchSize) is estimated at about 1 200 k-mers from it at 2 000, at
+ * 600 at 4 000 and at 0 at 10 000, where the two merge under any threshold. So
+ * the size should stay below the distinct k-mers of the smallest reference; at
+ * 2 000 that concerns references of less than 2 kb. The two functions say how
+ * many references a size other than this one sketches whole, and nothing at
+ * this one.
+ */
 static constexpr unsigned MINHASH_SKETCH_SIZE = 2000;
 
 /**
@@ -188,7 +215,8 @@ static constexpr unsigned MINHASH_SKETCH_SIZE = 2000;
  * @param kmerLen  K-mer length.
  * @param s  Sketch size (number of smallest distinct hashes to keep).
  * @param kmerCount  Output: total number of k-mer positions in the reference.
- * @return Sorted vector of the s smallest distinct k-mer hashes.
+ * @return Sorted vector of the s smallest distinct k-mer hashes (every distinct
+ *         hash of a reference that has fewer than s).
  */
 inline std::vector<uint64_t> clusterMinhashSketch(const std::string& fPath,
                                                   unsigned kmerLen, unsigned s,
@@ -415,17 +443,19 @@ inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
  * @param threshold  Distinguishing-k-mer threshold below which references merge.
  * @param kmerLen  K-mer length.
  * @param clusterFile  Output TSV path mapping each reference to its representative.
+ * @param sketchSize  Hashes in a reference's sketch (--minhash-size; see MINHASH_SKETCH_SIZE).
  * @return Vector of representative file paths (one per cluster).
  */
 inline std::vector<std::string> clusterReferencesMinHash(
         const std::vector<std::string>& refFiles,
         unsigned threshold,
         unsigned kmerLen,
-        const std::string& clusterFile) {
+        const std::string& clusterFile,
+        unsigned sketchSize = MINHASH_SKETCH_SIZE) {
     size_t n = refFiles.size();
     if (n <= 1) return refFiles;
 
-    const unsigned s = MINHASH_SKETCH_SIZE;
+    const unsigned s = sketchSize;
     std::cerr << "Clustering " << n << " references (MinHash, threshold=" << threshold
               << " unique k-mers, k=" << kmerLen << ", sketch=" << s << ")...\n";
 
@@ -437,6 +467,17 @@ inline std::vector<std::string> clusterReferencesMinHash(
     for (unsigned i = 0; i < n; i++) {
         sketches[i] = clusterMinhashSketch(refFiles[i], kmerLen, s, kmerCount[i]);
         names[i] = getBaseId(refFiles[i]);
+    }
+    // A reference with fewer distinct k-mers than the sketch is sketched whole and its
+    // estimates mean something else (see MINHASH_SKETCH_SIZE). Said for another size
+    // than the default only, so that the stderr of a default build is what it was.
+    if (s != MINHASH_SKETCH_SIZE) {
+        size_t whole = 0;
+        for (const std::vector<uint64_t>& sketch : sketches) whole += sketch.size() < s;
+        if (whole)
+            std::cerr << "Warning: " << whole << " of " << n << " references have fewer than " << s
+                      << " distinct k-mers and are sketched whole (--minhash-size); the distance "
+                         "estimates of their pairs mean something else (see README)\n";
     }
 
     // Shared-hash counts per candidate pair (countSharedSketchHashes). Above 20 000
@@ -504,10 +545,11 @@ inline std::vector<std::string> clusterReferences(
         unsigned bits,
         size_t dbfSize,
         const std::string& clusterFile,
-        bool useExact = false) {
+        bool useExact = false,
+        unsigned sketchSize = MINHASH_SKETCH_SIZE) {
     if (useExact)
         return clusterReferencesExact(refFiles, threshold, kmerLen, nhash, bits, dbfSize, clusterFile);
-    return clusterReferencesMinHash(refFiles, threshold, kmerLen, clusterFile);
+    return clusterReferencesMinHash(refFiles, threshold, kmerLen, clusterFile, sketchSize);
 }
 
 #endif // CLUSTERUTIL_HPP_

@@ -3,6 +3,7 @@
 // an assert were not made at all, and the suite still printed PASSED and exited 0.
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <iterator>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1307,6 +1309,216 @@ void testRecordTreeFile() {
     std::cerr << "PASSED: Test recordTreeFile\n";
 }
 
+// parseMinhashSize: what --minhash-size accepts, a plain positive integer up to the
+// range of the unsigned size. Read as the other numeric options are, by a stream
+// extraction into the unsigned, -1 and 4294967296 would both be taken as
+// 4294967295, +5 as 5 and 0 as it stands.
+void testParseMinhashSize() {
+    std::cerr << "START: Test parseMinhashSize... \t";
+    unsigned s = 7;
+    assert(parseMinhashSize("2000", s).empty() && s == 2000);
+    assert(parseMinhashSize("20000", s).empty() && s == 20000);
+    assert(parseMinhashSize("1", s).empty() && s == 1);
+    assert(parseMinhashSize("4294967295", s).empty() && s == 4294967295u);
+    assert(parseMinhashSize("000000020000", s).empty() && s == 20000);          // leading zeros: twelve characters, not a large number
+    // What is refused, and that the answer says why.
+    const std::vector<std::pair<const char*, const char*>> refused = {
+        {"", "no number"}, {"0", "at least one hash"}, {"000", "at least one hash"},
+        {"-1", "not a plain integer"}, {"+5", "not a plain integer"}, {"2e4", "not a plain integer"},
+        {"20k", "not a plain integer"}, {"20 000", "not a plain integer"}, {"20,000", "not a plain integer"},
+        {"2000,", "not a plain integer"}, {"1.5", "not a plain integer"}, {"0x10", "not a plain integer"},
+        {"abc", "not a plain integer"}, {"-c500", "not a plain integer"},
+        {"4294967296", "too large"}, {"99999999999", "too large"}, {"18446744073709553616", "too large"}};
+    for (const auto& [value, why] : refused) {
+        s = 7;
+        assert(parseMinhashSize(value, s).find(why) != std::string::npos);
+        assert(s == 7);                                                         // a refused value leaves the size as it was
+    }
+    std::cerr << "PASSED: Test parseMinhashSize\n";
+}
+
+// The sketch size of --minhash-size reaches the sketch pass of both functions that
+// have one, buildHierarchicalTree and clusterReferencesMinHash (and clusterReferences,
+// through which --cluster calls it), and without it nothing changes.
+//
+// A is a 3 000-base genome, B is A followed by 2 000 other bases, C is unrelated, D
+// is A with two substitutions. For a size s the estimate of the pair (A, B) is
+// recomputed here from clusterMinhashSketch at that size, and both functions are
+// called with the two thresholds on either side of it: they merge the pair under
+// the upper one and not under the lower. The four sizes give estimates with
+// different integer parts, so a function that sketched with another size than the
+// one it was given would fail one of the two.
+//
+// The sizes also hold what the option's text says of a genome with fewer distinct
+// k-mers than the sketch. A has 2 980 and B 4 980. At 500 and at 2 000 both
+// sketches are full and the estimate is about 1 200: the k-mers B has and A lacks,
+// 2 000, scaled by the sizes (2 980 / 4 980). At 4 000 A is sketched whole and the
+// estimate is half of that. At 10 000 both are, and the estimate is the k-mers A
+// has and B lacks: none.
+//
+// Both functions say on stderr how many references a size sketches whole, and
+// say nothing at the default size, whatever the references are: the stderr of a
+// default build is what it was.
+void testMinhashSketchSize() {
+    std::cerr << "START: Test MinHash sketch size... \t";
+    assert(MINHASH_SKETCH_SIZE == 2000);                   // the size the validated indexes were built with
+    const unsigned k = 21;
+    const std::string a = randDNA(3000, 601);
+    std::string d = a;
+    for (size_t p : {700, 2100}) d[p] = (d[p] == 'A') ? 'C' : 'A';
+    writeFasta("ms_A.fa", a);
+    writeFasta("ms_B.fa", a + randDNA(2000, 602));
+    writeFasta("ms_C.fa", randDNA(2600, 603));
+    writeFasta("ms_D.fa", d);
+    const std::vector<std::string> abc = {"ms_A.fa", "ms_B.fa", "ms_C.fa"};
+    auto contents = [](const std::string& f) { std::ifstream in(f); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+
+    // The estimate of (A, B) at sketch size s, by the formula of the two functions.
+    auto estimate = [&](unsigned s, size_t& sizeA, size_t& sizeB) {
+        size_t countA = 0, countB = 0;
+        const std::vector<std::vector<uint64_t>> sk = {clusterMinhashSketch("ms_A.fa", k, s, countA),
+                                                       clusterMinhashSketch("ms_B.fa", k, s, countB)};
+        assert(countA == 2980 && countB == 4980);
+        sizeA = sk[0].size(); sizeB = sk[1].size();
+        const std::unordered_map<uint64_t, uint32_t> shared = countSharedSketchHashes(sk, 20000);
+        assert(shared.size() == 1);
+        const double jaccard = static_cast<double>(shared.begin()->second) / static_cast<double>(std::min(sizeA, sizeB));
+        return static_cast<double>(std::min(countA, countB)) * (1.0 - jaccard);
+    };
+    // Is the pair (A, B) one node of the tree, one cluster of the clustering, under `threshold`?
+    auto treeMerges = [&](unsigned threshold, unsigned s, bool sizeGiven) {
+        const std::vector<TreeNode> tree = sizeGiven
+            ? buildHierarchicalTree(abc, {threshold}, k, 1, 16, 100000, "ms_tree.tsv", s)
+            : buildHierarchicalTree(abc, {threshold}, k, 1, 16, 100000, "ms_tree.tsv");
+        assert(tree.size() == 3 || tree.size() == 4);
+        if (tree.size() == 4) assert(!tree[3].isLeaf && tree[3].children.size() == 2 && tree[0].parentId == 3 && tree[1].parentId == 3);
+        return tree.size() == 4;
+    };
+    auto clusterMerges = [&](unsigned threshold, unsigned s, bool sizeGiven, bool dispatcher) {
+        const std::vector<std::string> reps = dispatcher
+            ? (sizeGiven ? clusterReferences(abc, threshold, k, 1, 16, 100000, "ms_clusters.tsv", false, s)
+                         : clusterReferences(abc, threshold, k, 1, 16, 100000, "ms_clusters.tsv"))
+            : (sizeGiven ? clusterReferencesMinHash(abc, threshold, k, "ms_clusters.tsv", s)
+                         : clusterReferencesMinHash(abc, threshold, k, "ms_clusters.tsv"));
+        assert(reps.size() == 2 || reps.size() == 3);
+        return reps.size() == 2;
+    };
+
+    std::vector<double> integerPart;
+    for (unsigned s : {500u, 2000u, 4000u, 10000u}) {
+        size_t sizeA = 0, sizeB = 0;
+        const double est = estimate(s, sizeA, sizeB);
+        assert(sizeA == std::min<size_t>(s, 2980) && sizeB == std::min<size_t>(s, 4980));   // sketched whole below s
+        const unsigned lower = static_cast<unsigned>(std::floor(est)), upper = lower + 1;   // lower <= est < upper
+        assert(treeMerges(upper, s, true) && !treeMerges(lower, s, true));
+        assert(clusterMerges(upper, s, true, false) && !clusterMerges(lower, s, true, false));
+        assert(clusterMerges(upper, s, true, true) && !clusterMerges(lower, s, true, true));
+        if (s == MINHASH_SKETCH_SIZE) {                    // without a size: the default's estimate
+            assert(treeMerges(upper, s, false) && !treeMerges(lower, s, false));
+            assert(clusterMerges(upper, s, false, false) && !clusterMerges(lower, s, false, false));
+            assert(clusterMerges(upper, s, false, true) && !clusterMerges(lower, s, false, true));
+        }
+        if (s <= 2000) assert(est > 1100 && est < 1300);
+        if (s == 4000) assert(est > 550 && est < 650);
+        if (s == 10000) assert(est == 0.0);
+        integerPart.push_back(std::floor(est));
+    }
+    for (size_t i = 0; i < integerPart.size(); i++)
+        for (size_t j = i + 1; j < integerPart.size(); j++) assert(integerPart[i] != integerPart[j]);
+
+    // The default is untouched: the four genomes at three thresholds give the same
+    // tree file and the same clusters.tsv without a size and with 2 000 spelled out
+    // (D joins A at the finest level, B joins them at the next), and another tree
+    // with every genome sketched whole (A, B and D in one node at the finest level).
+    const std::vector<std::string> abcd = {"ms_A.fa", "ms_B.fa", "ms_C.fa", "ms_D.fa"};
+    const std::vector<unsigned> thresholds = {4000, 1500, 100};
+    auto nodes = [](const std::vector<TreeNode>& tree) {
+        std::string levels;
+        for (const TreeNode& n : tree) if (!n.isLeaf) levels += std::to_string(n.level) + ":" + std::to_string(n.children.size()) + " ";
+        return levels;
+    };
+    assert(nodes(buildHierarchicalTree(abcd, thresholds, k, 1, 16, 100000, "ms_tree_default.tsv")) == "2:2 1:2 ");
+    assert(nodes(buildHierarchicalTree(abcd, thresholds, k, 1, 16, 100000, "ms_tree_2000.tsv", 2000)) == "2:2 1:2 ");
+    assert(nodes(buildHierarchicalTree(abcd, thresholds, k, 1, 16, 100000, "ms_tree_10000.tsv", 10000)) == "2:3 ");
+    assert(contents("ms_tree_default.tsv") == contents("ms_tree_2000.tsv"));
+    assert(contents("ms_tree_default.tsv") != contents("ms_tree_10000.tsv"));
+    assert(clusterReferencesMinHash(abcd, 1500, k, "ms_clusters_default.tsv") ==
+           clusterReferencesMinHash(abcd, 1500, k, "ms_clusters_2000.tsv", 2000));
+    assert(clusterReferences(abcd, 1500, k, 1, 16, 100000, "ms_clusters_dispatch.tsv").size() == 2);
+    assert(contents("ms_clusters_default.tsv") == contents("ms_clusters_2000.tsv"));
+    assert(contents("ms_clusters_default.tsv") == contents("ms_clusters_dispatch.tsv"));
+    assert(contents("ms_clusters_default.tsv").find("ms_D") != std::string::npos);
+
+    // The notice. What the two functions print is taken from std::cerr and given
+    // back to it, so the log of the suite keeps their lines. C has fewer distinct
+    // k-mers than A, and A, with exactly 2 980, is not sketched whole at 2 980. E
+    // and F have 980 each, fewer than the default size, which says nothing of them.
+    writeFasta("ms_E.fa", randDNA(1000, 604));
+    writeFasta("ms_F.fa", randDNA(1000, 605));
+    const std::vector<std::string> ef = {"ms_E.fa", "ms_F.fa"};
+    auto printed = [&](const std::vector<std::string>& files, unsigned s, bool sizeGiven, bool tree) {
+        std::ostringstream captured;
+        std::streambuf* const was = std::cerr.rdbuf(captured.rdbuf());
+        if (tree && sizeGiven) buildHierarchicalTree(files, {100}, k, 1, 16, 100000, "ms_tree.tsv", s);
+        else if (tree) buildHierarchicalTree(files, {100}, k, 1, 16, 100000, "ms_tree.tsv");
+        else if (sizeGiven) clusterReferencesMinHash(files, 100, k, "ms_clusters.tsv", s);
+        else clusterReferencesMinHash(files, 100, k, "ms_clusters.tsv");
+        std::cerr.rdbuf(was);
+        std::cerr << captured.str();
+        return captured.str();
+    };
+    auto times = [](const std::string& text, const std::string& what) {
+        size_t found = 0;
+        for (size_t p = text.find(what); p != std::string::npos; p = text.find(what, p + 1)) ++found;
+        return found;
+    };
+    auto notice = [](unsigned whole, unsigned of, unsigned s) {
+        return "Warning: " + std::to_string(whole) + " of " + std::to_string(of) + " references have fewer than " +
+               std::to_string(s) + " distinct k-mers and are sketched whole (--minhash-size)";
+    };
+    size_t positionsC = 0;
+    assert(clusterMinhashSketch("ms_C.fa", k, 100000, positionsC).size() < 2980);
+    for (bool tree : {true, false}) {
+        assert(times(printed(abc, 500, true, tree), "sketched whole") == 0);        // every sketch is full
+        assert(times(printed(abc, 2980, true, tree), notice(1, 3, 2980)) == 1);     // C
+        assert(times(printed(abc, 2981, true, tree), notice(2, 3, 2981)) == 1);     // C and A
+        const std::string all = printed(abc, 10000, true, tree);
+        assert(times(all, notice(3, 3, 10000)) == 1 && times(all, "sketched whole") == 1);   // said once
+        assert(times(printed(ef, 2000, false, tree), "sketched whole") == 0);       // the default size, not given
+        assert(times(printed(ef, 2000, true, tree), "sketched whole") == 0);        // and spelled out
+        assert(times(printed(ef, 2001, true, tree), notice(2, 2, 2001)) == 1);
+        assert(times(printed(ef, 900, true, tree), "sketched whole") == 0);         // 980 each: full at 900
+        assert(times(printed(ef, 1500, true, tree), notice(2, 2, 1500)) == 1);      // a size below the default
+    }
+
+    for (const char* f : {"ms_A.fa", "ms_B.fa", "ms_C.fa", "ms_D.fa", "ms_E.fa", "ms_F.fa", "ms_tree.tsv", "ms_clusters.tsv",
+                          "ms_tree_default.tsv", "ms_tree_2000.tsv", "ms_tree_10000.tsv", "ms_clusters_default.tsv",
+                          "ms_clusters_2000.tsv", "ms_clusters_dispatch.tsv"}) std::remove(f);
+    std::cerr << "PASSED: Test MinHash sketch size\n";
+}
+
+// recordMinhashSize adds its line to a build_params.tsv and takes nothing from it:
+// the file is the one writeTreeBuildParams wrote plus that line, and it loads to
+// the same record.
+void testRecordMinhashSize() {
+    std::cerr << "START: Test recordMinhashSize... \t";
+    const std::string path = treeBuildParamsPath(".");
+    TreeBuildParams p;
+    p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true; p.groupSignatures = true;
+    p.thresholds = "10000,1000,100"; p.bloomFilter = bloomFilterName(); p.nodeCarriers = 12; p.centralRepresentative = true;
+    auto contents = [](const std::string& f) { std::ifstream in(f); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+    writeTreeBuildParams(path, p);
+    const std::string plain = contents(path);
+    assert(plain.find("minhash") == std::string::npos);    // the file of a default build names no sketch size
+    recordMinhashSize(path, 20000);
+    assert(contents(path) == plain + "minhash_size\t20000\n");
+    const TreeBuildParams q = loadTreeBuildParams(path);
+    assert(q.loaded && q.kmerLen == 81 && q.sketchnum == 500 && q.minMargin == 2 && q.strictMargin && q.groupSignatures);
+    assert(q.thresholds == "10000,1000,100" && q.bloomFilter == bloomFilterName() && q.nodeCarriers == 12 && q.centralRepresentative);
+    std::remove(path.c_str());
+    std::cerr << "PASSED: Test recordMinhashSize\n";
+}
+
 int main() {
     testLoadTree();
     testTreeDefect();
@@ -1328,6 +1540,9 @@ int main() {
     testLoadTreeFile();
     testTreeFileRepresentatives();
     testRecordTreeFile();
+    testParseMinhashSize();
+    testMinhashSketchSize();
+    testRecordMinhashSize();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;
 }

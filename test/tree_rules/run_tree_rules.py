@@ -16,8 +16,12 @@ also runs the index variants an older uniqsketch would have written, so the
 fallbacks stay exercised, builds the index a second time from its own
 tree_index.tsv (uniqsketch --tree-file), which has to give the same index and the
 same tables, and gives that tree once more with a threshold too few, which has to
-be refused with nothing written. Nothing is committed but the generators and the
-expectations; the whole run takes a few seconds.
+be refused with nothing written. Three more builds hold --minhash-size, which
+main() hands to the tree's clustering and to --cluster and which no unit test can
+follow there: the index with the default size spelled out, and a tree and a
+--cluster build with one hash a sketch; the rebuild from the tree file is given a
+size as well, which must do nothing there. Nothing is committed but the
+generators and the expectations; the whole run takes a few seconds.
 
 Three stages, so that a failure says what moved:
   INDEX  the index holds the structures the samples rely on (read from the index
@@ -72,6 +76,10 @@ QUERY_FILES = ["tree_index.tsv", "leaves.tsv", "build_params.tsv", "sketch_level
 LOCUS_GAP = 500            # QuerySketchConfig::locusGap
 TREE_FILE = "tree_file"    # the index rebuilt from its own tree (rebuild_from_tree), under variants/
 TREE_FILE_ARG = "idx/outdir/tree_index.tsv"
+SIZE_DEFAULT = "minhash_2000"   # the index with --minhash-size=2000 (rebuild_with_sizes), under variants/
+SIZE_ONE = "minhash_1"          # the index with one hash in a reference's sketch
+CLUSTER_ONE = "cluster_minhash_1"   # a flat --cluster build with one hash a sketch
+SIZE_REFUSED = "minhash_0"      # a build that has to be refused
 
 checks = []                # (stage, case, description, ok, detail)
 
@@ -163,24 +171,21 @@ def rebuild_from_tree(bindir, work, threads):
 
     That file names each node after the member the level builds chose, not the genome
     the merges named; the rebuild has to come out as the same index all the same.
+    --minhash-size is given with it: a tree that is read sketches no reference, so the
+    option has to change nothing, leave no line and be said to have no effect.
     """
     out = os.path.join("variants", TREE_FILE)
     os.makedirs(os.path.join(work, out))
-    return run([os.path.join(bindir, "uniqsketch")] + BUILD + ["--tree-file=" + TREE_FILE_ARG, "-t", str(threads),
-                "-o", out + "/sketch_uniq.tsv", "-f", out + "/outdir", "-r", out + "/db.tsv", "@list.txt"],
-               work, os.path.join(work, out, "build.log"))
+    return run([os.path.join(bindir, "uniqsketch")] + BUILD + ["--tree-file=" + TREE_FILE_ARG, "--minhash-size=5",
+                "-t", str(threads), "-o", out + "/sketch_uniq.tsv", "-f", out + "/outdir", "-r", out + "/db.tsv",
+                "@list.txt"], work, os.path.join(work, out, "build.log"))
 
 
-def tree_file_check(work, rc):
-    """INDEX: the rebuild from the index's own tree is that index, file for file."""
-    what = "rebuilt from its own tree_index.tsv (--tree-file), the index is the same file for file, " \
-           "build_params.tsv with the tree_file line added"
-    a, b = os.path.join(work, "idx"), os.path.join(work, "variants", TREE_FILE)
-    if rc != 0 or not os.path.exists(os.path.join(b, "sketch_uniq.tsv")):
-        check("INDEX", "-", what, False, "uniqsketch --tree-file: exit %d, or no index (--reuse of a run without one); "
-              "see %s" % (rc, os.path.join(b, "build.log")))
-        return
+def index_differences(a, b, params_line=""):
+    """The files in which build b differs from build a, or that one of them lacks, and the number compared.
 
+    b's build_params.tsv is expected to be a's with `params_line` added.
+    """
     def files(top):
         found = set()
         for d, _, names in os.walk(os.path.join(top, "outdir")):
@@ -198,11 +203,26 @@ def tree_file_check(work, rc):
     for name in sorted(files(a) & files(b)):
         want = content(a, name)
         if name == os.path.join("outdir", "build_params.tsv"):
-            want += ("tree_file\t%s\n" % TREE_FILE_ARG).encode()
+            want += params_line.encode()
         if content(b, name) != want:
             differ.append(name)
-    check("INDEX", "-", what, not differ, "%d of %d files differ or are in one index only: %s" %
-          (len(differ), len(files(a) | files(b)), ", ".join(differ[:8])))
+    return differ, len(files(a) | files(b))
+
+
+def tree_file_check(work, rc):
+    """INDEX: the rebuild from the index's own tree is that index, file for file; --minhash-size does nothing there."""
+    what = "rebuilt from its own tree_index.tsv (--tree-file), the index is the same file for file, " \
+           "build_params.tsv with the tree_file line added; --minhash-size=5 beside it changes nothing and is said to"
+    a, b = os.path.join(work, "idx"), os.path.join(work, "variants", TREE_FILE)
+    if rc != 0 or not os.path.exists(os.path.join(b, "sketch_uniq.tsv")):
+        check("INDEX", "-", what, False, "uniqsketch --tree-file: exit %d, or no index (--reuse of a run without one); "
+              "see %s" % (rc, os.path.join(b, "build.log")))
+        return
+    differ, total = index_differences(a, b, "tree_file\t%s\n" % TREE_FILE_ARG)
+    with open(os.path.join(b, "build.log")) as fh:
+        warned = "--minhash-size has no effect with --tree-file" in fh.read()
+    check("INDEX", "-", what, not differ and warned, "%d of %d files differ or are in one index only: %s; the warning %s" %
+          (len(differ), total, ", ".join(differ[:8]), "given" if warned else "not given"))
 
 
 def tree_file_refusal(bindir, work):
@@ -229,6 +249,84 @@ def tree_file_refusal(bindir, work):
     check("INDEX", "-", what, rc == 1 and reason in said and named and not left,
           "exit %d; the reason %s; the option and the file %s; %d file(s) or directories written" %
           (rc, "given" if reason in said else "not given", "named" if named else "not named", len(left)))
+
+
+def rebuild_with_sizes(bindir, work, threads):
+    """Four runs of uniqsketch with --minhash-size; their exit statuses, by directory under variants/.
+
+    The size is parsed and handed on in main(): to buildHierarchicalTree, to
+    clusterReferences, and to build_params.tsv when it is not the default.
+    """
+    def build(name, options):
+        out = os.path.join("variants", name)
+        os.makedirs(os.path.join(work, out))
+        return run([os.path.join(bindir, "uniqsketch")] + options + ["-t", str(threads), "-o", out + "/sketch_uniq.tsv",
+                    "-f", out + "/outdir", "-r", out + "/db.tsv", "@list.txt"], work, os.path.join(work, out, "build.log"))
+
+    flat = [o for o in BUILD if not o.startswith(("--tree", "--node-carriers"))]
+    return {SIZE_DEFAULT: build(SIZE_DEFAULT, BUILD + ["--minhash-size=2000"]),
+            SIZE_ONE: build(SIZE_ONE, BUILD + ["--minhash-size=1"]),
+            CLUSTER_ONE: build(CLUSTER_ONE, flat + ["--cluster=300", "--minhash-size=1"]),
+            SIZE_REFUSED: build(SIZE_REFUSED, BUILD + ["--minhash-size=0"])}
+
+
+def minhash_size_checks(work, rcs):
+    """INDEX: --minhash-size reaches the tree and the clusters; 2000 spelled out is the default; 0 is refused."""
+    idx, vdir = os.path.join(work, "idx"), os.path.join(work, "variants")
+
+    def built(name, what):
+        ok = rcs.get(name, 0) == 0 and os.path.exists(os.path.join(vdir, name, "sketch_uniq.tsv"))
+        if not ok:
+            check("INDEX", "-", what, False, "uniqsketch: exit %d, or no index (--reuse of a run without one); see %s" %
+                  (rcs.get(name, 0), os.path.join(vdir, name, "build.log")))
+        return ok
+
+    what = "built with --minhash-size=2000, the index is the same file for file, build_params.tsv included, " \
+           "and stderr names no size"
+    if built(SIZE_DEFAULT, what):
+        differ, total = index_differences(idx, os.path.join(vdir, SIZE_DEFAULT))
+        with open(os.path.join(vdir, SIZE_DEFAULT, "build.log")) as fh:
+            quiet = "MinHash sketch size" not in fh.read()
+        check("INDEX", "-", what, not differ and quiet, "%d of %d files differ or are in one index only: %s; stderr %s" %
+              (len(differ), total, ", ".join(differ[:8]), "names no size" if quiet else "names a size"))
+
+    # With one hash a sketch two references are at distance 0 when they share their
+    # smallest k-mer hash and are not compared otherwise: the nodes are those groups,
+    # all at the finest level, and --cluster gives the same groups at any threshold.
+    groups = None
+    what = "built with --minhash-size=1, the tree's nodes are groups at the finest level only (not the default tree's), " \
+           "build_params.tsv has the minhash_size line and stderr names the size"
+    if built(SIZE_ONE, what):
+        one = os.path.join(vdir, SIZE_ONE)
+        rows = tsv(os.path.join(one, "outdir", "tree_index.tsv"), 1)
+        name_of = {r[0]: r[1] for r in rows}
+        nodes = [r for r in rows if r[4] == "no"]
+        finest = str(len(BUILD[0].split(",")) - 1)
+        groups = set(frozenset(name_of[c] for c in r[5].split(",")) for r in nodes)
+        with open(os.path.join(idx, "outdir", "build_params.tsv")) as fh:
+            want = fh.read() + "minhash_size\t1\n"
+        with open(os.path.join(one, "outdir", "build_params.tsv")) as fh:
+            params = fh.read()
+        with open(os.path.join(one, "build.log")) as fh:
+            said = "MinHash sketch size 1 " in fh.read()
+        default_nodes = sum(1 for r in tsv(os.path.join(idx, "outdir", "tree_index.tsv"), 1) if r[4] == "no" and r[2] == finest)
+        check("INDEX", "-", what, len(nodes) > default_nodes and all(r[2] == finest for r in nodes) and params == want and said,
+              "%d nodes at levels %s (the default tree has %d at level %s); build_params.tsv %s; stderr %s" %
+              (len(nodes), ",".join(sorted(set(r[2] for r in nodes))) or "-", default_nodes, finest,
+               "as expected" if params == want else "not the default's plus the line", "names the size" if said else "is silent"))
+    what = "--cluster with --minhash-size=1 gives the clusters that are the nodes of the tree built with that size"
+    if built(CLUSTER_ONE, what) and groups is not None:
+        members = {}
+        for r in tsv(os.path.join(vdir, CLUSTER_ONE, "outdir", "clusters.tsv"), 1):
+            members.setdefault(r[0], set()).add(r[2])
+        clusters = set(frozenset(m) for m in members.values() if len(m) > 1)
+        check("INDEX", "-", what, clusters == groups and len(groups) > 0,
+              "%d clusters of two or more references, %d nodes, %d in both" % (len(clusters), len(groups), len(clusters & groups)))
+    out = os.path.join(vdir, SIZE_REFUSED)
+    if os.path.exists(out):
+        left = sorted(set(os.listdir(out)) - set(["build.log"]))
+        check("INDEX", "-", "--minhash-size=0 is refused: exit status 1, nothing written", rcs.get(SIZE_REFUSED, 1) == 1 and not left,
+              "exit %d; written: %s" % (rcs.get(SIZE_REFUSED, 1), ", ".join(left) or "nothing"))
 
 
 def index_digest(work, path):
@@ -513,6 +611,7 @@ def main():
 
     reuse = args.reuse and os.path.exists(os.path.join(work, "reads", "EMPTY.fq"))
     rebuilt = 0                 # exit status of the rebuild from the index's own tree
+    sized = {}                  # exit statuses of the builds with --minhash-size
     if reuse:
         B, G = gen_fixture.build()
         G = dict(G, NEG=B["NEG"])
@@ -522,8 +621,10 @@ def main():
         G = build_index(bindir, work, args.build_threads)
         make_variants(work)
         rebuilt = rebuild_from_tree(bindir, work, args.build_threads)
+        sized = rebuild_with_sizes(bindir, work, args.build_threads)
     tree_file_check(work, rebuilt)
     tree_file_refusal(bindir, work)
+    minhash_size_checks(work, sized)
     if args.index_digest:
         index_digest(work, os.path.abspath(args.index_digest))
     ix = index_checks(work)

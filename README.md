@@ -301,6 +301,10 @@ A list of files containing file names in each row can be passed with @ prefix.
                         clustering the references (with --tree, whose thresholds then only name the levels);
                         a node's name and path in FILE are not read, a node with one child is refused (see below)
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
+      --minhash-size=N  hashes in each reference's MinHash sketch, from which --tree and --cluster (without
+                        --exact) estimate distances [2000]. A hash stands for 1/N of a genome's k-mers (2 500
+                        of 5 Mb at 2000, 250 at 20000). Another N can give another tree, hence another
+                        index (see below); keep N below the distinct k-mers of the smallest reference
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
       --strict-margin   enforce --min-margin as a hard requirement (no margin-1 fallback) [on with --tree unless --min-margin=1]
@@ -543,6 +547,46 @@ index layouts.
 
 By default `--cluster` uses a near-linear MinHash method; `--exact` selects the
 exact O(n^2) method for small reference sets.
+
+**The MinHash sketch size.** `--tree` and `--cluster` (without `--exact`) estimate the
+number of k-mers that separate two references from a MinHash sketch of each, its 2 000
+smallest distinct k-mer hashes; `--minhash-size=N` takes N hashes instead. The
+estimate is formed the same way whatever N is. It moves in steps of one sketch hash,
+which stands for the smaller genome's k-mers divided by N: on the 120 *E. coli*
+genomes 2 507 k-mers at 2 000 (2 264 to 2 840 over the pairs) and 251 at 20 000, where
+the finest threshold of the *E. coli* validation trees is 10 000. A larger sketch
+decides the fine levels on more hashes, and the tree depends less on which k-mers the
+hash function puts into the sketches: measured on the 5 493 *E. coli* of the
+validation set, outside the repository, two trees of the same genomes built with
+different hash functions had about 75 % of their nodes in common at 2 000 and about
+90 % at 20 000. No gain was found there in what the nodes hold or in which references
+can be reported, and nothing was measured there on detection: that takes a sweep on an
+index built with another size. The cost is in the tree step: on
+the 120 genomes the sketch pass takes 35 to 37 ms per genome at 2 000 and 56 to 62 at
+20 000 on one thread, the pair counting 0.02 s and 0.21 to 0.24 s, and the whole step
+0.64 to 0.66 s and 1.22 to 1.26 s at 8 threads, of a build of 67 to 69 s; a sketch is
+8 bytes a hash, 16 and 160 kB per reference. On the 5 493 genomes the pair counting
+took 7.5 to 7.8 s and 26 to 30 s at 8 threads (measured outside the repository). A
+reference with fewer distinct k-mers than N is sketched whole, and its estimates then
+mean something else. Between two full sketches the estimate follows the k-mers the
+larger genome has and the smaller lacks; when both are sketched whole it is the k-mers
+the smaller has and the larger lacks, and a value in between with one of them whole. A
+3 000-base genome that is part of a 5 000-base one (k = 21, in `treesketchtest`) is
+estimated at about 1 200 k-mers from it at 2 000, at 600 at 4 000 and at 0 at 10 000,
+where the two merge under any threshold. So N should stay below the number of distinct
+k-mers of the smallest reference, about its length in bases. With another N than
+2 000 the build says on stderr how many references it sketches whole; at the default,
+where this concerns references of less than 2 kb, it says nothing. An index built
+with another N is another index. Its tree can differ (on the 120 genomes the tree at
+20 000 has 22 of the default tree's 27 nodes, by level and leaf set, and 5 others, all
+at the two coarsest levels; on the 8 phages it is the same tree), and with the tree
+the nodes' signatures, the within-group signatures and the family rows, so the results
+of a sweep on such an index cannot be compared with the default index's row for row.
+The `build_params.tsv` of a tree index gains a line `minhash_size` when N is not 2 000,
+and the build then names the size on stderr (a `--cluster` build has no such file and
+names it there only); with 2 000 spelled out the build is the default one, byte for
+byte. The option has no effect, and the build says so, in a flat build without
+`--cluster`, with `--cluster --exact` and with `--tree-file`.
 
 ### querysketch
 ```

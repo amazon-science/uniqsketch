@@ -49,6 +49,10 @@ static const char USAGE_MESSAGE[] =
     "\t\t\tclustering the references (with --tree, whose thresholds then only name the levels);\n"
     "\t\t\ta node's name and path in FILE are not read, a node with one child is refused (README)\n"
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
+    "      --minhash-size=N\thashes in each reference's MinHash sketch, from which --tree and --cluster (without\n"
+    "\t\t\t--exact) estimate distances [2000]. A hash stands for 1/N of a genome's k-mers (2 500\n"
+    "\t\t\tof 5 Mb at 2000, 250 at 20000). Another N can give another tree, hence another\n"
+    "\t\t\tindex (README); keep N below the distinct k-mers of the smallest reference\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
     "      --strict-margin\tenforce --min-margin as a hard requirement (no margin-1 fallback; may yield fewer signatures) [on with --tree unless --min-margin=1]\n"
@@ -71,7 +75,7 @@ static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
        OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP, OPT_DISCARDCAND,
-       OPT_TREEFILE };
+       OPT_TREEFILE, OPT_MINHASHSIZE };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -100,6 +104,7 @@ static const struct option longopts[] = {
     {"tree-file",      required_argument, nullptr, OPT_TREEFILE},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
     {"exact",          no_argument,       nullptr, OPT_EXACT},
+    {"minhash-size",   required_argument, nullptr, OPT_MINHASHSIZE},
     {"max-homopolymer",required_argument, nullptr, OPT_MAXHOMOP},
     {"strict-margin",  no_argument,       nullptr, OPT_STRICTMARGIN},
     {"circular",       no_argument,       nullptr, OPT_CIRCULAR},
@@ -133,6 +138,8 @@ int main(int argc, char** argv) {
     int explicitCov = 0;            // -c
     bool covGiven = false;
     bool clusterGiven = false;      // --cluster
+    unsigned minhashSize = MINHASH_SKETCH_SIZE;   // --minhash-size: hashes in a reference's MinHash sketch
+    bool minhashGiven = false;
     std::vector<std::string> treeOnly;   // options given that only a --tree build reads
 
     bool die = false;
@@ -171,6 +178,19 @@ int main(int argc, char** argv) {
             break;
         }
         case OPT_TREEFILE: arg >> treeFileArg; treeFileGiven = true; break;
+        case OPT_MINHASHSIZE: {
+            std::string sizeArg;
+            arg >> sizeArg;
+            const std::string problem = parseMinhashSize(sizeArg, minhashSize);
+            if (!problem.empty()) {
+                std::cerr << PROGRAM ": --minhash-size=" << sizeArg << ": " << problem
+                          << "\n  --minhash-size takes the number of hashes in a reference's MinHash sketch as a plain "
+                             "positive integer, e.g. --minhash-size=20000 (default " << MINHASH_SKETCH_SIZE << ")\n";
+                exit(EXIT_FAILURE);
+            }
+            minhashGiven = true;
+            break;
+        }
         case OPT_CIRCULAR: cfg.circular = true; break;
         case OPT_DISCARDCAND: cfg.keepCandidates = false; break;
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
@@ -285,6 +305,19 @@ int main(int argc, char** argv) {
             std::cerr << PROGRAM ": warning: " << o << " has no effect without --tree\n";
     if (useExactCluster && clusterThreshold == 0)
         std::cerr << PROGRAM ": warning: --exact has no effect without --cluster\n";
+    // --minhash-size is read where references are sketched: by the clustering of a
+    // tree build, unless the tree comes from a file, and by --cluster without --exact.
+    const bool sketchesReferences = treeThresholds.empty() ? (clusterThreshold > 0 && !useExactCluster) : !treeFileGiven;
+    if (minhashGiven && !sketchesReferences) {
+        if (treeFileGiven && !treeThresholds.empty())
+            std::cerr << PROGRAM ": warning: --minhash-size has no effect with --tree-file (the tree is read from the "
+                         "file; no reference is sketched)\n";
+        else if (clusterThreshold > 0)
+            std::cerr << PROGRAM ": warning: --minhash-size has no effect with --exact (the exact clustering takes "
+                         "no sketch)\n";
+        else
+            std::cerr << PROGRAM ": warning: --minhash-size has no effect without --tree or --cluster\n";
+    }
 
     if (argc - optind < 1) {
         std::cerr << PROGRAM ": missing arguments\n";
@@ -298,6 +331,11 @@ int main(int argc, char** argv) {
         std::cerr << "Try `" << PROGRAM << " --help' for more information.\n";
         exit(EXIT_FAILURE);
     }
+    // Said for another size only, so that the stderr of a default build is what it was.
+    if (sketchesReferences && minhashSize != MINHASH_SKETCH_SIZE)
+        std::cerr << PROGRAM ": MinHash sketch size " << minhashSize << " (--minhash-size; default "
+                  << MINHASH_SKETCH_SIZE << "): the " << (treeThresholds.empty() ? "clusters" : "tree")
+                  << " may differ from a default build's, and the index with " << (treeThresholds.empty() ? "them" : "it") << "\n";
 
 #ifdef _OPENMP
     // Before the tree is built: the tree levels run ahead of the leaf sketch
@@ -432,7 +470,7 @@ int main(int argc, char** argv) {
         } else {
             tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
                                               cfg.nhash1, cfg.bits,
-                                              estimateMaxGenomeSize(refFiles), treeFile);
+                                              estimateMaxGenomeSize(refFiles), treeFile, minhashSize);
         }
         // No two references merged at any threshold: the tree is its leaves and the
         // index will have no node level. That is what a list written with thousands
@@ -516,6 +554,11 @@ int main(int argc, char** argv) {
         }
         writeTreeBuildParams(treeBuildParamsPath(cfg.outdir), bp);
         if (treeFileGiven) recordTreeFile(treeBuildParamsPath(cfg.outdir), treeFileArg);
+        // A line for the sketch size only when the tree was clustered from sketches of
+        // another size than the default: the file of a default build is compared byte
+        // for byte with those of earlier builds (cmp_index.sh).
+        if (sketchesReferences && minhashSize != MINHASH_SKETCH_SIZE)
+            recordMinhashSize(treeBuildParamsPath(cfg.outdir), minhashSize);
 
         // The main sketch is built from the leaf references (full-resolution level)
         std::unordered_set<std::string> uniqueRefs;
@@ -682,7 +725,7 @@ int main(int argc, char** argv) {
         std::string clusterFile = cfg.outdir + "/clusters.tsv";
         refFiles = clusterReferences(refFiles, clusterThreshold, cfg.kmerLen,
                                      cfg.nhash1, cfg.bits, 5000000, clusterFile,
-                                     useExactCluster);
+                                     useExactCluster, minhashSize);
     }
 
     cfg.numRef = refFiles.size();
