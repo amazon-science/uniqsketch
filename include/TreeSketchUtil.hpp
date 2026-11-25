@@ -103,17 +103,37 @@ inline std::vector<TreeNode> buildHierarchicalTree(
     const size_t POPULAR_CAP = 20000;  // hashes in more references are counted by bit sets, not pair by pair
     std::unordered_map<uint64_t, uint32_t> sharedCnt = countSharedSketchHashes(sketches, POPULAR_CAP);
 
-    // Estimated distinguishing k-mers between i and j (huge if they share no sketch
-    // hashes, i.e. too distant to be a merge candidate).
-    auto uniqueEst = [&](unsigned i, unsigned j) -> double {
-        if (i > j) std::swap(i, j);
-        auto it = sharedCnt.find((static_cast<uint64_t>(i) << 32) | j);
-        if (it == sharedCnt.end()) return 1e18;
-        size_t denom = std::min(sketches[i].size(), sketches[j].size());
-        if (denom == 0) return 1e18;
-        double jac = static_cast<double>(it->second) / static_cast<double>(denom);
-        return static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - jac);
-    };
+    // The merge candidates: the pairs whose estimate is below the largest threshold,
+    // each with its estimate, in the map's iteration order. No other pair can merge
+    // at any level (a pair that shares no sketch hash is not in the map at all), so
+    // the levels below walk this list. Each of them walked the whole map, looking
+    // both members up among the current representatives and the pair up again for
+    // its estimate: on 5 493 E. coli four walks of 15 083 778 pairs, 1.2 to 1.4 s
+    // each, where 380 992 pairs are below the largest threshold of that index,
+    // 1 000 000. On 1 000 genomes, 12 136 of 499 500 pairs, the merge stage took
+    // 39 ms and takes 7, the one walk that is left. The list keeps the map's order
+    // because a level makes its unions in the order it meets the pairs, hanging the
+    // root of the first member under the root of the second: the order decides
+    // which member ends as a root, the groups below are keyed by root, and the node
+    // ids and the order of the children follow from them. The tree is the same
+    // file byte for byte. The list takes 16 bytes a pair; where the largest
+    // threshold lies above every estimate it holds every pair, beside the map, and
+    // the tree step peaks here: on 1 000 genomes with thresholds of 1 000 000 000
+    // and more at 88.8 to 89.0 MB, where it peaked at 86.8 to 87.3 MB before, in
+    // the pair counting.
+    struct MergeCandidate { unsigned i, j; double est; };
+    std::vector<MergeCandidate> candidates;
+    double maxThreshold = 0.0;
+    for (unsigned t : thresholds) maxThreshold = std::max(maxThreshold, static_cast<double>(t));
+    for (const auto& kv : sharedCnt) {
+        const unsigned i = static_cast<unsigned>(kv.first >> 32);
+        const unsigned j = static_cast<unsigned>(kv.first & 0xffffffffu);
+        const size_t denom = std::min(sketches[i].size(), sketches[j].size());
+        if (denom == 0) continue;
+        const double overlap = static_cast<double>(kv.second) / static_cast<double>(denom);
+        const double uniqueEst = static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - overlap);
+        if (uniqueEst < maxThreshold) candidates.push_back({i, j, uniqueEst});
+    }
 
     // Build tree nodes: start with leaf nodes for each reference
     std::vector<TreeNode> tree;
@@ -157,16 +177,13 @@ inline std::vector<TreeNode> buildHierarchicalTree(
         for (unsigned c = 0; c < m; c++) repToIdx[active[c].rep] = c;
 
         // Merge clusters whose representatives form a candidate pair below threshold.
-        for (auto& kv : sharedCnt) {
-            unsigned i = static_cast<unsigned>(kv.first >> 32);
-            unsigned j = static_cast<unsigned>(kv.first & 0xffffffffu);
-            auto ii = repToIdx.find(i);
-            auto jj = repToIdx.find(j);
+        for (const MergeCandidate& c : candidates) {
+            if (!(c.est < threshold)) continue;
+            auto ii = repToIdx.find(c.i);
+            auto jj = repToIdx.find(c.j);
             if (ii == repToIdx.end() || jj == repToIdx.end()) continue;
-            if (uniqueEst(i, j) < threshold) {
-                unsigned a = find(ii->second), b = find(jj->second);
-                if (a != b) parent[a] = b;
-            }
+            unsigned a = find(ii->second), b = find(jj->second);
+            if (a != b) parent[a] = b;
         }
 
         std::unordered_map<unsigned, std::vector<unsigned>> groups;

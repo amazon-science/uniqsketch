@@ -412,20 +412,35 @@ inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
             }
         }
     }
-    // The pairs in insertion order.
-    struct Seen { uint32_t pos, i, j; };
+    // The pairs in insertion order, each with its count, so that neither array is
+    // read once the pairs are collected.
+    struct Seen { uint32_t pos, i, j, count; };
     std::vector<Seen> seen;
     for (size_t i = 0; i < n; i++) {
         const uint32_t* f = &first[i * n];
+        const uint32_t* c = &count[i * n];
         for (size_t j = i + 1; j < n; j++)
-            if (f[j] != UINT32_MAX) seen.push_back({f[j], static_cast<uint32_t>(i), static_cast<uint32_t>(j)});
+            if (f[j] != UINT32_MAX) seen.push_back({f[j], static_cast<uint32_t>(i), static_cast<uint32_t>(j), c[j]});
     }
-    first = {};
+    // Both arrays end here, before the map is built, which with the sorted pairs is
+    // the larger part of the function's peak. `first = {}` stood here alone and
+    // released nothing: assigning an empty list leaves a vector its allocation, so
+    // the 4 n^2 bytes of `first` were held to the end, and those of `count` had to
+    // be, for the counts, which the pairs now carry (four more bytes a pair). The
+    // assignment is kept, and shrink_to_fit after it gives the allocation back
+    // (with libstdc++ a swap with a vector of the exact size, here none). Peak RSS
+    // of the function on 1 000 genomes: 72.5 MB, 68.9 with `first` released, 66.8
+    // with both. Written without the assignment, as a swap with an empty vector, a
+    // move assignment or clear() and shrink_to_fit, the release changed the
+    // querysketch binary (g++ 7.3.1), which compiles this header and calls nothing
+    // in it; as written it does not.
+    first = {}; first.shrink_to_fit();
+    count = {}; count.shrink_to_fit();
     std::sort(seen.begin(), seen.end(), [](const Seen& a, const Seen& b) {
         return a.pos != b.pos ? a.pos < b.pos : a.i != b.i ? a.i < b.i : a.j < b.j;
     });
     for (const Seen& s : seen)
-        shared.emplace((static_cast<uint64_t>(s.i) << 32) | s.j, count[static_cast<size_t>(s.i) * n + s.j]);
+        shared.emplace((static_cast<uint64_t>(s.i) << 32) | s.j, s.count);
     return shared;
 }
 

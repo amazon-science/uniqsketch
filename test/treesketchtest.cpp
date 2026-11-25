@@ -525,6 +525,184 @@ void testBuildHierarchicalTree() {
     std::cerr << "PASSED: Test buildHierarchicalTree\n";
 }
 
+// The merges as buildHierarchicalTree made them before it collected its merge
+// candidates: every level walks the whole pair map in its iteration order, finds
+// the two members among the current representatives and looks the pair up again
+// for its estimate. Kept here as the loop stood, as what the function is held to.
+static std::vector<TreeNode> mergeByWholeMapWalks(const std::vector<std::string>& refFiles,
+                                                  const std::vector<unsigned>& thresholds,
+                                                  const std::vector<std::vector<uint64_t>>& sketches,
+                                                  const std::vector<size_t>& kmerCount,
+                                                  const std::unordered_map<uint64_t, uint32_t>& sharedCnt) {
+    const size_t n = refFiles.size();
+    auto uniqueEst = [&](unsigned i, unsigned j) -> double {
+        if (i > j) std::swap(i, j);
+        auto it = sharedCnt.find((static_cast<uint64_t>(i) << 32) | j);
+        if (it == sharedCnt.end()) return 1e18;
+        size_t denom = std::min(sketches[i].size(), sketches[j].size());
+        if (denom == 0) return 1e18;
+        double overlap = static_cast<double>(it->second) / static_cast<double>(denom);
+        return static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - overlap);
+    };
+    std::vector<TreeNode> tree;
+    tree.reserve(n * 2);
+    for (unsigned i = 0; i < n; i++) {
+        TreeNode leaf;
+        leaf.id = i;
+        leaf.name = getBaseId(refFiles[i]);
+        leaf.filePath = refFiles[i];
+        leaf.level = thresholds.size();
+        leaf.parentId = -1;
+        leaf.isLeaf = true;
+        tree.push_back(std::move(leaf));
+    }
+    struct ActiveCluster { unsigned rep; unsigned node; };
+    std::vector<ActiveCluster> active;
+    for (unsigned i = 0; i < n; i++) active.push_back({i, i});
+    for (int lvl = static_cast<int>(thresholds.size()) - 1; lvl >= 0; --lvl) {
+        double threshold = static_cast<double>(thresholds[lvl]);
+        unsigned m = static_cast<unsigned>(active.size());
+        std::vector<unsigned> parent(m);
+        std::iota(parent.begin(), parent.end(), 0);
+        auto find = [&](unsigned x) -> unsigned {
+            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+        };
+        std::unordered_map<unsigned, unsigned> repToIdx;
+        for (unsigned c = 0; c < m; c++) repToIdx[active[c].rep] = c;
+        for (auto& kv : sharedCnt) {
+            unsigned i = static_cast<unsigned>(kv.first >> 32);
+            unsigned j = static_cast<unsigned>(kv.first & 0xffffffffu);
+            auto ii = repToIdx.find(i);
+            auto jj = repToIdx.find(j);
+            if (ii == repToIdx.end() || jj == repToIdx.end()) continue;
+            if (uniqueEst(i, j) < threshold) {
+                unsigned a = find(ii->second), b = find(jj->second);
+                if (a != b) parent[a] = b;
+            }
+        }
+        std::unordered_map<unsigned, std::vector<unsigned>> groups;
+        for (unsigned c = 0; c < m; c++) groups[find(c)].push_back(c);
+        std::vector<ActiveCluster> next;
+        for (auto& kv : groups) {
+            auto& members = kv.second;
+            if (members.size() == 1) { next.push_back(active[members[0]]); continue; }
+            unsigned repIdx = active[members[0]].rep;
+            for (unsigned c : members)
+                if (kmerCount[active[c].rep] > kmerCount[repIdx]) repIdx = active[c].rep;
+            TreeNode internal;
+            internal.id = static_cast<unsigned>(tree.size());
+            internal.name = "cluster_L" + std::to_string(lvl) + "_" + getBaseId(refFiles[repIdx]);
+            internal.filePath = refFiles[repIdx];
+            internal.level = static_cast<unsigned>(lvl);
+            internal.parentId = -1;
+            internal.isLeaf = false;
+            for (unsigned c : members) {
+                unsigned childNode = active[c].node;
+                tree[childNode].parentId = static_cast<int>(internal.id);
+                internal.children.push_back(childNode);
+            }
+            unsigned newNode = static_cast<unsigned>(tree.size());
+            tree.push_back(std::move(internal));
+            next.push_back({repIdx, newNode});
+        }
+        active = std::move(next);
+    }
+    return tree;
+}
+
+// buildHierarchicalTree collects the pairs below the largest threshold once, in
+// the pair map's iteration order, and every level walks that list. The tree must
+// be the one the walks of the whole map gave, node for node: ids and the order of
+// the children too, which follow the order in which a level meets its pairs (the
+// first member of a pair hangs its root under the second's).
+//
+// 112 genomes: 8 families of 14 behind a common 150-base block, so every pair is
+// in the map and the pairs of different families lie above every threshold. A
+// member is the family's sequence with its first steps[m] sites substituted, cut
+// short by cut[m] bases, so two members lie 21 k-mers apart for every site
+// between them, and the largest genome of a set of members is the one with the
+// smallest cut. Members of a family are 8 apart in the list.
+//
+// With thresholds of 700, 400, 100, 30 and 0 k-mers a family builds, finest level
+// first: six nodes at 30 (the members a site apart, the two at 34 among them,
+// which lie 0 apart and do not merge at 0); two at 100, {6, 7, 11, 12} and
+// {30, 31, 34, 34}; one at 400 holding the twelve; one at 700 with {61, 62}.
+void testMergeCandidates() {
+    std::cerr << "START: Test merge candidates... \t";
+    const unsigned k = 21, families = 8;
+    const std::vector<unsigned> steps = {0, 1, 2, 3, 6, 7, 11, 12, 30, 31, 34, 34, 61, 62};
+    const std::vector<unsigned> cut   = {2, 9, 5, 12, 8, 4, 1, 10, 0, 6, 3, 7, 11, 13};
+    const unsigned members = static_cast<unsigned>(steps.size());
+    const std::string common = randDNA(150, 700);
+    std::vector<std::string> refs(families * members);
+    auto leafOf = [&](unsigned family, unsigned member) { return member * families + family; };
+    for (unsigned f = 0; f < families; f++) {
+        const std::string base = common + randDNA(1450, 701 + f);
+        for (unsigned m = 0; m < members; m++) {
+            std::string s = base;
+            for (unsigned t = 0; t < steps[m]; t++) { char& c = s[180 + 22 * t]; c = (c == 'A') ? 'C' : 'A'; }
+            const std::string path = "mc_" + std::to_string(f) + "_" + std::to_string(m) + ".fa";
+            writeFasta(path, s.substr(0, s.size() - cut[m]));
+            refs[leafOf(f, m)] = path;
+        }
+    }
+    const size_t n = refs.size();
+    auto contents = [](const std::string& f) { std::ifstream in(f); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+    auto sameTree = [](const std::vector<TreeNode>& x, const std::vector<TreeNode>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); i++)
+            if (x[i].id != y[i].id || x[i].name != y[i].name || x[i].filePath != y[i].filePath || x[i].level != y[i].level ||
+                x[i].parentId != y[i].parentId || x[i].children != y[i].children || x[i].isLeaf != y[i].isLeaf) return false;
+        return true;
+    };
+    const std::vector<unsigned> descending = {700, 400, 100, 30, 0};   // as uniqsketch hands them over
+    const std::vector<unsigned> unordered = {30, 700, 0, 100, 400};    // the largest is not the first
+
+    // 2 000: every genome is sketched whole and the estimates are the designed
+    // ones. 300: sketches of 300 hashes of some 1 580, estimates in steps of five
+    // k-mers and other merges; only the comparison with the walks is made there.
+    for (unsigned sketchSize : {MINHASH_SKETCH_SIZE, 300u}) {
+        std::vector<std::vector<uint64_t>> sketches(n);
+        std::vector<size_t> kmerCount(n, 0);
+        for (size_t i = 0; i < n; i++) sketches[i] = clusterMinhashSketch(refs[i], k, sketchSize, kmerCount[i]);
+        const std::unordered_map<uint64_t, uint32_t> shared = countSharedSketchHashes(sketches, 20000);
+        assert(shared.size() == n * (n - 1) / 2);                      // every pair is in the map
+        auto estimate = [&](unsigned i, unsigned j) {
+            const uint32_t hashes = shared.at((static_cast<uint64_t>(std::min(i, j)) << 32) | std::max(i, j));
+            return static_cast<double>(std::min(kmerCount[i], kmerCount[j])) *
+                   (1.0 - static_cast<double>(hashes) / static_cast<double>(std::min(sketches[i].size(), sketches[j].size())));
+        };
+        for (const std::vector<unsigned>& thresholds : {descending, unordered}) {
+            const std::vector<TreeNode> expected = mergeByWholeMapWalks(refs, thresholds, sketches, kmerCount, shared);
+            const std::vector<TreeNode> tree = buildHierarchicalTree(refs, thresholds, k, 1, 16, 100000, "mc_tree.tsv", sketchSize);
+            assert(sameTree(tree, expected));
+            writeTreeIndex(expected, "mc_expected.tsv");
+            assert(contents("mc_tree.tsv") == contents("mc_expected.tsv"));
+        }
+        if (sketchSize != MINHASH_SKETCH_SIZE) continue;
+
+        // What the fixture holds: 64 pairs below the finest threshold that merges,
+        // 584 below the largest, 5 632 at or above it, which no level may merge.
+        size_t below30 = 0, below700 = 0;
+        for (unsigned i = 0; i < n; i++)
+            for (unsigned j = i + 1; j < n; j++) { below30 += estimate(i, j) < 30; below700 += estimate(i, j) < 700; }
+        assert(below30 == 64 && below700 == 584 && shared.size() - below700 == 5632);
+        const std::vector<TreeNode> tree = buildHierarchicalTree(refs, descending, k, 1, 16, 100000, "mc_tree.tsv");
+        std::vector<unsigned> nodesAt(descending.size(), 0);
+        for (const TreeNode& node : tree) if (!node.isLeaf) nodesAt[node.level]++;
+        assert((nodesAt == std::vector<unsigned>{8, 8, 16, 48, 0}));   // nothing merges at a threshold of 0
+        // The two genomes at 34, one inside the other: 0 apart, merged at 30, not at 0.
+        for (unsigned f = 0; f < families; f++) {
+            assert(estimate(leafOf(f, 10), leafOf(f, 11)) == 0.0);
+            assert(tree[leafOf(f, 10)].parentId == tree[leafOf(f, 11)].parentId && tree[tree[leafOf(f, 10)].parentId].level == 3);
+        }
+    }
+    for (const std::string& f : refs) std::remove(f.c_str());
+    std::remove("mc_tree.tsv"); std::remove("mc_expected.tsv");
+    std::cerr << "PASSED: Test merge candidates\n";
+}
+
 // Node signatures with carriers (NodeCarrierUtil.hpp), on a node whose core is
 // carried outside it. A is the representative, with a 60-bp repeat of [500, 560)
 // appended; the members are A with one substitution (A1), A without [100, 250)
@@ -1533,6 +1711,7 @@ int main() {
     testBuildGroupSketch();
     testNodeCarriers();
     testBuildHierarchicalTree();
+    testMergeCandidates();
     testSharedSketchHashes();
     testCardinalitySamples();
     testCountKmerPositions();
