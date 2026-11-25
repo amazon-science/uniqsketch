@@ -405,6 +405,19 @@ full-resolution leaf sketch to `-o`. Query it with `querysketch --tree=DIR`
 (pointing at that output directory) together with `--ref` set to the leaf sketch;
 the query narrows candidates from the coarsest level down to individual references.
 
+**What a level's groups are.** The levels are built from the finest threshold up. A
+level joins the groups it finds, each standing in the merges by its largest genome,
+wherever two of those genomes are estimated closer than its threshold, and it joins
+transitively: single linkage over the current representatives (the member a group's
+signatures come from is chosen afterwards, see below). A threshold therefore bounds the
+step from one representative to the next, not the width of a group. On the tree of the
+5 493-genome *E. coli* index, 266 of the 1 143 nodes hold two genomes estimated at
+their level's threshold or more apart, the widest at four thresholds, and the nodes,
+counted at each level they span, are in 1 485 cases of 1 533 the groups that plain
+single linkage over all genomes makes of the same estimates. The estimate of a pair
+follows the k-mers its larger genome has and the smaller lacks (see the MinHash sketch
+size, below).
+
 At every level, each reference is represented by the cluster that spans that level
 on its path to the root, or by itself if it never clustered, so a level's sketch
 covers every reference in the index. A cluster's signatures are k-mers that occur

@@ -447,12 +447,38 @@ inline std::unordered_map<uint64_t, uint32_t> countSharedSketchHashes(
 /**
  * Near-linear clustering via MinHash + inverted index + single-linkage union-find.
  * Instead of scoring all O(n^2) pairs, references are sketched (bottom-s MinHash)
- * and only pairs that share sketch hashes are scored, using an inverted index. The
- * estimated number of distinguishing k-mers is min(|i|,|j|)*(1 - Jaccard); pairs
- * below `threshold` are merged, matching the semantics of --cluster=N. Approximate
- * (sketch resolution ~ |genome|/s), but on well-separated near-identical strains it
- * reproduces the exact clustering at a fraction of the cost. Use clusterReferencesExact
- * for a precise result.
+ * and only pairs that share sketch hashes are scored, using an inverted index. A
+ * pair's estimated number of distinguishing k-mers is
+ *     uniqueEst = min(kmerCount_i, kmerCount_j) * (1 - shared / s),
+ * shared being the sketch hashes the two have in common and s the size of the
+ * smaller sketch; pairs below `threshold` are merged, matching the semantics of
+ * --cluster=N. Approximate (sketch resolution ~ |genome|/s), but on well-separated
+ * near-identical strains it reproduces the exact clustering at a fraction of the
+ * cost. Use clusterReferencesExact for a precise result. buildHierarchicalTree
+ * (TreeSketchUtil.hpp) forms the same estimate.
+ *
+ * What uniqueEst estimates is not min(|i|,|j|) * (1 - Jaccard): shared / s is no
+ * estimate of the Jaccard index. A k-mer that both genomes hold is in both
+ * sketches only if its hash is among the s smallest of each, and the genome with
+ * more distinct k-mers is the one that decides: between two full sketches
+ * shared / s tends to |A and B| / max(|A|, |B|), A and B being the two sets of
+ * distinct k-mers, not to |A and B| / |A or B|. uniqueEst therefore tends to
+ *     D * min(kmerCount) / max(|A|, |B|),
+ * D being the larger of the two one-sided differences, the k-mers that the genome
+ * with more of them holds and the other lacks, and kmerCount the k-mer positions,
+ * repeats included. Measured on the 7 140 pairs of the 120 E. coli genomes of the
+ * validation index against their exact k-mer sets: shared / s lies 0.0052 below
+ * |A and B| / max(|A|, |B|) in the mean at s = 2 000 and 0.00007 above it at
+ * s = 100 000, and 0.105 and 0.110 above the Jaccard index; the median of
+ * uniqueEst over that limit is 1.007 and 1.000. At 2 000 the median estimate is
+ * 0.98 of D, 1.05 of the smaller difference, 0.51 of the two together and 0.89
+ * of min(kmerCount) * (1 - Jaccard). Against D it is 1.02 for two genomes of one
+ * size (positions over distinct k-mers) and falls as the sizes part: 0.95 where
+ * their distinct k-mers differ by 5 to 10 %, 0.90 above 10 %. One sketch hash
+ * stands for min(kmerCount) / s k-mers, 2 264 to 2 840 on those genomes at
+ * 2 000, and the estimate is a multiple of that. A reference with fewer than s
+ * distinct k-mers is sketched whole and its estimates mean something else: see
+ * MINHASH_SKETCH_SIZE.
  *
  * @param refFiles  All reference file paths.
  * @param threshold  Distinguishing-k-mer threshold below which references merge.
@@ -514,8 +540,8 @@ inline std::vector<std::string> clusterReferencesMinHash(
         unsigned j = static_cast<unsigned>(kv.first & 0xffffffffu);
         size_t denom = std::min(sketches[i].size(), sketches[j].size());
         if (denom == 0) continue;
-        double jaccard = static_cast<double>(kv.second) / static_cast<double>(denom);
-        double uniqueEst = static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - jaccard);
+        double overlap = static_cast<double>(kv.second) / static_cast<double>(denom);
+        double uniqueEst = static_cast<double>(std::min(kmerCount[i], kmerCount[j])) * (1.0 - overlap);
         if (uniqueEst < static_cast<double>(threshold)) {
             unsigned ri = find(i), rj = find(j);
             if (ri != rj) parent[ri] = rj;

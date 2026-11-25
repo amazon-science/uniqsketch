@@ -121,6 +121,11 @@ inline std::vector<TreeNode> buildHierarchicalTree(
     // the tree step peaks here: on 1 000 genomes with thresholds of 1 000 000 000
     // and more at 88.8 to 89.0 MB, where it peaked at 86.8 to 87.3 MB before, in
     // the pair counting.
+    //
+    // The estimate is the uniqueEst of clusterReferencesMinHash (ClusterUtil.hpp),
+    // whose comment says what it estimates: between two full sketches, the larger
+    // of the pair's two one-sided differences, scaled by the smaller genome's k-mer
+    // positions over the larger's distinct k-mers.
     struct MergeCandidate { unsigned i, j; double est; };
     std::vector<MergeCandidate> candidates;
     double maxThreshold = 0.0;
@@ -152,9 +157,22 @@ inline std::vector<TreeNode> buildHierarchicalTree(
 
     // Bottom-up agglomerative nesting. Thresholds are processed finest-first so that
     // coarser levels are unions of finer clusters (a proper nested hierarchy, rather
-    // than re-clustering from scratch per level). Clusters merge by representative
-    // distance (representative-linkage) via union-find over the sparse candidate
-    // graph: near-linear, and it avoids single-linkage chaining. Level numbering is
+    // than re-clustering from scratch per level). A level joins the clusters whose
+    // representatives form a candidate pair below its threshold, and joins them
+    // transitively (union-find over the sparse candidate graph: near-linear); the
+    // largest genome among the joined representatives stands for the new cluster
+    // from then on. That is single linkage over the current representatives of
+    // each level, and it does not avoid chaining: a run of representatives, each
+    // below the threshold from the next, becomes one node, and the genomes behind
+    // a representative are not compared at that level, so a node can be wider
+    // than its threshold. On the tree of the 5 493-genome E. coli index
+    // (thresholds 1 000 000, 300 000, 100 000 and 10 000) the nodes, counted at
+    // each level they span, 1 533 in all, are in 1 485 cases the groups that plain
+    // single linkage over all genomes makes of the same estimates (284 of 284 at
+    // the finest level, 240 of 256 at the coarsest), and 266 of the 1 143 nodes
+    // hold two genomes estimated at their level's threshold or more apart, the
+    // widest at 4.0 thresholds (331 nodes and 4.4 thresholds by the larger
+    // one-sided difference counted on one k-mer in 50). Level numbering is
     // unchanged (0 = coarsest, thresholds.size() = leaves).
     struct ActiveCluster { unsigned rep; unsigned node; };
     std::vector<ActiveCluster> active;

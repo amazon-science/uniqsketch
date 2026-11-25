@@ -628,6 +628,13 @@ static std::vector<TreeNode> mergeByWholeMapWalks(const std::vector<std::string>
 // first: six nodes at 30 (the members a site apart, the two at 34 among them,
 // which lie 0 apart and do not merge at 0); two at 100, {6, 7, 11, 12} and
 // {30, 31, 34, 34}; one at 400 holding the twelve; one at 700 with {61, 62}.
+//
+// Two of those nodes hold what the merges are, single linkage over the current
+// representatives of each level. The members at 0, 1, 2 and 3 are one node at 30
+// though the outer two are 63 apart: a node can be wider than its threshold. And
+// the member at 6 is 63 from the one at 3 but does not join that node at 100: the
+// node stands by its largest genome, the member at 0, which is 147 from the
+// member at 7 that stands for {6, 7}.
 void testMergeCandidates() {
     std::cerr << "START: Test merge candidates... \t";
     const unsigned k = 21, families = 8;
@@ -696,6 +703,28 @@ void testMergeCandidates() {
         for (unsigned f = 0; f < families; f++) {
             assert(estimate(leafOf(f, 10), leafOf(f, 11)) == 0.0);
             assert(tree[leafOf(f, 10)].parentId == tree[leafOf(f, 11)].parentId && tree[tree[leafOf(f, 10)].parentId].level == 3);
+        }
+
+        // What the merges are, in every family.
+        for (unsigned f = 0; f < families; f++) {
+            const std::string family = "mc_" + std::to_string(f) + "_";
+            // A node wider than its threshold: 0, 1, 2 and 3 at 30, the outer two 63 apart.
+            const TreeNode& chain = tree[tree[leafOf(f, 0)].parentId];
+            assert(chain.level == 3 && chain.children.size() == 4 && chain.name == "cluster_L3_" + family + "0");
+            assert(tree[leafOf(f, 3)].parentId == static_cast<int>(chain.id));
+            assert(estimate(leafOf(f, 0), leafOf(f, 3)) > 62 && estimate(leafOf(f, 0), leafOf(f, 3)) < 64);
+            // Representatives decide the next level: 3 and 6 are 63 apart, below
+            // 100, but the nodes they are in stand by 0 and 7, 147 apart, and
+            // stay two nodes at 100. They meet at 400, through the member at 11.
+            const TreeNode& pair = tree[tree[leafOf(f, 4)].parentId];
+            assert(pair.level == 3 && pair.children.size() == 2 && pair.name == "cluster_L3_" + family + "5");
+            assert(estimate(leafOf(f, 3), leafOf(f, 4)) < 64 && estimate(leafOf(f, 0), leafOf(f, 5)) > 146);
+            assert(tree[pair.parentId].level == 2 && tree[pair.parentId].name == "cluster_L2_" + family + "6");
+            assert(tree[chain.parentId].level == 1 && chain.parentId == tree[pair.parentId].parentId);
+            // That node holds twelve members up to 714 apart at a threshold of 400.
+            assert(tree[chain.parentId].name == "cluster_L1_" + family + "8" && tree[chain.parentId].children.size() == 3);
+            assert(estimate(leafOf(f, 0), leafOf(f, 10)) > 713);
+            assert(tree[tree[chain.parentId].parentId].level == 0 && tree[tree[chain.parentId].parentId].children.size() == 2);
         }
     }
     for (const std::string& f : refs) std::remove(f.c_str());
@@ -1560,8 +1589,8 @@ void testMinhashSketchSize() {
         sizeA = sk[0].size(); sizeB = sk[1].size();
         const std::unordered_map<uint64_t, uint32_t> shared = countSharedSketchHashes(sk, 20000);
         assert(shared.size() == 1);
-        const double jaccard = static_cast<double>(shared.begin()->second) / static_cast<double>(std::min(sizeA, sizeB));
-        return static_cast<double>(std::min(countA, countB)) * (1.0 - jaccard);
+        const double overlap = static_cast<double>(shared.begin()->second) / static_cast<double>(std::min(sizeA, sizeB));
+        return static_cast<double>(std::min(countA, countB)) * (1.0 - overlap);
     };
     // Is the pair (A, B) one node of the tree, one cluster of the clustering, under `threshold`?
     auto treeMerges = [&](unsigned threshold, unsigned s, bool sizeGiven) {
