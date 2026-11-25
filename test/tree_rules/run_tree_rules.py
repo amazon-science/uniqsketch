@@ -13,7 +13,10 @@ builds a 16-genome synthetic index in which each of those rules has a structure
 of its own (gen_fixture.py), queries it with samples that each make one rule
 decide the result (gen_reads.py), and compares the rows with expected.tsv. It
 also runs the index variants an older uniqsketch would have written, so the
-fallbacks stay exercised. Nothing is committed but the generators and the
+fallbacks stay exercised, builds the index a second time from its own
+tree_index.tsv (uniqsketch --tree-file), which has to give the same index and the
+same tables, and gives that tree once more with a threshold too few, which has to
+be refused with nothing written. Nothing is committed but the generators and the
 expectations; the whole run takes a few seconds.
 
 Three stages, so that a failure says what moved:
@@ -67,6 +70,8 @@ BUILD = ["--tree=12000,4000,300", "--node-carriers=2", "-c1000", "-k81"]
 QUERY_FILES = ["tree_index.tsv", "leaves.tsv", "build_params.tsv", "sketch_level_0.tsv", "sketch_level_1.tsv",
                "sketch_level_2.tsv", "sketch_group.tsv", "ancestor_signatures.tsv"]
 LOCUS_GAP = 500            # QuerySketchConfig::locusGap
+TREE_FILE = "tree_file"    # the index rebuilt from its own tree (rebuild_from_tree), under variants/
+TREE_FILE_ARG = "idx/outdir/tree_index.tsv"
 
 checks = []                # (stage, case, description, ok, detail)
 
@@ -151,6 +156,79 @@ def make_variants(work):
         lines = fh.readlines()
     with open(p, "w") as fh:
         fh.writelines(lines[:-1])
+
+
+def rebuild_from_tree(bindir, work, threads):
+    """The index once more, its tree read from the first build's tree_index.tsv (uniqsketch --tree-file).
+
+    That file names each node after the member the level builds chose, not the genome
+    the merges named; the rebuild has to come out as the same index all the same.
+    """
+    out = os.path.join("variants", TREE_FILE)
+    os.makedirs(os.path.join(work, out))
+    return run([os.path.join(bindir, "uniqsketch")] + BUILD + ["--tree-file=" + TREE_FILE_ARG, "-t", str(threads),
+                "-o", out + "/sketch_uniq.tsv", "-f", out + "/outdir", "-r", out + "/db.tsv", "@list.txt"],
+               work, os.path.join(work, out, "build.log"))
+
+
+def tree_file_check(work, rc):
+    """INDEX: the rebuild from the index's own tree is that index, file for file."""
+    what = "rebuilt from its own tree_index.tsv (--tree-file), the index is the same file for file, " \
+           "build_params.tsv with the tree_file line added"
+    a, b = os.path.join(work, "idx"), os.path.join(work, "variants", TREE_FILE)
+    if rc != 0 or not os.path.exists(os.path.join(b, "sketch_uniq.tsv")):
+        check("INDEX", "-", what, False, "uniqsketch --tree-file: exit %d, or no index (--reuse of a run without one); "
+              "see %s" % (rc, os.path.join(b, "build.log")))
+        return
+
+    def files(top):
+        found = set()
+        for d, _, names in os.walk(os.path.join(top, "outdir")):
+            found.update(os.path.relpath(os.path.join(d, n), top) for n in names)
+        return found | set(["sketch_uniq.tsv", "db.tsv"])
+
+    def content(path, name):
+        with open(os.path.join(path, name), "rb") as fh:
+            data = fh.read()
+        if os.path.basename(name) in ("db_uniq_count.tsv", "db.tsv"):      # they name the build's own -f directory
+            data = b"".join(line.split(b"/")[-1] for line in data.splitlines(True))
+        return data
+
+    differ = sorted(files(a) ^ files(b))
+    for name in sorted(files(a) & files(b)):
+        want = content(a, name)
+        if name == os.path.join("outdir", "build_params.tsv"):
+            want += ("tree_file\t%s\n" % TREE_FILE_ARG).encode()
+        if content(b, name) != want:
+            differ.append(name)
+    check("INDEX", "-", what, not differ, "%d of %d files differ or are in one index only: %s" %
+          (len(differ), len(files(a) | files(b)), ", ".join(differ[:8])))
+
+
+def tree_file_refusal(bindir, work):
+    """INDEX: the index's own tree, given with a threshold too few, is refused and nothing is written.
+
+    The refusal is in uniqsketch's main(), which no suite calls: without this run a build
+    that printed the reason and went on, one that ended with exit status 0, and one that
+    checked the file after making its output directory passed every test.
+    """
+    what = "its own tree_index.tsv with two thresholds for its three levels (--tree-file) is refused: exit status 1, " \
+           "the reason on stderr after the option and the file, nothing written"
+    out = os.path.join("variants", TREE_FILE + "_refused")          # there, and empty: a build would fill it
+    shutil.rmtree(os.path.join(work, out), ignore_errors=True)
+    os.makedirs(os.path.join(work, out))
+    log = os.path.join(work, "variants", TREE_FILE + "_refused.log")
+    rc = run([os.path.join(bindir, "uniqsketch"), BUILD[0].rsplit(",", 1)[0]] + BUILD[1:] +
+             ["--tree-file=" + TREE_FILE_ARG, "-t", "1", "-o", out + "/sketch_uniq.tsv", "-f", out + "/outdir",
+              "-r", out + "/db.tsv", "@list.txt"], work, log)
+    with open(log) as fh:
+        said = fh.read()
+    reason = "with 2 threshold(s) in --tree the leaves are at level 2"
+    named = ("Error: --tree-file %s: " % TREE_FILE_ARG) in said
+    left = os.listdir(os.path.join(work, out))
+    check("INDEX", "-", what, rc == 1 and reason in said and named and not left,
+          "exit %d; the reason %s; the option and the file %s; %d file(s) or directories written" %
+          (rc, "given" if reason in said else "not given", "named" if named else "not named", len(left)))
 
 
 def index_digest(work, path):
@@ -434,6 +512,7 @@ def main():
             sys.exit("%s not found in %s (build the tools first)" % (tool, bindir))
 
     reuse = args.reuse and os.path.exists(os.path.join(work, "reads", "EMPTY.fq"))
+    rebuilt = 0                 # exit status of the rebuild from the index's own tree
     if reuse:
         B, G = gen_fixture.build()
         G = dict(G, NEG=B["NEG"])
@@ -442,6 +521,9 @@ def main():
         os.makedirs(work)
         G = build_index(bindir, work, args.build_threads)
         make_variants(work)
+        rebuilt = rebuild_from_tree(bindir, work, args.build_threads)
+    tree_file_check(work, rebuilt)
+    tree_file_refusal(bindir, work)
     if args.index_digest:
         index_digest(work, os.path.abspath(args.index_digest))
     ix = index_checks(work)

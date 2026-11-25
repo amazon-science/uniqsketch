@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <set>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "TreeSketchUtil.hpp"
+#include "TreeFileUtil.hpp"
 #include "GroupSketchUtil.hpp"
 #include "NodeCarrierUtil.hpp"
 
@@ -973,6 +975,338 @@ void testCardinalitySamples() {
     std::cerr << "PASSED: Test cardinality samples\n";
 }
 
+// countKmerPositions is the k-mer count of the tree's sketch pass
+// (clusterMinhashSketch), which decides the representative of a node, taken
+// without hashing: on runs of N, a character that is neither a base nor N, lower
+// case, a sequence shorter than k, an empty one, a gzip file, and from k = 1 to a
+// k longer than every sequence.
+void testCountKmerPositions() {
+    std::cerr << "START: Test countKmerPositions... \t";
+    const std::string a = randDNA(900, 31), b = randDNA(700, 32), c = randDNA(40, 33);
+    std::string lower = randDNA(300, 34);
+    for (char& ch : lower) ch = static_cast<char>(ch - 'A' + 'a');
+    {
+        std::ofstream o("kc_plain.fa");
+        o << ">one\n" << a.substr(0, 400) << "NNNNN" << a.substr(400, 30) << "N" << a.substr(430) << "\n"
+          << ">two a comment\n" << b.substr(0, 350) << "\n" << "R" << b.substr(350) << "N\n"
+          << ">short\n" << c << "\n"
+          << ">lower\n" << lower << "\n"
+          << ">empty\n";
+    }
+    writeFasta("kc_one.fa", a);
+    {
+        gzFile z = gzopen("kc_zipped.fa.gz", "wb");
+        const std::string text = ">z\n" + a.substr(0, 500) + "\nN" + b + "\n";
+        gzwrite(z, text.data(), static_cast<unsigned>(text.size()));
+        gzclose(z);
+    }
+    assert(countKmerPositions("kc_one.fa", 21) == 900 - 21 + 1);
+    assert(countKmerPositions("kc_one.fa", 900) == 1 && countKmerPositions("kc_one.fa", 901) == 0);
+    // 400, 30 and 470 bases between the N of the first sequence, 350 on either side
+    // of the R in the second, then 40 and 300.
+    assert(countKmerPositions("kc_plain.fa", 21) == 380 + 10 + 450 + 330 + 330 + 20 + 280);
+    for (const char* f : {"kc_plain.fa", "kc_one.fa", "kc_zipped.fa.gz"})
+        for (unsigned k : {1u, 21u, 31u, 81u, 351u, 2000u}) {
+            size_t sketched = 0;
+            clusterMinhashSketch(f, k, MINHASH_SKETCH_SIZE, sketched);
+            assert(countKmerPositions(f, k) == sketched);
+        }
+    for (const char* f : {"kc_plain.fa", "kc_one.fa", "kc_zipped.fa.gz"}) std::remove(f);
+    std::cerr << "PASSED: Test countKmerPositions\n";
+}
+
+// treeFileDefect: what --tree-file refuses in a tree whose rows parse and that
+// treeDefect accepts. The tree is the shape of testTreeLevelPartition, three thresholds:
+// N (level 2) = {A, B} under P (level 0) = {N, C}; O (level 1) = {D, E}, an
+// orphan; F on its own. Every refusal is one change to it, to the list or to the
+// number of thresholds.
+void testTreeFileDefect() {
+    std::cerr << "START: Test treeFileDefect... \t";
+    const std::vector<std::string> refs = {"d/A.fa", "d/B.fa", "e/C.fna.gz", "d/D.fa", "d/E.fa", "d/F.fa"};
+    std::vector<TreeNode> t;
+    auto leaf = [&](unsigned id, const char* n, int parent) {
+        TreeNode x; x.id = id; x.name = n; x.filePath = std::string("/elsewhere/") + n + ".fasta";
+        x.level = 3; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+    };
+    auto node = [&](unsigned id, unsigned level, int parent, std::vector<unsigned> children) {
+        TreeNode x; x.id = id; x.name = "n" + std::to_string(id); x.level = level; x.parentId = parent;
+        x.isLeaf = false; x.children = std::move(children); t.push_back(x);
+    };
+    leaf(0, "A", 6); leaf(1, "B", 6); leaf(2, "C", 7); leaf(3, "D", 8); leaf(4, "E", 8); leaf(5, "F", -1);
+    node(6, 2, 7, {0, 1}); node(7, 0, -1, {6, 2}); node(8, 1, -1, {3, 4});
+    assert(treeDefect(t).empty() && treeFileDefect(t, refs, 3).empty());
+    {
+        std::vector<TreeNode> rows(t.rbegin(), t.rend());                      // the order of the rows is free
+        assert(treeFileDefect(rows, refs, 3).empty());
+    }
+    // `edit` changes a copy; the copy must still pass treeDefect, as in loadTreeFile,
+    // and be refused with a message holding `what`.
+    auto refused = [&](const char* what, const std::function<void(std::vector<TreeNode>&)>& edit,
+                       std::vector<std::string> list = {}, size_t thresholds = 3) {
+        std::vector<TreeNode> x = t;
+        edit(x);
+        assert(treeDefect(x).empty());
+        const std::string why = treeFileDefect(x, list.empty() ? refs : list, thresholds);
+        if (why.find(what) == std::string::npos) std::cerr << "\n  expected `" << what << "', got `" << why << "'\n";
+        assert(why.find(what) != std::string::npos);
+    };
+    auto same = [](std::vector<TreeNode>&) {};
+    // The leaves are the references of the list, each once, in its order.
+    refused("5 leaves, the list has 6", [](std::vector<TreeNode>& x) { x.erase(x.begin() + 5); });
+    refused("6 leaves, the list has 5", same, {"d/A.fa", "d/B.fa", "e/C.fna.gz", "d/D.fa", "d/E.fa"});
+    refused("6 leaves, the list has 7", same, {"d/A.fa", "d/B.fa", "e/C.fna.gz", "d/D.fa", "d/E.fa", "d/F.fa", "d/G.fa"});
+    refused("leaf 5 (Z) is not a reference", [](std::vector<TreeNode>& x) { x[5].name = "Z"; });
+    refused("leaf 3 (E) is reference 4", [](std::vector<TreeNode>& x) { std::swap(x[3].name, x[4].name); });
+    refused("leaf 1 (A) is reference 0", [](std::vector<TreeNode>& x) { x[1].name = "A"; });          // A twice, no B
+    refused("leaf 9 (F) is reference 5", [](std::vector<TreeNode>& x) { x[5].id = 9; });
+    refused("leaf 0 (A) is reference 1", same, {"d/B.fa", "d/A.fa", "e/C.fna.gz", "d/D.fa", "d/E.fa", "d/F.fa"});
+    // The levels are those of the thresholds.
+    refused("leaf 0 (A) is at level 3; with 4 threshold(s)", same, {}, 4);
+    refused("leaf 0 (A) is at level 3; with 2 threshold(s)", same, {}, 2);
+    refused("leaf 5 (F) is at level 2", [](std::vector<TreeNode>& x) { x[5].level = 2; });
+    refused("node 6 (n6) is at level 3", [](std::vector<TreeNode>& x) { x[6].level = 3; });
+    // A node groups two or more, at deeper levels, and the links agree both ways.
+    refused("leaf 5 (F) has children", [](std::vector<TreeNode>& x) { x[5].children = {0}; });
+    refused("node 8 (n8) has one child", [](std::vector<TreeNode>& x) { x[8].children = {3}; x[4].parentId = -1; });
+    refused("node 9 (n9) has no child", [](std::vector<TreeNode>& x) {
+        TreeNode e; e.id = 9; e.name = "n9"; e.level = 1; e.parentId = -1; e.isLeaf = false; x.push_back(e); });
+    refused("node 8 (n8) has the child 99, which is not in the file", [](std::vector<TreeNode>& x) { x[8].children.push_back(99); });
+    refused("node 8 (n8) has the child 3 (D) twice", [](std::vector<TreeNode>& x) { x[8].children = {3, 4, 3}; });
+    refused("node 8 (n8) has the child 5 (F), whose parent is not given", [](std::vector<TreeNode>& x) { x[8].children.push_back(5); });
+    refused("node 8 (n8) has the child 2 (C), whose parent is 7", [](std::vector<TreeNode>& x) { x[8].children.push_back(2); });
+    refused("node 5 (F) names 8 (n8) as its parent and is not among its children", [](std::vector<TreeNode>& x) { x[5].parentId = 8; });
+    refused("node 5 (F) has the leaf 4 (E) as its parent", [](std::vector<TreeNode>& x) { x[5].parentId = 4; });
+    refused("node 7 (n7), at level 0, has the child 6 (n6) at level 0", [](std::vector<TreeNode>& x) { x[6].level = 0; });
+    refused("node 7 (n7), at level 2, has the child 6 (n6) at level 2", [](std::vector<TreeNode>& x) { x[7].level = 2; });
+    refused("node 7 (n7), at level 2, has the child 6 (n6) at level 1", [](std::vector<TreeNode>& x) { x[7].level = 2; x[6].level = 1; });
+    std::cerr << "PASSED: Test treeFileDefect\n";
+}
+
+// loadTreeFile: what cannot be read as a tree is said, with its line where it is
+// one line, and what can comes back in the layout of a tree the tool built,
+// whatever the order of the rows, the line endings and the number of columns
+// after the fifth, and whatever the file says of paths and node names.
+void testLoadTreeFile() {
+    std::cerr << "START: Test loadTreeFile... \t";
+    const std::vector<std::string> refs = {"d/A.fa", "d/B.fa", "e/C.fna.gz", "d/D.fa"};
+    const char* tf = "tree_file_test.tsv";
+    const std::string header = "node_id\tname\tlevel\tparent_id\tis_leaf\tchildren\tfile_path\n";
+    auto load = [&](const std::string& text, std::vector<TreeNode>& out) {
+        { std::ofstream o(tf); o << text; }
+        return loadTreeFile(tf, refs, 2, out);
+    };
+    std::vector<TreeNode> out;
+    std::remove(tf);
+    assert(loadTreeFile(tf, refs, 2, out).find("cannot be read") != std::string::npos);
+    assert(loadTreeFile(".", refs, 2, out).find("cannot be read") != std::string::npos);      // a directory
+    assert(load("", out).find("cannot be read, or is empty") != std::string::npos);
+    const std::string rows =
+        "9\tcluster_L0_C\t0\t-1\tno\t7,3\t/old/C.fa\n"          // rows in no order, ids with a gap
+        "3\tD\t2\t9\tyes\t\t/old/D.fa\n"
+        "0\tA\t2\t7\tyes\t\t/old/A.fa\n"
+        "7\tsome name\t1\t9\tno\t1,0\t\n"
+        "2\tC\t2\t-1\tyes\t\t\n"
+        "\n"
+        "1\tB\t2\t7\tyes\t\t/old/B.fa\n";
+    assert(load(rows, out).find("not the header") != std::string::npos);           // the first node would be lost
+    assert(load(header + rows + "4\tE\t2\n", out).find("line 9: 3 tab-separated column(s)") != std::string::npos);
+    assert(load(header + rows + "3\tD\t2\t9\tyes\t\t\n", out).find("appears twice") != std::string::npos);   // treeDefect
+    assert(load(header + rows + "4\tE\t2\t-1\tyes\t\t\n", out).find("5 leaves, the list has 4") != std::string::npos);
+    assert(out.empty());                                                           // nothing comes back from a refusal
+    assert(load(header + rows, out).empty());
+    assert(out.size() == 6);
+    for (unsigned i = 0; i < 4; i++) {                                             // the leaves, in list order, with the list's paths
+        assert(out[i].isLeaf && out[i].id == i && out[i].level == 2 && out[i].children.empty());
+        assert(out[i].filePath == refs[i] && out[i].name == getBaseId(refs[i]));
+    }
+    assert(out[0].parentId == 7 && out[1].parentId == 7 && out[2].parentId == -1 && out[3].parentId == 9);
+    assert(!out[4].isLeaf && out[4].id == 7 && out[4].level == 1 && out[4].parentId == 9);
+    assert(out[4].children == std::vector<unsigned>({1, 0}));                      // in the order given
+    assert(!out[5].isLeaf && out[5].id == 9 && out[5].level == 0 && out[5].parentId == -1);
+    assert(out[5].children == std::vector<unsigned>({7, 3}));
+    for (unsigned i = 4; i < 6; i++) assert(out[i].name.empty() && out[i].filePath.empty());   // not read
+    assert(treeDefect(out).empty() && treeLevelPartition(out).size() == 2);
+    // The same tree from CRLF line endings, with the path column, without it and
+    // without the children column of the leaves: a carriage return is part of the
+    // line ending whichever column it follows.
+    auto sameTree = [&](const std::string& text) {
+        std::vector<TreeNode> other;
+        if (!load(text, other).empty() || other.size() != out.size()) return false;
+        for (size_t i = 0; i < out.size(); i++)
+            if (other[i].id != out[i].id || other[i].name != out[i].name || other[i].filePath != out[i].filePath ||
+                other[i].level != out[i].level || other[i].parentId != out[i].parentId ||
+                other[i].children != out[i].children || other[i].isLeaf != out[i].isLeaf) return false;
+        return true;
+    };
+    auto crlf = [](std::string text) {
+        for (size_t p = 0; (p = text.find('\n', p)) != std::string::npos; p += 2) text.insert(p, "\r");
+        return text;
+    };
+    const std::string fewer =
+        "9\tx\t0\t-1\tno\t7,3\n" "3\tD\t2\t9\tyes\n" "0\tA\t2\t7\tyes\t\n" "7\tx\t1\t9\tno\t1,0\n"
+        "2\tC\t2\t-1\tyes\t-\n" "1\tB\t2\t7\tyes\n";
+    assert(sameTree(crlf(header + rows)) && sameTree(header + fewer) && sameTree(crlf(header + fewer)));
+    assert(sameTree(crlf(header + rows) + "\r\n"));                               // an empty line at the end
+    // A column that is not what it takes is named with its line; nothing is read as
+    // the number its leading digits make, wrapped into the type, or taken for no.
+    auto refusedAt = [&](const char* what, std::string text) {
+        std::vector<TreeNode> none;
+        const std::string why = load(header + text, none);
+        if (why.find(what) == std::string::npos) std::cerr << "\n  expected `" << what << "', got `" << why << "'\n";
+        return why.find(what) != std::string::npos && none.empty();
+    };
+    auto with = [&](const std::string& was, const std::string& now) {
+        std::string text = rows;
+        const size_t p = text.find(was);
+        assert(p != std::string::npos);
+        return text.replace(p, was.size(), now);
+    };
+    assert(refusedAt("line 3: node_id `3x' is not a plain integer", with("3\tD\t2", "3x\tD\t2")));
+    assert(refusedAt("line 3: node_id `4294967299' is not a plain integer", with("3\tD\t2", "4294967299\tD\t2")));
+    assert(refusedAt("line 3: node_id `-3' is not a plain integer", with("3\tD\t2", "-3\tD\t2")));
+    assert(refusedAt("line 3: node_id ` 3' is not a plain integer", with("3\tD\t2", " 3\tD\t2")));
+    assert(refusedAt("line 3: level `2.0' is not a plain integer", with("3\tD\t2", "3\tD\t2.0")));
+    assert(refusedAt("line 2: level `1e0' is not a plain integer", with("cluster_L0_C\t0", "cluster_L0_C\t1e0")));
+    assert(refusedAt("line 3: parent_id `' is neither a node id nor -1", with("3\tD\t2\t9", "3\tD\t2\t")));
+    assert(refusedAt("line 3: parent_id `-2' is neither a node id nor -1", with("3\tD\t2\t9", "3\tD\t2\t-2")));
+    assert(refusedAt("line 3: is_leaf `Yes' is neither yes nor no", with("3\tD\t2\t9\tyes", "3\tD\t2\t9\tYes")));
+    assert(refusedAt("line 5: is_leaf `0' is neither yes nor no", with("1\t9\tno", "1\t9\t0")));
+    assert(refusedAt("line 5: children `1;0' is not a comma-separated list", with("no\t1,0", "no\t1;0")));
+    assert(refusedAt("line 5: children `1,,0' is not a comma-separated list", with("no\t1,0", "no\t1,,0")));
+    assert(refusedAt("line 5: children `1, 0' is not a comma-separated list", with("no\t1,0", "no\t1, 0")));
+    {
+        std::string blanks = rows;                                                 // blanks where the tabs are
+        for (char& c : blanks) if (c == '\t') c = ' ';
+        assert(refusedAt("line 2: 1 tab-separated column(s)", blanks));
+    }
+    assert(refusedAt("line 4: node_id `node_id' is not a plain integer", with("0\tA\t2", header + "0\tA\t2")));   // the header twice
+    // 2147483647 is the largest id, as a node, as a parent and as a child, and the
+    // next number is refused in each of the three columns.
+    auto numbered = [](const std::string& node, const std::string& parent, const std::string& child) {
+        return "0\tA\t2\t" + parent + "\tyes\n" "1\tB\t2\t2147483647\tyes\n" "2\tC\t2\t-1\tyes\n" "3\tD\t2\t-1\tyes\n" +
+               node + "\tx\t1\t-1\tno\t" + child + ",1\n";
+    };
+    {
+        std::vector<TreeNode> big;
+        assert(load(header + numbered("2147483647", "2147483647", "0"), big).empty() && big.size() == 5);
+        assert(big[4].id == 2147483647u && big[0].parentId == 2147483647 && big[4].children == std::vector<unsigned>({0, 1}));
+    }
+    assert(refusedAt("line 6: node_id `2147483648' is not a plain integer (at most 2147483647)", numbered("2147483648", "2147483647", "0")));
+    assert(refusedAt("line 2: parent_id `2147483648' is neither a node id nor -1", numbered("2147483647", "2147483648", "0")));
+    assert(refusedAt("line 6: children `2147483648,1' is not a comma-separated list", numbered("2147483647", "2147483647", "2147483648")));
+    std::remove(tf);
+    std::cerr << "PASSED: Test loadTreeFile\n";
+}
+
+// The representatives of a tree read from a file are those the merges give the
+// tree they build. First the rule on given counts, then a tree built from seven
+// genomes, written, read back and named again: B is A plus a tail and D is in E,
+// so each pair merges at the finest threshold; C is A with five substitutions and
+// a longer tail, G is D with five, so each joins its pair's node one level up,
+// where C, a leaf, is the largest of {A, B, C} and E, the pair's representative,
+// the largest of {D, E, G}.
+void testTreeFileRepresentatives() {
+    std::cerr << "START: Test treeFileRepresentatives... \t";
+    {
+        std::vector<TreeNode> t;
+        auto leaf = [&](unsigned id, const char* n, int parent) {
+            TreeNode x; x.id = id; x.name = n; x.filePath = std::string("d/") + n + ".fa";
+            x.level = 3; x.parentId = parent; x.isLeaf = true; t.push_back(x);
+        };
+        auto node = [&](unsigned id, unsigned level, int parent, std::vector<unsigned> children) {
+            TreeNode x; x.id = id; x.level = level; x.parentId = parent; x.isLeaf = false;
+            x.children = std::move(children); t.push_back(x);
+        };
+        leaf(0, "A", 5); leaf(1, "B", 5); leaf(2, "C", 6); leaf(3, "D", 7); leaf(4, "E", 7);
+        node(6, 0, -1, {2, 5}); node(5, 2, 6, {1, 0}); node(7, 1, -1, {4, 3});      // node 6 listed before its child 5
+        auto named = [&](std::vector<size_t> counts) {
+            std::vector<TreeNode> x = t;
+            treeFileRepresentatives(x, counts);
+            return x[6].name + " " + x[5].name + " " + x[7].name + " " + x[6].filePath + " " + x[5].filePath;   // nodes 5, 6, 7
+        };
+        assert(named({10, 30, 20, 5, 5}) == "cluster_L2_B cluster_L0_B cluster_L1_E d/B.fa d/B.fa");   // through the child node
+        assert(named({30, 10, 40, 5, 6}) == "cluster_L2_A cluster_L0_C cluster_L1_E d/A.fa d/C.fa");   // a leaf beside it
+        // Equal counts: the first in the order of the children column, not the smaller id.
+        assert(named({30, 30, 30, 7, 7}) == "cluster_L2_B cluster_L0_C cluster_L1_E d/B.fa d/C.fa");
+        // A leaf and a child node's representative of the same size: the first child again.
+        assert(named({30, 10, 30, 5, 5}) == "cluster_L2_A cluster_L0_C cluster_L1_E d/A.fa d/C.fa");
+    }
+
+    const unsigned k = 21;
+    const std::string a = randDNA(1200, 501), d = randDNA(1000, 502);
+    auto substituted = [](std::string s) {
+        for (size_t p : {150, 350, 550, 750, 950}) s[p] = (s[p] == 'A') ? 'C' : 'A';
+        return s;
+    };
+    writeFasta("tf_A.fa", a);
+    writeFasta("tf_B.fa", a + randDNA(300, 503));
+    writeFasta("tf_C.fa", substituted(a) + randDNA(600, 504));
+    writeFasta("tf_D.fa", d);
+    writeFasta("tf_E.fa", d + randDNA(200, 505));
+    writeFasta("tf_G.fa", substituted(d).substr(0, 990));
+    writeFasta("tf_F.fa", randDNA(900, 506));
+    const std::vector<std::string> refs = {"tf_A.fa", "tf_B.fa", "tf_C.fa", "tf_D.fa", "tf_E.fa", "tf_G.fa", "tf_F.fa"};
+    const std::vector<unsigned> thresholds = {5000, 600, 20};
+    const std::vector<TreeNode> built = buildHierarchicalTree(refs, thresholds, k, 1, 16, 100000, "tf_built.tsv");
+    {
+        std::set<std::string> names;
+        for (const TreeNode& n : built) if (!n.isLeaf) names.insert(n.name);
+        assert(names == std::set<std::string>({"cluster_L2_tf_B", "cluster_L2_tf_E", "cluster_L1_tf_C", "cluster_L1_tf_E"}));
+    }
+    auto equal = [](const std::vector<TreeNode>& x, const std::vector<TreeNode>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); i++)
+            if (x[i].id != y[i].id || x[i].name != y[i].name || x[i].filePath != y[i].filePath || x[i].level != y[i].level ||
+                x[i].parentId != y[i].parentId || x[i].children != y[i].children || x[i].isLeaf != y[i].isLeaf) return false;
+        return true;
+    };
+    std::vector<TreeNode> fromFile;
+    assert(loadTreeFile("tf_built.tsv", refs, thresholds.size(), fromFile).empty());
+    assert(!equal(fromFile, built));                       // the nodes have no name yet
+    treeFileRepresentatives(fromFile, k);
+    assert(equal(fromFile, built));
+    // The file of a finished index: nodes renamed after the member the level builds
+    // chose, the leaves' paths those of another machine. The same tree comes back.
+    {
+        std::vector<TreeNode> renamed = built;
+        for (TreeNode& n : renamed) {
+            if (n.isLeaf) { n.filePath = "/elsewhere/" + n.name + ".fasta"; continue; }
+            n.name = "cluster_L" + std::to_string(n.level) + "_tf_A";
+            n.filePath = "tf_A.fa";
+        }
+        writeTreeIndex(renamed, "tf_renamed.tsv");
+        std::vector<TreeNode> again;
+        assert(loadTreeFile("tf_renamed.tsv", refs, thresholds.size(), again).empty());
+        treeFileRepresentatives(again, k);
+        assert(equal(again, built));
+    }
+    for (const std::string& f : refs) std::remove(f.c_str());
+    std::remove("tf_built.tsv"); std::remove("tf_renamed.tsv");
+    std::cerr << "PASSED: Test treeFileRepresentatives\n";
+}
+
+// recordTreeFile adds its line to a build_params.tsv and takes nothing from it:
+// the file is the one writeTreeBuildParams wrote plus that line, and it loads to
+// the same record.
+void testRecordTreeFile() {
+    std::cerr << "START: Test recordTreeFile... \t";
+    const std::string path = treeBuildParamsPath(".");
+    TreeBuildParams p;
+    p.kmerLen = 81; p.sketchnum = 500; p.minMargin = 2; p.strictMargin = true; p.groupSignatures = true;
+    p.thresholds = "10000,1000,100"; p.bloomFilter = bloomFilterName(); p.nodeCarriers = 12; p.centralRepresentative = true;
+    auto contents = [](const std::string& f) { std::ifstream in(f); return std::string((std::istreambuf_iterator<char>(in)), {}); };
+    writeTreeBuildParams(path, p);
+    const std::string plain = contents(path);
+    assert(plain.find("tree_file") == std::string::npos);
+    recordTreeFile(path, "some/dir/tree_index.tsv");
+    assert(contents(path) == plain + "tree_file\tsome/dir/tree_index.tsv\n");
+    const TreeBuildParams q = loadTreeBuildParams(path);
+    assert(q.loaded && q.kmerLen == 81 && q.sketchnum == 500 && q.minMargin == 2 && q.strictMargin && q.groupSignatures);
+    assert(q.thresholds == "10000,1000,100" && q.bloomFilter == bloomFilterName() && q.nodeCarriers == 12 && q.centralRepresentative);
+    std::remove(path.c_str());
+    std::cerr << "PASSED: Test recordTreeFile\n";
+}
+
 int main() {
     testLoadTree();
     testTreeDefect();
@@ -989,6 +1323,11 @@ int main() {
     testBuildHierarchicalTree();
     testSharedSketchHashes();
     testCardinalitySamples();
+    testCountKmerPositions();
+    testTreeFileDefect();
+    testLoadTreeFile();
+    testTreeFileRepresentatives();
+    testRecordTreeFile();
     std::cerr << "TreeSketch: All tests PASSED!\n\n";
     return 0;
 }

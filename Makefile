@@ -53,7 +53,7 @@ e2etest: test/e2etest.cpp
 
 # Rule-stack test of the tree query, through the binaries: runTreeQuery lives in
 # src/querysketch.cpp, where no in-process suite can call it. Generates 16
-# synthetic genomes and their reads, builds a tree index and checks 69 queries
+# synthetic genomes and their reads, builds a tree index and checks 71 queries
 # against test/tree_rules/expected.tsv (a few seconds; needs python3).
 # The two tools are file targets here, so they are rebuilt only when a source is
 # newer than the binary (the uniqsketch and querysketch targets always compile).

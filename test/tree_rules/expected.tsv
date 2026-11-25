@@ -1,7 +1,8 @@
 # Expected verdicts of the tree query's rule-stack test (run_tree_rules.py).
 #
-# One query per line: the index (idx, or a variant of it lacking what an older
-# uniqsketch did not write), the read file(s) under reads/ ('+' joins two files),
+# One query per line: the index (idx, a variant of it lacking what an older
+# uniqsketch did not write, or tree_file, the index rebuilt from its own tree with
+# uniqsketch --tree-file), the read file(s) under reads/ ('+' joins two files),
 # extra querysketch options, the exit status, and the rows of the result table.
 #
 # rows: name:resolution[:members], comma-separated, compared as a set (the table
@@ -85,3 +86,5 @@ V_dup_line_S09	dup_line	S09_B2.fq	-	0	cluster_L1_B2:family:B1|B2	KNOWN: the seco
 V_no_level1_S02	no_level1	S02_X3.fq	-	0	cluster_L0_X3:family:SB|SL|X1|X1s|X2|X3	a level sketch missing: the level is skipped
 V_no_level0_S08	no_level0	S08_A2.fq	-	0	cluster_L1_A2:family:A1|A2	the coarsest level sketch missing: nothing is pruned above, no rejoin needed
 V_no_tree_S12	no_tree	S12_W.fq	-	1	*	no tree_index.tsv: a message and exit 1
+T_tree_file_S02	tree_file	S02_X3.fq	-	0	=S02_X3	the index rebuilt from its own tree_index.tsv (uniqsketch --tree-file) gives the table of the index as built: a family row on carried signatures
+T_tree_file_S22	tree_file	S22_mix.fq	-	0	=S22_mix	the same for four strain rows and their abundances

@@ -117,7 +117,7 @@ cmake --build build --target test
 make test
 ```
 Both run the seven unit suites and the tree query's rule-stack test (`test/tree_rules/`), which builds a
-small synthetic tree index with the freshly built binaries and checks 69 queries against
+small synthetic tree index with the freshly built binaries and checks 71 queries against
 `test/tree_rules/expected.tsv`; that test needs `python3` and takes a few seconds.
 
 ## Quick Start
@@ -297,6 +297,9 @@ A list of files containing file names in each row can be passed with @ prefix.
       --cluster=N       cluster similar references with N unique k-mer threshold [0=off]
       --tree=T1,T2,..   build hierarchical tree index with comma-separated thresholds
                         (k-mer counts as plain integers, e.g. 1000000,300000; the list is required)
+      --tree-file=FILE  take the tree from FILE, in the format of <outdir>/tree_index.tsv, instead of
+                        clustering the references (with --tree, whose thresholds then only name the levels);
+                        a node's name and path in FILE are not read, a node with one child is refused (see below)
       --exact           use exact O(n^2) clustering instead of MinHash (with --cluster)
       --min-margin=N    min Hamming distance of signatures to other references (1=off, 2) [1; 2 with --tree]
       --max-homopolymer=N  drop signatures with a homopolymer run > N bp (0=off) [0]
@@ -443,6 +446,38 @@ quartile/median) to 41 %/83 %, on 1 000 genomes from 38 %/71 % to 60 %/87 %; the
 sampling adds 8 s and the choice 10 s to the 5 493-genome build.
 `--node-representative=largest` restores the old choice (the index then rebuilds
 byte-identical); `build_params.tsv` records it as `node_representative`.
+
+**A tree from a file.** `--tree-file=FILE`, given with `--tree=T1,T2,...`, takes the
+tree from FILE instead of clustering the references, so that another grouping of the
+same references (another linkage, another distance estimate) can be put through the
+same build and queried. The file has the format of `tree_index.tsv`: the header line,
+then one tab-separated row per node with its id, name, level, parent id (`-1` for
+none), `yes` or `no` for a leaf, the ids of its children separated by commas, and a
+path. The numbers are plain integers, a leaf's row may end after its fifth column,
+and a carriage return before the line feed is part of the line ending. Its leaves must
+be the references of the build, each once: leaf *i* is the *i*-th reference of the
+list (from 0) under its name, the file name without directory and extension, at level
+N when `--tree` gives N thresholds. A node above them is at a level below N and has
+two or more children, each at a deeper level and each naming it as its parent. A group
+that is the same at several levels is one node, at the finest of them, so a chain of
+nodes with one child each is refused. A file that does not fit is refused before any
+genome is read or anything is written, with a message that names the file and what in
+it does not fit, and the line where it is one line. The thresholds are not used to
+merge: they name the levels and are recorded as before, and `build_params.tsv` gains a
+line `tree_file` with the path as given. Only the grouping is taken from the file,
+with its node ids and the order of each node's children. A node's name and path in the
+file are not read, so the file cannot say which member stands for a node: that is
+decided as for a tree the tool clusters itself, by the rule of the merges and then by
+the level builds, and the nodes are named accordingly. A leaf's path is not read
+either: its genome is the one in the list. The `tree_index.tsv` of an existing index,
+given back with the same references and options, therefore rebuilds that index byte
+for byte, `build_params.tsv` apart (the 8-phage and 120-genome indexes: 27 and 653
+files). An index built from another tree is another index: its nodes and their
+signatures, the within-group signatures of its leaves and its family rows are not
+those of the default tree, so its query results cannot be compared with the default
+tree's row for row. Build it into an empty directory: the level sketches and the
+within-group sketch that an earlier build left and the new tree does not write stay in
+a used one, and the build's reachability pass counts them.
 
 **Within-group signatures.** A tree build also writes `<outdir>/sketch_group.tsv`,
 a second signature set for the leaves (turn it off with `--no-group-signatures`).

@@ -11,6 +11,7 @@
 #include "UniqSketchUtil.hpp"
 #include "ClusterUtil.hpp"
 #include "TreeSketchUtil.hpp"
+#include "TreeFileUtil.hpp"
 #include "GroupSketchUtil.hpp"
 #include "NodeCarrierUtil.hpp"
 #include "FileUtil.hpp"
@@ -44,6 +45,9 @@ static const char USAGE_MESSAGE[] =
     "      --cluster=N\tcluster similar references with N unique k-mer threshold [0=off]\n"
     "      --tree=T1,T2,..\tbuild hierarchical tree index with comma-separated thresholds\n"
     "\t\t\t(k-mer counts as plain integers, e.g. 1000000,300000; the list is required)\n"
+    "      --tree-file=FILE\ttake the tree from FILE, in the format of <outdir>/tree_index.tsv, instead of\n"
+    "\t\t\tclustering the references (with --tree, whose thresholds then only name the levels);\n"
+    "\t\t\ta node's name and path in FILE are not read, a node with one child is refused (README)\n"
     "      --exact\t\tuse exact O(n^2) clustering instead of MinHash (with --cluster)\n"
     "      --min-margin=N\tmin Hamming distance of signatures to other refs (1=off, 2) [1; 2 with --tree]\n"
     "      --max-homopolymer=N\tdrop signatures with a homopolymer run > N bp (0=off) [0]\n"
@@ -66,7 +70,8 @@ static const char USAGE_MESSAGE[] =
 static const char shortopts[] = "t:k:b:d:s:c:f:o:r:e:";
 
 enum { OPT_HELP = 1, OPT_VERSION, OPT_CLUSTER, OPT_MINMARGIN, OPT_EXACT, OPT_TREE,
-       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP, OPT_DISCARDCAND };
+       OPT_MAXHOMOP, OPT_STRICTMARGIN, OPT_NOGROUPSIGS , OPT_CIRCULAR, OPT_NODECARRIERS, OPT_NODEREP, OPT_DISCARDCAND,
+       OPT_TREEFILE };
 
 // --sensitive / --very-sensitive are getopt flag entries, which store through a
 // pointer at parse time and so cannot target a struct member. They write here and
@@ -92,6 +97,7 @@ static const struct option longopts[] = {
     {"entropy",        required_argument, nullptr, 'e'},
     {"cluster",        required_argument, nullptr, OPT_CLUSTER},
     {"tree",           required_argument, nullptr, OPT_TREE},
+    {"tree-file",      required_argument, nullptr, OPT_TREEFILE},
     {"min-margin",     required_argument, nullptr, OPT_MINMARGIN},
     {"exact",          no_argument,       nullptr, OPT_EXACT},
     {"max-homopolymer",required_argument, nullptr, OPT_MAXHOMOP},
@@ -118,6 +124,8 @@ int main(int argc, char** argv) {
     bool useExactCluster = false;   // --exact: use exact O(n^2) clustering instead of MinHash
     std::vector<unsigned> treeThresholds;  // empty = tree disabled
     std::vector<TreeNode> tree;            // the hierarchy, when --tree is used
+    std::string treeFileArg;               // --tree-file: the hierarchy is read from this file, not clustered
+    bool treeFileGiven = false;
     bool marginGiven = false;       // --min-margin passed explicitly (tree default otherwise)
     bool groupSignatures = true;    // within-group leaf signatures for a tree index (--no-group-signatures)
     int nodeCarriers = -1;          // --node-carriers (-1: min(50, leaves/10) once the leaf count is known)
@@ -162,6 +170,7 @@ int main(int argc, char** argv) {
             std::sort(treeThresholds.begin(), treeThresholds.end(), std::greater<unsigned>());
             break;
         }
+        case OPT_TREEFILE: arg >> treeFileArg; treeFileGiven = true; break;
         case OPT_CIRCULAR: cfg.circular = true; break;
         case OPT_DISCARDCAND: cfg.keepCandidates = false; break;
         case OPT_MAXHOMOP: arg >> cfg.maxHomopolymer; break;
@@ -250,6 +259,25 @@ int main(int argc, char** argv) {
         std::cerr << PROGRAM ": --cluster cannot be combined with --tree (the tree keeps every reference; "
                      "its nodes are the clusters)\n";
         die = true;
+    }
+    // --tree-file replaces the clustering step of a tree build and nothing else.
+    // The thresholds of --tree still say how many levels the index has and are
+    // recorded with it, so the option needs them; a flat or --cluster build has
+    // no tree to read.
+    if (treeFileGiven) {
+        if (treeFileArg.empty()) {
+            std::cerr << PROGRAM ": --tree-file needs the name of a file\n";
+            die = true;
+        }
+        if (treeThresholds.empty()) {
+            std::cerr << PROGRAM ": --tree-file needs --tree=T1,T2,..: one threshold for each level of the tree "
+                         "in the file (they name the levels and are not used to merge)\n";
+            die = true;
+        }
+        if (treeThresholds.empty() && clusterGiven && clusterThreshold > 0) {
+            std::cerr << PROGRAM ": --tree-file cannot be combined with --cluster\n";
+            die = true;
+        }
     }
     // Options that do nothing in this mode were ignored without a word.
     if (treeThresholds.empty())
@@ -352,6 +380,19 @@ int main(int argc, char** argv) {
         if (bad) exit(EXIT_FAILURE);
     }
 
+    // The tree of a --tree-file build, read and checked against the references
+    // before anything is written or any genome is read.
+    if (treeFileGiven) {
+        const std::string problem = loadTreeFile(treeFileArg, refFiles, treeThresholds.size(), tree);
+        if (!problem.empty()) {
+            std::cerr << "Error: --tree-file " << treeFileArg << ": " << problem
+                      << "\n  --tree-file takes a tree in the format of the tree_index.tsv a --tree build writes: "
+                         "its leaves the references of this build, numbered in the order of the list, "
+                         "at level " << treeThresholds.size() << " (one level for each --tree threshold)\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+
     mkdir(cfg.outdir.c_str(), 0777);
 
     // Everything the build writes goes under -f, to -o and to -r, and none of them
@@ -377,17 +418,35 @@ int main(int argc, char** argv) {
     // Optional: build hierarchical tree index with per-level sketches
     if (!treeThresholds.empty()) {
         std::string treeFile = cfg.outdir + "/tree_index.tsv";
-        tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
-                                          cfg.nhash1, cfg.bits,
-                                          estimateMaxGenomeSize(refFiles), treeFile);
+        if (treeFileGiven) {
+            // The grouping is the file's. Which member stands for a node is decided
+            // as the merges decide it, whatever the file names (treeFileRepresentatives
+            // says why), so from here on the build is that of a tree it clustered
+            // itself, and it writes the tree to the index as that build does.
+            treeFileRepresentatives(tree, cfg.kmerLen);
+            writeTreeIndex(tree, treeFile);
+            std::cerr << "Hierarchical tree read from " << treeFileArg << ": " << refFiles.size() << " leaves, "
+                      << tree.size() - refFiles.size() << " internal nodes, " << treeThresholds.size()
+                      << " levels (no reference was clustered; the --tree thresholds name the levels; "
+                         "node names and paths in the file are not read)\n";
+        } else {
+            tree = buildHierarchicalTree(refFiles, treeThresholds, cfg.kmerLen,
+                                              cfg.nhash1, cfg.bits,
+                                              estimateMaxGenomeSize(refFiles), treeFile);
+        }
         // No two references merged at any threshold: the tree is its leaves and the
         // index will have no node level. That is what a list written with thousands
         // separators (1,000,000 is the thresholds 1, 0 and 0) or in another unit
         // builds, and it was said only in passing ("0 internal nodes").
-        if (std::none_of(tree.begin(), tree.end(), [](const TreeNode& n) { return !n.isLeaf; }))
-            std::cerr << PROGRAM ": warning: no two references merged at any --tree threshold (largest: "
-                      << treeThresholds.front() << "); the index has no node level, so no family rows. "
-                         "Thresholds are counts of distinguishing k-mers between genomes\n";
+        if (std::none_of(tree.begin(), tree.end(), [](const TreeNode& n) { return !n.isLeaf; })) {
+            if (treeFileGiven)
+                std::cerr << PROGRAM ": warning: the tree in " << treeFileArg << " has no node above its leaves; "
+                             "the index has no node level, so no family rows\n";
+            else
+                std::cerr << PROGRAM ": warning: no two references merged at any --tree threshold (largest: "
+                          << treeThresholds.front() << "); the index has no node level, so no family rows. "
+                             "Thresholds are counts of distinguishing k-mers between genomes\n";
+        }
 
         // Every level's sketch is built over the complete partition of the leaves
         // at that level (see treeLevelPartition), so its signatures are unique
@@ -456,6 +515,7 @@ int main(int argc, char** argv) {
             bp.thresholds += std::to_string(treeThresholds[i]);
         }
         writeTreeBuildParams(treeBuildParamsPath(cfg.outdir), bp);
+        if (treeFileGiven) recordTreeFile(treeBuildParamsPath(cfg.outdir), treeFileArg);
 
         // The main sketch is built from the leaf references (full-resolution level)
         std::unordered_set<std::string> uniqueRefs;
