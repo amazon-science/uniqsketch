@@ -30,6 +30,7 @@
 /test/tree_C.fa
 /test/tree_out.tsv
 /test/tree_test_index.tsv
+/test/cmp_*
 
 # Editor / OS cruft
 .DS_Store

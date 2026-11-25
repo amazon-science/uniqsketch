@@ -238,6 +238,41 @@ together:
 * `log_out_sample.tsv`: detailed log showing for each reference the total number of assigned reads and all `signature:count` pairs.
 * `logread_out_sample.tsv`: read-level log listing all matched read IDs per reference.
 
+### comparesketch
+* `reference_similarity.tsv`: one row for every pair of a LIST2 genome and a LIST1 genome.
+  For each LIST1 genome `comparesketch` puts the genome's k-mers into a Bloom filter and
+  counts, for each LIST2 genome, the k-mer positions it does not find there.
+
+| column | content |
+|---|---|
+| `ref1` | the LIST2 genome: the one whose k-mers are counted |
+| `ref2` | the LIST1 genome: the one whose Bloom filter they are looked up in |
+| `uniq_ref1` | k-mer positions of `ref1` whose k-mer is not found in `ref2` |
+| `all_ref1` | k-mer positions of `ref1` |
+| `similarity` | (`all_ref1` − `uniq_ref1`) / `all_ref1`: the share of `ref1` found in `ref2` |
+
+Reading this table:
+
+* The header numbers the two genomes of a row, not the two lists: `ref1` is the genome
+  from LIST2. With one list given twice every pair is there in both directions; with two
+  different lists the first column holds the names of LIST2.
+* A row is one direction. The row of A in B counts the positions of A whose k-mer B
+  lacks and the row of B in A those of B whose k-mer A lacks: two numbers, and two
+  values of `similarity`. Among 120 complete *E. coli* genomes no pair has the same
+  count in both directions, and one has 0 in one and 189 926 in the other.
+* The counts are k-mer positions, not distinct k-mers: a k-mer that occurs three times in
+  `ref1` is three positions of `all_ref1` and, when `ref2` lacks it, three of `uniq_ref1`.
+  A window that holds a character other than A, C, G or T (in either case) is skipped,
+  k-mers do not span FASTA records, and a k-mer and its reverse complement are one k-mer.
+* `uniq_ref1` is never too high, and it is too low by the filter's false-positive rate: a
+  Bloom filter finds every k-mer it holds and takes a share of the others for present.
+  Every LIST1 genome gets a filter of the same size (`-b` bits for each of `-g` elements,
+  `-d` hash functions), so the rate grows with the genome. At the defaults, on 120 × 120
+  complete *E. coli* genomes, the counts are 0.55 % low in total, from 0.39 % where the
+  LIST1 genome has 4.5 M distinct k-mers to 0.71 % where it has 5.6 M, and `similarity`
+  is up to 0.006 too high. `-g`, `--auto-gsize` and `--auto` set the number of elements,
+  `-b` and `--fpr` the bits for each; more of either lowers the rate.
+
 ## Usage
 
 ### uniqsketch
@@ -751,6 +786,15 @@ Usage: comparesketch [OPTION] LIST1 LIST2
 Compare two sets of fasta reference files |LIST1|*|LIST2|.
 Two lists of files containing file paths in each row.
 
+ Output: one row per pair of a LIST2 genome and a LIST1 genome, tab-separated:
+  ref1          the LIST2 genome, whose k-mers are counted
+  ref2          the LIST1 genome, whose Bloom filter they are looked up in
+  uniq_ref1     k-mer positions of ref1 not found in ref2 (a repeated k-mer counts
+                at each of its positions); never too high, and too low by the filter's
+                false-positive rate (0.55% on 120 x 120 E. coli at the defaults)
+  all_ref1      k-mer positions of ref1
+  similarity    (all_ref1 - uniq_ref1) / all_ref1
+
  Options:
 
   -t, --threads=N       use N parallel threads [1]
@@ -768,13 +812,21 @@ Two lists of files containing file paths in each row.
       --version         output version information and exit
 ```
 
-For large reference sets (e.g. thousands of multi-megabase genomes), caching every
-reference's k-mer hashes in memory can require more RAM than is available. The
-`-m, --mem=N` budget (GB, default 64) bounds this: `comparesketch` caches as many
-second-list references as fit within the budget and streams the rest, re-reading
-them per first-list reference. `--mem 0` (equivalently `--low-mem`) streams fully,
-holding only one Bloom filter and one reference per thread at a time — minimal
-memory, more I/O. The similarity output is identical regardless of the budget.
+The columns are described under [Output](#comparesketch).
+
+The k-mers of the LIST2 genomes are held in memory, 8 bytes per k-mer position (one
+hash value; the filter derives a k-mer's other hash values from it), and each thread
+holds one Bloom filter (10 MB at the defaults) and, while it loads a LIST2 genome, that
+genome's sequence and a second array of its hash values for the sort: about 0.08 GB a
+thread for *E. coli* (120 × 120 at `-m 1`: 1.02 GB at one thread, 1.62 GB at eight). The
+`-m, --mem=N` budget (GB, default 64) bounds the first: LIST2 is taken in batches of as
+many genomes as fit the budget, each genome counted as 8 bytes per byte of the largest
+LIST2 file, and LIST1 is read once per batch. The default takes 1 717 genomes of
+5 000 000 bytes in one batch. `--mem 0` (equivalently `--low-mem`) takes one LIST2 genome
+at a time: minimal memory, and LIST1 is read once for every LIST2 genome. The counts are
+the same whatever the budget and the thread count. The rows are written as they are
+computed, batch after batch and, with more than one thread, in the order the threads
+finish, so two runs of one command can order them differently.
 
 ## Choosing parameters
 

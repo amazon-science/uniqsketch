@@ -171,6 +171,48 @@ public:
     }
 
     /**
+     * How many of n k-mers the filter does not hold, each k-mer given by its
+     * leading hash; the blocked filter's countAbsent() for this layout. The other
+     * hash values are derived from the leading one as ntHashIterator derives
+     * them (NTE64), each only when the bits before it are set.
+     *
+     * The exit on the first unset bit stays here: a k-mer's bits are anywhere in
+     * the filter, a line of memory and a 64-bit modulo each, and an absent k-mer
+     * mostly ends at its first. comparesketch leaves the k-mers in genome order
+     * for this layout: ascending leading hashes are no order of this filter.
+     * For the k-mers of a 5 Mb E. coli genome in the filter of another (16 bits
+     * for each of 5 000 000 elements, three hashes, one thread): 37.2 ms in
+     * genome order, where contains() on all three values of every k-mer stored,
+     * as comparesketch kept them before, took 36.6 ms, and 62.4 ms with the
+     * leading hashes ascending.
+     *
+     * Three hashes are passed as a constant, as in the blocked filter: 37.2 ms
+     * against 42.6 ms (g++ 7.3.1; 37 to 38 ms against 45 ms with GCC 10.5).
+     * Other numbers take the general loop, which costs more than the stored
+     * values did: 71 ms against 56 ms with five hashes.
+     *
+     * @param h0  Leading hash values of the k-mers.
+     * @param n  Number of k-mers.
+     * @return Number of k-mers for which contains() is false.
+     */
+    size_t countAbsent(const uint64_t* h0, size_t n) const {
+        const auto count = [&](const unsigned hashNum) {
+            size_t absent = 0;
+            for (size_t x = 0; x < n; x++) {
+                for (unsigned i = 0; i < hashNum; i++) {
+                    const size_t hLoc = (i == 0 ? h0[x] : NTE64(h0[x], m_kmerSize, i)) % m_size;
+                    if ((m_filter[hLoc / CHAR_BIT] & (1 << (CHAR_BIT - 1 - hLoc % CHAR_BIT))) == 0) {
+                        ++absent;
+                        break;
+                    }
+                }
+            }
+            return absent;
+        };
+        return m_hashNum == 3 ? count(3) : count(m_hashNum);
+    }
+
+    /**
      * Store the Bloom filter to a binary file.
      *
      * @param fPath  Output file path.

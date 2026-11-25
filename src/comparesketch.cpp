@@ -23,6 +23,15 @@ static const char USAGE_MESSAGE[] =
     "Compare two sets of fasta reference files |LIST1|*|LIST2|.\n"
     "Two lists of files containing file paths in each row.\n"
     "\n"
+    " Output: one row per pair of a LIST2 genome and a LIST1 genome, tab-separated:\n"
+    "  ref1\t\tthe LIST2 genome, whose k-mers are counted\n"
+    "  ref2\t\tthe LIST1 genome, whose Bloom filter they are looked up in\n"
+    "  uniq_ref1\tk-mer positions of ref1 not found in ref2 (a repeated k-mer counts\n"
+    "\t\tat each of its positions); never too high, and too low by the filter's\n"
+    "\t\tfalse-positive rate (0.55% on 120 x 120 E. coli at the defaults)\n"
+    "  all_ref1\tk-mer positions of ref1\n"
+    "  similarity\t(all_ref1 - uniq_ref1) / all_ref1\n"
+    "\n"
     " Options:\n"
     "\n"
     "  -t, --threads=N\tuse N parallel threads [1]\n"
@@ -110,6 +119,15 @@ int main(int argc, char** argv) {
     }
     if (cfg.outfile.empty()) {
         std::cerr << PROGRAM ": missing outfile argument\n";
+        die = true;
+    }
+    // No hash function is no filter: every k-mer counts as found, so every row
+    // would say similarity 1, after ntHashIterator has written one hash value
+    // into an array of none (AddressSanitizer: heap-buffer-overflow). While all
+    // hash values of a position were kept, -d 0 ended on a division by zero
+    // (exit status 136, an empty file).
+    if (cfg.nhash < 1) {
+        std::cerr << PROGRAM ": -d must be at least 1\n";
         die = true;
     }
     if (die) {
