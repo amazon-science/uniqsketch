@@ -33,6 +33,24 @@ struct CompareSketchConfig {
 };
 
 /**
+ * Option values no comparison can use. Returns an empty string, or what is wrong.
+ *
+ * -k 0 and -b 0 were taken as given and wrote a table with exit status 0. With
+ * -k 0 a sequence counts one position more than it has bases and every one is
+ * found, so every row says similarity 1. With -b 0 the filter is asked for no
+ * bit: the blocked filter is then its smallest size, 16 KB, in which unrelated
+ * phages come out at similarity 0.94, and the standard filter divides by zero
+ * (exit status 136). -d 0 is no filter at all: every k-mer counts as found,
+ * after ntHashIterator has written one hash value into an array of none
+ * (AddressSanitizer: heap-buffer-overflow); while all hash values of a position
+ * were kept it ended on a division by zero (exit status 136, an empty file).
+ */
+std::string unusableOptions(const CompareSketchConfig& cfg) {
+    if (cfg.kmerLen < 1 || cfg.bits < 1 || cfg.nhash < 1) return "-k, -b and -d must be at least 1";
+    return std::string();
+}
+
+/**
  * Load all k-mer hashes from a FASTA/FASTA.gz reference into a vector.
  * Each entry stores nhash hash values for one k-mer.
  *

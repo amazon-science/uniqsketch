@@ -92,6 +92,25 @@ void testCheckBloomFilterDifferent(const CompareSketchConfig& cfg) {
     std::cerr << "PASSED: Test checkBloomFilter (different)\n";
 }
 
+// unusableOptions names a k-mer length, a number of bits or a hash number of 0,
+// which main() then refuses with exit status 1, and nothing else: the defaults
+// and the smallest values a comparison can run with are accepted.
+void testUnusableOptions() {
+    std::cerr << "START: Test unusable option values are named... \t";
+    CompareSketchConfig cfg;
+    assert(unusableOptions(cfg).empty());
+    cfg.kmerLen = 1;
+    cfg.bits = 1;
+    cfg.nhash = 1;
+    assert(unusableOptions(cfg).empty());
+    for (unsigned which = 0; which < 3; which++) {
+        CompareSketchConfig zero;
+        (which == 0 ? zero.kmerLen : which == 1 ? zero.bits : zero.nhash) = 0;
+        assert(unusableOptions(zero) == "-k, -b and -d must be at least 1");
+    }
+    std::cerr << "PASSED: Test unusable option values are named\n";
+}
+
 // Deterministic sequence generator for the tests below.
 static uint64_t rngState = 0x9E3779B97F4A7C15ull;
 static uint64_t rnd() {
@@ -469,6 +488,7 @@ int main() {
     testLoadBloomFilter(cfg);
     testCheckBloomFilterIdentical(cfg);
     testCheckBloomFilterDifferent(cfg);
+    testUnusableOptions();
     testDerivedHashes();
     testSortHashes();
     testBatchSize();

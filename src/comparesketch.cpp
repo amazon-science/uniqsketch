@@ -122,13 +122,10 @@ int main(int argc, char** argv) {
         std::cerr << PROGRAM ": missing outfile argument\n";
         die = true;
     }
-    // No hash function is no filter: every k-mer counts as found, so every row
-    // would say similarity 1, after ntHashIterator has written one hash value
-    // into an array of none (AddressSanitizer: heap-buffer-overflow). While all
-    // hash values of a position were kept, -d 0 ended on a division by zero
-    // (exit status 136, an empty file).
-    if (cfg.nhash < 1) {
-        std::cerr << PROGRAM ": -d must be at least 1\n";
+    // Values no comparison can use (unusableOptions, CompareSketchUtil.hpp).
+    const std::string unusable = unusableOptions(cfg);
+    if (!unusable.empty()) {
+        std::cerr << PROGRAM ": " << unusable << "\n";
         die = true;
     }
     if (die) {
