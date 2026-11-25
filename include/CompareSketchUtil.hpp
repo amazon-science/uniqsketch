@@ -207,6 +207,15 @@ void insertReference(const std::string& fPath, BloomFilter& dbFilter) {
 }
 
 /**
+ * The similarity column: the fraction of countAll k-mers that were found, 0 for a
+ * reference without k-mers.
+ */
+double similarityRate(size_t countAll, size_t countUnique) {
+    if (countAll == 0) return 0.0;
+    return static_cast<double>(countAll - countUnique) / countAll;
+}
+
+/**
  * Check a reference's k-mers, given by their leading hashes (loadLeadingHashes
  * with the filter's k-mer size, in any order), against a Bloom filter. The numbers
  * are those of checkBloomFilterFromHashes on the same reference.
@@ -221,8 +230,7 @@ double checkBloomFilterFromLeading(const std::vector<uint64_t>& leading, const B
                                    size_t& countAll, size_t& countUnique) {
     countAll = leading.size();
     countUnique = dbFilter.countAbsent(leading.data(), leading.size());
-    if (countAll == 0) return 0.0;
-    return static_cast<double>(countAll - countUnique) / countAll;
+    return similarityRate(countAll, countUnique);
 }
 
 /**
@@ -255,8 +263,21 @@ size_t refSet2BatchSize(size_t memBudgetGB, size_t largestGenome, size_t genomes
  *     file is read once (M+N reads: fastest, highest memory);
  *   - cfg.memBudgetGB == 0 (or a genome bigger than the budget) -> batch size 1,
  *     i.e. one refSet2 genome cached at a time -> M x N reads (lowest memory).
- * The --low-mem flag is simply an alias for memBudgetGB == 0. Similarity values
- * are identical for any budget; only the memory/I/O profile changes.
+ * The --low-mem flag is simply an alias for memBudgetGB == 0. The table is the
+ * same file for any budget and any number of threads; only the memory/I/O
+ * profile changes.
+ *
+ * Rows are written in list order, refSet1 outer and refSet2 inner, which is the
+ * order one thread and one batch always gave. They used to be written as they
+ * were computed: batch after batch, so the budget decided the order, and within
+ * a batch as the threads finished, so two runs of one command on several
+ * threads could give two files. A refSet1 genome's counts are now kept until the
+ * genomes before it are written. With one batch that is a few genomes' rows at
+ * a time; with several batches a genome is complete only in the last one, and
+ * the counts of every pair are held until then, 8 bytes each (0.24 GB for
+ * 5 493 x 5 493), beside the budget. No row is written before the last batch,
+ * so a run with several batches that is stopped earlier leaves an empty file,
+ * where it used to leave the rows of the batches done.
  *
  * What is cached of a refSet2 genome is the leading hash of each k-mer position
  * (loadLeadingHashes), 8 bytes a position, and a genome is checked with one call
@@ -315,10 +336,18 @@ void identifyDifference(const CompareSketchConfig& cfg, const std::vector<std::s
     // order to offer and keeps the file's.
     const bool sorted = BloomFilter::kPartitioned && refSet1.size() >= 2;
 
+    // The k-mer positions of every refSet2 genome and, for each refSet1 genome whose
+    // rows are not written yet, the positions of every refSet2 genome not found in it.
+    std::vector<size_t> countAll(refSet2.size(), 0);
+    std::vector<std::vector<size_t>> countUnique(refSet1.size());
+    std::vector<char> complete(refSet1.size(), 0);
+    size_t nextRow = 0;     // the first refSet1 genome whose rows are not written
+
     // Process refSet2 in batches that fit the budget; stream refSet1 within each.
     for (size_t bStart = 0; bStart < refSet2.size(); bStart += batchSize) {
         size_t bEnd = std::min(bStart + batchSize, refSet2.size());
         size_t bCount = bEnd - bStart;
+        const bool lastBatch = bEnd == refSet2.size();
 
         std::vector<std::vector<uint64_t>> batchHashes(bCount);
         #pragma omp parallel
@@ -330,6 +359,7 @@ void identifyDifference(const CompareSketchConfig& cfg, const std::vector<std::s
                 if (sorted) sortHashes(batchHashes[b], scratch);
             }
         }
+        for (size_t b = 0; b < bCount; b++) countAll[bStart + b] = batchHashes[b].size();
 
         #pragma omp parallel
         {
@@ -342,14 +372,29 @@ void identifyDifference(const CompareSketchConfig& cfg, const std::vector<std::s
                 std::memset(filterPtr, 0, filterBytes);
                 insertReference(refSet1[i], dbFilter);
 
+                // One thread at a time has genome i, in every batch.
+                std::vector<size_t>& unique = countUnique[i];
+                if (unique.empty()) unique.resize(refSet2.size());
                 for (size_t b = 0; b < bCount; b++) {
-                    size_t countAll = 0, countUnique = 0;
-                    double score = checkBloomFilterFromLeading(
-                        batchHashes[b], dbFilter, countAll, countUnique);
-                    #pragma omp critical(simout)
-                    simOut << names2[bStart + b] << "\t" << names1[i]
-                           << "\t" << countUnique << "\t" << countAll
-                           << "\t" << score << "\n";
+                    size_t all = 0;     // the genome's positions, in countAll since its batch was loaded
+                    checkBloomFilterFromLeading(batchHashes[b], dbFilter, all, unique[bStart + b]);
+                }
+                if (!lastBatch) continue;
+
+                // Genome i is complete: write every complete genome from the first
+                // unwritten one on, and stop at the first that is still running.
+                #pragma omp critical(simout)
+                {
+                    complete[i] = 1;
+                    for (; nextRow < refSet1.size() && complete[nextRow]; ++nextRow) {
+                        std::vector<size_t>& done = countUnique[nextRow];
+                        for (size_t j = 0; j < refSet2.size(); j++) {
+                            simOut << names2[j] << "\t" << names1[nextRow]
+                                   << "\t" << done[j] << "\t" << countAll[j]
+                                   << "\t" << similarityRate(countAll[j], done[j]) << "\n";
+                        }
+                        std::vector<size_t>().swap(done);
+                    }
                 }
             }
         }

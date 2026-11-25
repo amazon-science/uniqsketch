@@ -241,7 +241,8 @@ together:
 ### comparesketch
 * `reference_similarity.tsv`: one row for every pair of a LIST2 genome and a LIST1 genome.
   For each LIST1 genome `comparesketch` puts the genome's k-mers into a Bloom filter and
-  counts, for each LIST2 genome, the k-mer positions it does not find there.
+  counts, for each LIST2 genome, the k-mer positions it does not find there. The rows are
+  in list order: the LIST1 genomes in their order and, for each, the LIST2 genomes in theirs.
 
 | column | content |
 |---|---|
@@ -786,7 +787,8 @@ Usage: comparesketch [OPTION] LIST1 LIST2
 Compare two sets of fasta reference files |LIST1|*|LIST2|.
 Two lists of files containing file paths in each row.
 
- Output: one row per pair of a LIST2 genome and a LIST1 genome, tab-separated:
+ Output: one row per pair of a LIST2 genome and a LIST1 genome, tab-separated,
+ in list order (the LIST1 genomes in their order and, for each, LIST2 in its order):
   ref1          the LIST2 genome, whose k-mers are counted
   ref2          the LIST1 genome, whose Bloom filter they are looked up in
   uniq_ref1     k-mer positions of ref1 not found in ref2 (a repeated k-mer counts
@@ -823,10 +825,16 @@ thread for *E. coli* (120 × 120 at `-m 1`: 1.02 GB at one thread, 1.62 GB at ei
 many genomes as fit the budget, each genome counted as 8 bytes per byte of the largest
 LIST2 file, and LIST1 is read once per batch. The default takes 1 717 genomes of
 5 000 000 bytes in one batch. `--mem 0` (equivalently `--low-mem`) takes one LIST2 genome
-at a time: minimal memory, and LIST1 is read once for every LIST2 genome. The counts are
-the same whatever the budget and the thread count. The rows are written as they are
-computed, batch after batch and, with more than one thread, in the order the threads
-finish, so two runs of one command can order them differently.
+at a time: minimal memory, and LIST1 is read once for every LIST2 genome.
+
+The table is the same file whatever the budget and the thread count. Its rows are in
+list order: the LIST1 genomes in their order and, for each, the LIST2 genomes in
+theirs. With one batch the rows of a LIST1 genome are written as soon as those of the
+genomes before it are, so the file grows as the run goes; with several batches a
+genome is complete only in the last one, the counts are kept until then (8 bytes per
+pair, 0.24 GB for 5 493 × 5 493, beside the budget) and the rows are written during
+the last batch. A run with several batches that is stopped before the last one
+therefore leaves an empty file.
 
 ## Choosing parameters
 

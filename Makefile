@@ -35,8 +35,9 @@ querysketchtest: test/querysketchtest.cpp
 bloomfiltertest: test/bloomfiltertest.cpp
 	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -pthread -o test/$@ $^
 
+# Checks the row order of identifyDifference on several threads, so it needs OpenMP.
 comparesketchtest: test/comparesketchtest.cpp
-	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -o test/$@ $^ $(LIBPATH)
+	$(CXX) $(INCLUDEPATH) $(CPPFLAGS) -fopenmp -o test/$@ $^ $(LIBPATH)
 
 # Builds a within-group sketch in-process (parallel job lists), so it needs OpenMP.
 treesketchtest: test/treesketchtest.cpp

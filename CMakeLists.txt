@@ -56,8 +56,13 @@ add_executable(bloomfiltertest test/bloomfiltertest.cpp)
 # The concurrency test for insert_make_change uses std::thread
 target_link_libraries(bloomfiltertest PRIVATE Threads::Threads)
 
+# Checks the row order of identifyDifference on several threads, so it needs
+# OpenMP to exercise them.
 add_executable(comparesketchtest test/comparesketchtest.cpp)
 target_link_libraries(comparesketchtest PRIVATE ZLIB::ZLIB)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(comparesketchtest PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # Builds a within-group sketch in-process (parallel job lists), so it needs OpenMP.
 add_executable(treesketchtest test/treesketchtest.cpp)

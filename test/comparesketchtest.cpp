@@ -17,6 +17,10 @@
 #include "CompareSketchUtil.hpp"
 #include "BlockedBloomFilter.hpp"   // explicit, so both layouts are tested under -DUNIQSKETCH_STANDARD_BF too
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 // Test that loadBloomFilter populates the filter so known k-mers are found
 void testLoadBloomFilter(const CompareSketchConfig& cfg) {
     std::cerr << "START: Test loadBloomFilter... \t";
@@ -333,11 +337,11 @@ static std::vector<std::string> runIdentifyDifference(const CompareSketchConfig&
 // this suite is built with: the filter of a reference bit for bit, the three
 // numbers of every pair, and the table, at the default sizing, with thin filters
 // (false positives in most rows) and with other numbers of hash functions and
-// other k. A budget of 0 takes refSet2 one genome a batch; the rows are the same.
-// refSet2 names a reference twice and one that holds no k-mer. With one refSet1
-// genome identifyDifference leaves the leading hashes in file order, with four
-// and with nine it sorts them (the blocked filter); the settings take the three
-// in turn.
+// other k. A budget of 0 takes refSet2 one genome a batch; the table is the same
+// file. refSet2 names a reference twice and one that holds no k-mer. With one
+// refSet1 genome identifyDifference leaves the leading hashes in file order, with
+// four and with nine it sorts them (the blocked filter); the settings take the
+// three in turn.
 void testComparisonPath() {
     std::cerr << "START: Test the comparison gives the numbers of loadBloomFilter and checkBloomFilter... \t";
     const std::vector<std::string> four = {cmpRefs[0], cmpRefs[1], cmpRefs[2], cmpRefs[4]};
@@ -376,7 +380,7 @@ void testComparisonPath() {
                 assert(allNow == allBefore && uniqueNow == uniqueBefore);
             }
         }
-        std::vector<std::string> expect = expectedRows(cfg, refSet1, refSet2);
+        const std::vector<std::string> expect = expectedRows(cfg, refSet1, refSet2);
         // Thin filters: a row that is neither "nothing found" nor "all found".
         for (const std::string& row : expect) {
             std::istringstream fields(row);
@@ -385,15 +389,13 @@ void testComparisonPath() {
             fields >> name2 >> name1 >> countUnique >> countAll;
             if (countUnique > 0 && countUnique < countAll) ++lowRows;
         }
-        std::sort(expect.begin(), expect.end());
         for (size_t budget : {64u, 0u}) {
             cfg.memBudgetGB = budget;
             std::string log;
-            std::vector<std::string> lines = runIdentifyDifference(cfg, refSet1, refSet2, log);
+            const std::vector<std::string> lines = runIdentifyDifference(cfg, refSet1, refSet2, log);
             assert(log.find(budget ? "refSet2 batch=6/6" : "refSet2 batch=1/6") != std::string::npos);
             assert(lines.size() == 1 + expect.size());
             assert(lines[0] == "ref1\tref2\tuniq_ref1\tall_ref1\tsimilarity");
-            std::sort(lines.begin() + 1, lines.end());
             assert(std::equal(expect.begin(), expect.end(), lines.begin() + 1));
         }
     }
@@ -402,7 +404,62 @@ void testComparisonPath() {
     std::cerr << "PASSED: Test the comparison gives the numbers of loadBloomFilter and checkBloomFilter\n";
 }
 
+// The table is in list order, refSet1 outer and refSet2 inner, whatever the number
+// of threads and the budget. Before, the rows were written as they were computed:
+// with one refSet2 genome a batch (a budget of 0) refSet2 became the outer loop,
+// and with several threads a refSet1 genome's rows came when its thread finished.
+// The first refSet1 genome here has 300 000 bases and the ones after it 6 to
+// 48 000, so that with several threads they are complete, and have to wait, while
+// it is still being read. Either of the old orders fails this test, the first of
+// them on one thread.
+void testRowOrder() {
+    std::cerr << "START: Test rows are in list order on any thread count and budget... \t";
+    const std::string big = "cmp_big.fa";
+    { std::ofstream o(big); o << ">big\n" << dna(300000) << "\n"; }
+    const std::vector<std::string> refSet1 = {big, cmpRefs[3], cmpRefs[2], cmpRefs[4], cmpRefs[3], cmpRefs[2], cmpRefs[3], cmpRefs[1]};
+    const std::vector<std::string> refSet2 = {cmpRefs[1], cmpRefs[3], cmpRefs[4], cmpRefs[2], cmpRefs[0]};
+    CompareSketchConfig cfg;
+    cfg.bits = 8;
+    cfg.dbfSize = 300000;
+    cfg.kmerLen = 31;
+    cfg.outfile = "cmp_order.tsv";
+    const std::vector<std::string> expect = expectedRows(cfg, refSet1, refSet2);
+    assert(expect.size() == refSet1.size() * refSet2.size());
+#ifdef _OPENMP
+    const int savedThreads = omp_get_max_threads();
+    const std::vector<int> threadCounts = {1, 4, 8};
+#else
+    const std::vector<int> threadCounts = {1};      // built without OpenMP: the budget's order only
+#endif
+    for (int threads : threadCounts) {
+#ifdef _OPENMP
+        omp_set_num_threads(threads);
+#endif
+        for (size_t budget : {64u, 0u}) {
+            cfg.memBudgetGB = budget;
+            for (int run = 0; run < (threads > 1 ? 3 : 1); run++) {
+                std::string log;
+                const std::vector<std::string> lines = runIdentifyDifference(cfg, refSet1, refSet2, log);
+                assert(log.find(budget ? "refSet2 batch=5/5" : "refSet2 batch=1/5") != std::string::npos);
+                assert(lines.size() == 1 + expect.size());
+                assert(std::equal(expect.begin(), expect.end(), lines.begin() + 1));
+            }
+        }
+    }
+#ifdef _OPENMP
+    omp_set_num_threads(savedThreads);
+#endif
+    std::remove(big.c_str());
+    std::remove(cfg.outfile.c_str());
+    std::cerr << "PASSED: Test rows are in list order on any thread count and budget\n";
+}
+
 int main() {
+#ifdef _OPENMP
+    // One thread, unless a test asks for more: identifyDifference takes the number
+    // OpenMP has, every core of the machine by default, and a filter for each.
+    omp_set_num_threads(1);
+#endif
     CompareSketchConfig cfg;
     cfg.kmerLen = 10;
     cfg.bits = 128;
@@ -418,6 +475,7 @@ int main() {
     writeCmpRefs();
     testCountAbsent();
     testComparisonPath();
+    testRowOrder();
     removeCmpRefs();
 
     std::cerr << "CompareSketch: All tests PASSED!\n\n";
